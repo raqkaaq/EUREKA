@@ -1,0 +1,25 @@
+[project]
+name = "eureka"
+version = "0.1.0"
+description = "An agentic scientific tool"
+readme = "README.md"
+authors = [
+    { name = "raqkaaq", email = "eryan97@raqkaaq.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "arxiv>=4.0.1",
+    "pydantic>=2.13.5",
+]
+
+[project.scripts]
+eureka = "eureka:main"
+
+[build-system]
+requires = ["uv_build>=0.11.8,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+]
