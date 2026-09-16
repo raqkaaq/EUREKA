@@ -5,7 +5,7 @@ description: Deliver bounded work from an approved specification or ready issue.
 
 # Implement
 
-1. Invoke `git` to load the authoritative issue or specification, confirm readiness, inspect the working tree, and establish the intended branch state.
+1. Invoke `git` to load the authoritative issue or specification, confirm it meets the shared [ready-work criteria](../workflow/references/readiness.md), inspect the working tree, and establish the intended branch state.
 2. Identify the observable behavior and testing seams. Use `module-design` when the interface is unsettled.
 3. Use `tdd` for each behavior that can be driven through a reliable seam. Follow repository instructions when orchestration and coding must be performed by different agents.
 4. Run focused checks throughout and the appropriate broader checks before review.

@@ -7,7 +7,7 @@ description: Decompose an approved specification into small, dependency-aware im
 
 Read the complete specification and current repository state. Split by observable capability, not by technical layer.
 
-First identify any small prefactor that makes the change easy without changing behavior. Make it an earlier slice only when independently safe and verifiable.
+First identify any small preparatory refactor that makes the change easier without changing behavior. Make it an earlier slice only when independently safe and verifiable.
 
 Each slice must:
 

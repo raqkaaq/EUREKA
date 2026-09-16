@@ -19,6 +19,6 @@ Produce:
 - dependencies, migration concerns, research citations, and non-goals;
 - unresolved questions that prevent readiness.
 
-Prefer stable domain language and behavior over file-level instructions. Prefer existing, high public testing seams and as few new seams as practical. Confirm the proposed seams with the user before marking the specification ready. It is ready only when a fresh agent could tell what success means and what remains out of scope.
+Prefer stable domain language and behavior over file-level instructions. Prefer existing, high public testing seams and as few new seams as practical. Confirm the proposed seams with the user, then evaluate the result with the shared [ready-work criteria](../workflow/references/readiness.md).
 
 Return a proposed specification. When the user wants it recorded in GitHub, invoke `git` to create or update the corresponding issue; do not perform GitHub operations directly.

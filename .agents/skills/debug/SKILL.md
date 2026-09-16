@@ -25,4 +25,4 @@ Show the ranked hypotheses to the user before testing them; continue without wai
 
 For performance problems, establish a repeatable baseline and profile or bisect before optimizing. Redact secrets and sensitive payloads from captured artifacts.
 
-Report reproduction, minimal case, causal evidence, scope, and remedy. If authorized to fix, add a regression test, make the smallest adequate change, rerun the original reproduction and broader checks, and remove tagged instrumentation.
+Report reproduction, minimal case, causal evidence, scope, and remedy. If authorized to fix, add a regression test, make the smallest adequate change, and rerun the original reproduction and broader checks. Mark temporary instrumentation with a unique task label while diagnosing; before completion, remove every labeled site and verify the final diff contains none.

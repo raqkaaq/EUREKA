@@ -22,6 +22,6 @@ Choose one category and one state. Conflicts require maintainer direction.
 4. Recommend category, state, and next route before asking questions.
 5. For ready work, use [references/agent-brief.md](references/agent-brief.md).
 
-An item is ready only when its outcome, boundaries, acceptance criteria, dependencies, and verification approach are sufficient for a fresh agent. Do not force incoming work through further questioning when the maintainer gives a direct state override.
+Apply the shared [ready-work criteria](../workflow/references/readiness.md). Do not force incoming work through further questioning when the maintainer gives a direct state override.
 
 On resume, preserve established facts and ask only unresolved questions. A maintainer override wins. Preview consequential mutations, then hand exact changes to `git`.

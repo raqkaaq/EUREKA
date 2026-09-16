@@ -7,7 +7,7 @@ description: Review a change or pull request against both its originating requir
 
 Pin the target and fixed point. For branch work, use the merge base and record the commits reviewed. Stop on an invalid reference or empty diff. Use `git` for pull-request context.
 
-Find requirements in linked issues or commits, then user-provided or repository specifications. Ask only if none can be found; never invent them.
+Find requirements in linked issues, the pull-request description and relevant discussion, commits, then user-provided or repository specifications. If the available material does not define enough behavior or scope to review safely, ask for the missing requirements; never invent them.
 
 Read [references/standards.md](references/standards.md) for the baseline engineering heuristics.
 

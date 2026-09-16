@@ -18,6 +18,6 @@ For each credible candidate, report:
 - conflicts with existing decisions;
 - recommendation strength and uncertainty.
 
-When several candidates exist, present them in a self-contained visual HTML report in the temporary directory, including before/after structure and a top recommendation. Give the user its path; open it only with authorization.
+When several candidates exist, present them in a self-contained visual HTML report in a dedicated temporary directory, including before/after structure and a top recommendation. Give the user its path, state that it is disposable, and open it only with authorization. Remove the directory after the user is finished unless a handoff depends on it; report the cleanup.
 
 Do not refactor or fully design every candidate. Let the user select one, then use `design-session` for the focused interview. Use `git` to record approved follow-up work in GitHub; never create issues directly.
