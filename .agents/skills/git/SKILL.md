@@ -5,7 +5,7 @@ description: Manage Git and GitHub project state, including issues, dependencies
 
 # Git and GitHub
 
-This skill alone performs Git and GitHub operations. Other skills supply issue drafts, dependency graphs, reviews, or transition recommendations.
+This skill is the sole executor of Git and GitHub operations. Other skills own the judgment — issue drafts, dependency graphs, reviews, transition recommendations — and hand exact changes to `git` for execution.
 
 GitHub Issues and pull requests are the work-state source of truth. Repository documents hold durable design knowledge.
 

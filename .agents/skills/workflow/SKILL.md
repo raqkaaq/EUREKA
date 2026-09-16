@@ -30,6 +30,8 @@ Use when the agent encounters a phase boundary or cannot determine the proper wo
 
 Name one recommended skill, the evidence that its entry conditions are met, and its expected output. Ask the user to authorize that route and stop. A request to inspect status or choose a route authorizes the read-only inspection needed to answer, but not the recommended next phase.
 
+Standing authorizations (no per-phase re-auth needed while they hold): a request for design-through-slicing authorizes progression through `brainstorm`, `design-session`, `research`, `prototype`, `map-work`, `specify`, and `slice-work` in one conversation. GitHub writes, implementation (`implement`), merges, and any phase outside the authorized span always require explicit authorization.
+
 If new evidence or code changes invalidate an existing specification, return to `design-session` when a decision must be reopened or to `specify` when only the recorded contract is stale.
 
 Keep design through slicing in one conversation while its reasoning remains useful. Start each implementation issue fresh from its GitHub brief. At other boundaries, read [references/phase-boundaries.md](references/phase-boundaries.md).
