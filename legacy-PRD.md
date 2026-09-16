@@ -26,7 +26,7 @@
 Autonomous (user-absent) local researcher for cs/math/physics (bio/chem
 out of scope; math is a subset of science, extracted deepest) that:
 
-1. Searches/fetches arXiv via SDK (S3 bulk later),
+1. Searches/fetches arXiv via SDK (Project Euclid + S3 bulk later),
 2. Builds an ontology-grounded knowledge graph in Kuzu (browsable),
 3. Chats with citations (search/fetch tools shared with chat),
 4. Improves via SkillOpt (both skills),
@@ -76,6 +76,9 @@ sci-eureka/
   `main.tex` (`\documentclass` + `\begin{document}`); always fetch `pdf_url`.
   Record `branch{tex+pdf|pdf-only}` in manifest. `data/raw/` immutable.
   SDK now; S3 bulk (`boto3`, requester-pays `us-east-1`, manifest) deferred.
+- Project Euclid is a deferred mathematics source. Use only content available
+  without a paid subscription; retain publisher, journal, DOI, license/access,
+  and source attribution metadata.
 - S1: Docling LaTeX + TexSoup/arXiTeX (macros, `\input` cap 10) /
   PDF fallback Docling PDF `do_formula_enrichment` + PyMuPDF bbox.
 - S2 chunks: section-aware (`title,abstract,intro,related,background,method,
@@ -185,8 +188,18 @@ OpenRouter/MCP.
   repo https://github.com/microsoft/SkillOpt ,
   guideline https://microsoft.github.io/SkillOpt/docs/guideline.html .
   Gate proof required; never live-edit skills in ingest.
-- Future evolution (deferred, no work): `AVO arXiv:2603.24517`
-  https://arxiv.org/abs/2603.24517 (+ §3 `Vary(P)=Agent(P,K,f)`).
+- Future evolution (deferred, no work): compare `AVO arXiv:2603.24517`
+  https://arxiv.org/abs/2603.24517 (+ §3 `Vary(P)=Agent(P,K,f)`) with
+  `AlphaEvolve arXiv:2506.13131`
+  https://arxiv.org/abs/2506.13131 and
+  https://deepmind.google/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/
+  before selecting the Auto Research evolution design.
+- Future verification (deferred, no work): evaluate
+  `LLM-as-a-Verifier arXiv:2607.05391`
+  https://arxiv.org/abs/2607.05391 and code
+  https://github.com/llm-as-a-verifier/llm-as-a-verifier for candidate
+  selection, progress scoring, and feedback. Benchmark it for EUREKA rather
+  than treating verifier scores as ground truth.
 - Math precedent: `TheoremGraph 2606.25363`
   https://arxiv.org/abs/2606.25363 + ArXiTeX
   https://github.com/uw-math-ai/arXiTeX (§3 env/label/body/proof).
@@ -198,6 +211,8 @@ OpenRouter/MCP.
   https://physh.org/ + https://github.com/physh-org/PhySH , Schema.org
   https://schema.org/docs/schemas.html , SPAR
   http://www.sparontologies.net/ , OMDoc https://kwarc.info/systems/omdoc .
+- Future paper source: Project Euclid https://projecteuclid.org/ (open-access
+  content only; no subscription dependency).
 
 ## 10. Autonomy (user-absent execution contract)
 
@@ -229,5 +244,5 @@ huge section overflow, dup papers, ambiguous aliases, missing QIDs).
   any training + edge tests.
 - P5 SkillOpt adapters + sequential runs + gate proof + edge tests.
 - P6 Logfire-local + audit + `run_report` + edge tests.
-- Deferred stubs only: S3 bulk, full broker, AVO evolution, Lean
-  replication, draft-math.
+- Deferred stubs only: Project Euclid, S3 bulk, full broker, AlphaEvolve vs
+  AVO evaluation, LLM-as-a-Verifier evaluation, Lean replication, draft-math.
