@@ -120,6 +120,17 @@ class TestClefConfigRequired(unittest.TestCase):
                 model_override=_fixed_model()))
         self.assertEqual(result.exit_code, 4)
 
+    def test_bad_clef_path_redacted_in_pipeline_stderr(self):
+        secret_path = "/v1/secret-token-abc-xyz"
+        result = _run_pipeline(PipelineRequest(
+            mode="analyze", max_candidates=1,
+            clef_base_url=f"http://127.0.0.1:11434{secret_path}",
+            source_override=DictTransport(_pages(1)),
+            model_override=_fixed_model()))
+        self.assertEqual(result.exit_code, 3)
+        joined = " ".join(result.stderr_notes)
+        self.assertNotIn("secret-token-abc-xyz", joined)
+
     def test_no_triage_mode_flag(self):
         from radar.cli import main
 

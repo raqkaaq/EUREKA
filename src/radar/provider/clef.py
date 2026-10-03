@@ -156,7 +156,7 @@ def _normalize_base(raw: str) -> str:
         path = path[: -len("/systemone")]
     elif not (path == "/v1" or path.endswith("/v1")):
         raise ClefError(
-            f"CLEF base URL path {path!r} is unsupported; use an empty path, "
+            "CLEF base URL path is unsupported; use an empty path, "
             "a /v1 root (reverse-proxy prefixes ending in /v1 are kept), "
             "or a /v1/systemone URL."
         )

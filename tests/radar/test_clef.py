@@ -163,6 +163,17 @@ class TestClefConfig(unittest.TestCase):
                 cfg = ClefConfig.resolve()
             self.assertEqual(cfg.base_url, expected, msg=raw)
 
+    def test_unsupported_path_echoes_nothing(self):
+        from radar.provider.clef import ClefConfig, ClefError
+
+        secret_path = "/v1/secret-token-abc-xyz"
+        with self._env(f"http://127.0.0.1:11434{secret_path}"):
+            with self.assertRaises(ClefError) as ctx:
+                ClefConfig.resolve()
+        text = str(ctx.exception)
+        self.assertNotIn("secret-token-abc-xyz", text)
+        self.assertNotIn(secret_path, text)
+
     def test_bad_base_shapes_rejected_without_leak(self):
         from radar.provider.clef import ClefConfig, ClefError
 
@@ -357,6 +368,7 @@ class TestScreenWorks(unittest.TestCase):
         import time
 
         closed = 0
+        calls = 0
 
         class RecordingTransport(httpx.MockTransport):
             async def aclose(self):
@@ -365,7 +377,9 @@ class TestScreenWorks(unittest.TestCase):
                 await super().aclose()
 
         async def handler(request):
-            await asyncio.sleep(0.5)
+            nonlocal calls
+            calls += 1
+            await asyncio.sleep(1.0)
             return httpx.Response(200, json=_answers(0.5, 0.5))
 
         from radar.provider.clef import ClefConfig, screen_works
@@ -374,7 +388,7 @@ class TestScreenWorks(unittest.TestCase):
             os.environ, {"CLEF_BASE_URL": "http://127.0.0.1:11434/v1"},
             clear=False,
         ):
-            config = ClefConfig.resolve(overall_timeout_s=0.05,
+            config = ClefConfig.resolve(overall_timeout_s=0.1,
                                         request_timeout_s=10)
         works = [_work(f"W{i}") for i in range(3)]
         transport = RecordingTransport(handler)
@@ -382,13 +396,16 @@ class TestScreenWorks(unittest.TestCase):
         batch = screen_works(works, _profile(), config=config,
                              transport=transport)
         elapsed = time.monotonic() - start
-        # All accounted, none scored; wall clock bounded by the overall
-        # deadline plus slack -- far below one request timeout (old join
-        # could overrun by a full request_timeout).
+        # Async overall deadline cancels in-flight calls: all deadline,
+        # wall clock near the 0.1s budget (far below the 1.0s handler
+        # delay a blocking join would wait out), client closed, and no
+        # further calls issued after cancellation. (No guarantee holds
+        # for custom transports whose handlers block the loop itself.)
         self.assertEqual([r.status for r in batch.results],
                          ["deadline"] * 3)
-        self.assertLess(elapsed, 2.0)
+        self.assertLess(elapsed, 0.5)
         self.assertEqual(closed, 1)
+        self.assertEqual(calls, 1)
 
     def test_client_closed_on_service_failure(self):
         closed = 0
