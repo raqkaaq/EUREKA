@@ -219,3 +219,6 @@ __marimo__/
 
 
 notebooks
+
+# Radar runtime snapshots (metadata-only refresh output; never committed).
+data/radar/
