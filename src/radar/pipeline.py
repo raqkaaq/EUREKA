@@ -9,6 +9,7 @@ errors map to CLI exit codes). No printing, no argparse, no prompts.
 from __future__ import annotations
 
 import os as _os
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -32,6 +33,8 @@ from radar.schema.papers import CollectedWork
 
 if TYPE_CHECKING:
     from pydantic_ai.models import Model as _Model
+    from radar.config.interests import RadarProfile as _RadarProfile
+    from radar.schema.triage import TriageBatch as _TriageBatch
 
 
 class PipelineUsageError(ValueError):
@@ -66,9 +69,18 @@ class PipelineRequest:
     disable_thinking: bool = False
     base_url: str | None = None
     model: str | None = None
+    # CLEF routing (mandatory for analysis; collect-only ignores these).
+    clef_base_url: str | None = None
+    clef_model: str | None = None
+    clef_timeout_s: float = 10.0
+    triage_timeout_s: float = 60.0
+    triage_output: str | None = None
     # Injected doubles (tests only; production leaves both None).
     source_override: Any | None = None
     model_override: Any | None = None
+    triage_scorer: (
+        Callable[[Sequence[CollectedWork], "_RadarProfile"], "_TriageBatch"] | None
+    ) = None
 
 
 @dataclass(frozen=True)
@@ -119,13 +131,7 @@ def _validate_request(request: PipelineRequest) -> None:
 
 
 def _keywords(request: PipelineRequest) -> list[str]:
-    profile = default_profile(lookback_days=request.lookback_days)
-    override = clean_keyword_override(
-        list(request.keywords) if request.keywords else None
-    )
-    if override is not None:
-        profile = profile.model_copy(update={"keywords": override})
-    return profile.keywords
+    return list(_active_profile(request).keywords)
 
 
 def _collect_live(request: PipelineRequest) -> list[CollectedWork]:
@@ -235,8 +241,92 @@ def _run_cached(request: PipelineRequest) -> PipelineResult:
         )
     return _analyze_pool(
         request, pool_full=cached_works, refresh_collected_at=None,
-        preselected=top, prefix_notes=tuple(notes),
+        prefix_notes=tuple(notes),
     )
+
+
+def _active_profile(request: PipelineRequest):
+    """Discovery profile with the active CLI keyword override applied."""
+    from radar.config.interests import RadarProfile
+
+    profile: RadarProfile = default_profile(lookback_days=request.lookback_days)
+    override = clean_keyword_override(
+        list(request.keywords) if request.keywords else None
+    )
+    if override is not None:
+        profile = profile.model_copy(update={"keywords": override})
+    return profile
+
+
+def _screen_full_pool(request: PipelineRequest, pool: list[CollectedWork],
+                      profile) -> Any:
+    """CLEF-score the full pool (mandatory routing for analysis).
+
+    Missing endpoint configuration fails fast with usage error and zero
+    model calls; any screening failure stops the run before FreeToken
+    synthesis (analysis error). The injected scorer override bypasses
+    configuration for hermetic tests.
+    """
+    from radar.config.runtime import (
+        validate_clef_overall_timeout,
+        validate_clef_request_timeout,
+    )
+
+    try:
+        clef_timeout = validate_clef_request_timeout(request.clef_timeout_s)
+        triage_timeout = validate_clef_overall_timeout(request.triage_timeout_s)
+    except ValueError as exc:
+        raise PipelineUsageError(str(exc)) from exc
+    if request.triage_scorer is not None:
+        try:
+            return request.triage_scorer(pool, profile)
+        except Exception as exc:
+            raise PipelineAnalysisError(
+                f"CLEF screening failed ({type(exc).__name__}: {exc}); "
+                "stopping before FreeToken synthesis with the last valid "
+                "snapshot preserved."
+            ) from exc
+    if not (request.clef_base_url or _os.environ.get("CLEF_BASE_URL", "").strip()):
+        raise PipelineUsageError(
+            "CLEF screening is the mandatory routing stage but no endpoint "
+            "is configured; set CLEF_BASE_URL or pass --clef-base-url. "
+            "The CLEF server is user-owned and is never launched by radar."
+        )
+    try:
+        from radar.provider.clef import ClefConfig, screen_works
+
+        config = ClefConfig.resolve(
+            base_url=request.clef_base_url,
+            model=request.clef_model,
+            request_timeout_s=clef_timeout,
+            overall_timeout_s=triage_timeout,
+        )
+    except ValueError as exc:
+        raise PipelineUsageError(str(exc)) from exc
+    except Exception as exc:
+        raise PipelineAnalysisError(
+            f"CLEF configuration failed ({type(exc).__name__}: {exc})."
+        ) from exc
+    try:
+        return screen_works(pool, profile, config=config)
+    except Exception as exc:
+        raise PipelineAnalysisError(
+            f"CLEF screening failed ({type(exc).__name__}: {exc}); "
+            "stopping before FreeToken synthesis with the last valid "
+            "snapshot preserved."
+        ) from exc
+
+
+def _has_deadline(batch: Any) -> bool:
+    return any(
+        getattr(r, "status", None) == "deadline"
+        for r in (getattr(batch, "results", []) or []))
+
+
+def _deadline_count(batch: Any) -> int:
+    return sum(
+        1 for r in (getattr(batch, "results", []) or [])
+        if getattr(r, "status", None) == "deadline")
 
 
 def _analyze_pool(
@@ -244,20 +334,37 @@ def _analyze_pool(
     *,
     pool_full: list[CollectedWork],
     refresh_collected_at: str | None,
-    preselected: list[CollectedWork] | None = None,
     prefix_notes: tuple[str, ...] = (),
 ) -> PipelineResult:
     from radar.agent import opportunity_analysis as _agent
     from radar.output import markdown as _out_md
+    from radar.output import triage as _out_triage
+    from radar.processing.triage import select_candidates
     from radar.storage import snapshots as _snapshots
+    from radar.storage import triage as _triage_store
 
     notes: list[str] = list(prefix_notes)
-    ranked = (
-        list(preselected)
-        if preselected is not None
-        else _ranking.select_topn(pool_full, request.max_candidates)
-    )
-    included = _agent.select_for_prompt(ranked, request.max_candidates)
+    if not pool_full:
+        return PipelineResult(0, "No candidates collected; nothing to analyze.",
+                              tuple(notes))
+    profile = _active_profile(request)
+    batch = _screen_full_pool(request, pool_full, profile)
+    summary = _out_triage.summarize_batch(batch)
+    if request.triage_output:
+        try:
+            _triage_store.write_sidecar(request.triage_output, batch)
+        except _triage_store.TriageSidecarError as exc:
+            notes.append(f"radar: warning: {exc}")
+    if summary["failed"] > 0 or _has_deadline(batch):
+        raise PipelineAnalysisError(
+            f"CLEF screening incomplete: {summary['failed']} failed, "
+            f"{_deadline_count(batch)} deadline "
+            f"(model={summary['model_id']} rubric={summary['rubric_version']}); "
+            "stopping before FreeToken synthesis with the last valid "
+            "snapshot preserved."
+        )
+    shortlist = select_candidates(pool_full, batch, request.max_candidates)
+    included = _agent.select_for_prompt(shortlist, request.max_candidates)
     if not included:
         return PipelineResult(0, "No candidates collected; nothing to analyze.",
                               tuple(notes))
@@ -292,8 +399,9 @@ def _analyze_pool(
         raise PipelineAnalysisError(
             f"Report generation failed ({type(exc).__name__}: {exc})."
         ) from exc
-    notes.append(_out_md.coverage_line(
-        len(pool_full), len(included), len(draft.opportunities)))
+    notes.append(_out_triage.triage_coverage_line(
+        pool_total=len(pool_full), summary=summary,
+        selected=len(included), opportunities=len(draft.opportunities)))
     if request.refresh_dir and refresh_collected_at is not None:
         try:
             _snapshots.update_llm_coverage(

@@ -79,10 +79,32 @@ uv run --env-file .env python -m radar --collect-only --refresh-dir data/radar
 # Cached synthesis: zero OpenAlex calls (needs FreeToken for analysis).
 uv run --env-file .env python -m radar --from-snapshot data/radar/snapshot.json --max-candidates 2
 
+# Analysis with CLEF routing (CLEF server user-owned, not running yet).
+# Endpoint below is a placeholder: replace with your LAN CLEF server.
+uv run --env-file .env python -m radar --max-candidates 8 \
+  --clef-base-url http://192.168.1.20:1921/v1 --triage-output data/radar/triage
+
 # Options.
 uv run --env-file .env python -m radar --help
 uv run --env-file .env python -m radar --keywords "graph neural networks" --lookback-days 30
 ```
+
+## CLEF screening (mandatory routing, server absent)
+
+Every analysis run CLEF-scores the full pool before shortlist selection
+and FreeToken synthesis; there is no opt-out and no heuristic fallback
+on service failure. Configure `CLEF_BASE_URL` (or `--clef-base-url`;
+no endpoint is ever guessed), optionally `CLEF_MODEL` (default
+`clef-flash`), `--clef-timeout` (per request, default 10 s), and
+`--triage-timeout` (overall, default 60 s). Missing configuration is
+exit 4 with zero model calls; unreachable/malformed/deadline/failed
+screening is exit 3 and stops before synthesis with the last valid
+snapshot preserved. Missing abstracts and oversize texts stay typed
+unknowns with one unknown slot reserved; `--collect-only` never calls
+CLEF or FreeToken. An optional atomic `--triage-output` JSON sidecar
+records model/rubric provenance; strict v1 snapshots are never mutated.
+The CLEF server is not launched by radar and live CLEF checks are
+skipped while it is absent.
 
 Exit codes: 0 ok, 2 external-service (OpenAlex) failure, 3 analysis/report
 failure (including FreeToken), 4 usage/config error.
@@ -96,6 +118,8 @@ failure (including FreeToken), 4 usage/config error.
 | `FREETOKEN_API_KEY` | Local API key placeholder | `freetoken-local` |
 | `FREETOKEN_DISABLE_THINKING` | Opt-in server-specific thinking-disable key | unset (omitted) |
 | `OPENALEX_API_KEY` | Optional personal OpenAlex budget | unset (shared anonymous pool) |
+| `CLEF_BASE_URL` | User-owned LAN CLEF endpoint (**required** for analysis) | unset (no guess) |
+| `CLEF_MODEL` | CLEF model id | `clef-flash` |
 
 Loopback, RFC 1918, IPv6 ULA, and RFC 6598 endpoints are allowed. Public,
 link-local, multicast, reserved, and unspecified destinations are refused;

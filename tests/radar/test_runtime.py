@@ -41,6 +41,16 @@ def _seed_snapshot(tmp: str, works: list[CollectedWork]) -> str:
     return summary["snapshot"]
 
 
+def _scored_batch(pool) -> object:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        model_id="test-clef", rubric_version="r1",
+        results=[SimpleNamespace(
+            work_id=w.openalex_id, status="scored",
+            ai_ml_relevance=0.9, cross_domain_potential=0.1) for w in pool])
+
+
 def _fixed_draft_model() -> FunctionModel:
     fixed = RadarDraft(opportunities=[], ignore=[], next_move="done")
 
@@ -203,7 +213,8 @@ class TestCachedSnapshot(unittest.TestCase):
             before = open(path, "rb").read()
             result = _run_pipeline(PipelineRequest(
                 mode="analyze", max_candidates=1, from_snapshot=path,
-                model_override=_fixed_draft_model()))
+                model_override=_fixed_draft_model(),
+                triage_scorer=lambda pool, profile: _scored_batch(pool)))
             self.assertEqual(result.exit_code, 0)
             self.assertIn("Next move", result.stdout)
             self.assertEqual(open(path, "rb").read(), before)
@@ -214,7 +225,8 @@ class TestCachedSnapshot(unittest.TestCase):
                                         for i in range(5)])
             result = _run_pipeline(PipelineRequest(
                 mode="analyze", max_candidates=2, from_snapshot=path,
-                model_override=_fixed_draft_model()))
+                model_override=_fixed_draft_model(),
+                triage_scorer=lambda pool, profile: _scored_batch(pool)))
             self.assertEqual(result.exit_code, 0)
             coverage = " ".join(result.stderr_notes)
             self.assertIn("pool=5", coverage)
