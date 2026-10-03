@@ -20,10 +20,10 @@ from typing import Any
 import httpx as _httpx
 
 from radar.config.interests import RadarProfile
-from radar.config.triage_questions import build_questions
 from radar.provider.freetoken import FreeTokenError, check_local_network
+from radar.processing.triage_input import build_input
 from radar.schema.papers import CollectedWork
-from radar.schema.triage import RUBRIC_VERSION, TriageBatch, TriageResult
+from radar.schema.triage import RUBRIC_VERSION, SystemOneResponse, TriageBatch, TriageResult
 
 DEFAULT_MODEL = "clef-flash"
 CLEF_BASE_URL_ENV = "CLEF_BASE_URL"
@@ -167,23 +167,14 @@ def _normalize_base(raw: str) -> str:
     return f"{parts.scheme}://{netloc}{path}"
 
 
-def _questions(profile: RadarProfile) -> dict[str, Any]:
-    return build_questions(profile)
-
-
 def _payload_bytes(
     work: CollectedWork, profile: RadarProfile, model: str
 ) -> bytes | None:
     """Serialize one screening call; None when the abstract is missing."""
     if not (work.abstract or "").strip():
         return None
-    state = {
-        "title": work.title or "(untitled)",
-        "abstract": work.abstract,
-        "publication_year": work.publication_year,
-    }
     body = _json.dumps(
-        {"model": model, "state": state, "questions": _questions(profile)},
+        build_input(work, profile, model),
         ensure_ascii=False,
     ).encode("utf-8")
     return body
@@ -197,22 +188,8 @@ def _validate_answer(
         return TriageResult(work_id=work_id, status="failed")
     if payload.get("model") != model:
         return TriageResult(work_id=work_id, status="failed")
-    answers = payload.get("answers")
-    if not isinstance(answers, dict):
-        return TriageResult(work_id=work_id, status="failed")
-    probs: dict[str, float] = {}
-    for key in (AI_ML_QUESTION, CROSS_DOMAIN_QUESTION):
-        entry = answers.get(key)
-        if not isinstance(entry, dict) or entry.get("type") != "noul":
-            return TriageResult(work_id=work_id, status="failed")
-        probs[key] = entry.get("noul")
     try:
-        return TriageResult(
-            work_id=work_id,
-            status="scored",
-            ai_ml_relevance=probs[AI_ML_QUESTION],
-            cross_domain_potential=probs[CROSS_DOMAIN_QUESTION],
-        )
+        return SystemOneResponse.model_validate(payload).to_result(work_id)
     except ValueError:
         return TriageResult(work_id=work_id, status="failed")
 

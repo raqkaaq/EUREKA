@@ -85,6 +85,12 @@ class _NoOpenAlex:
         raise AssertionError("zero OpenAlex calls expected")
 
 
+def _failed_routing_model() -> FunctionModel:
+    def unavailable(messages, info):
+        raise RuntimeError("simulated provider outage")
+    return FunctionModel(unavailable)
+
+
 class TestFullPoolOfflineAcceptance(unittest.TestCase):
     def test_106_pool_end_to_end_offline(self):
         works = _pool106()
@@ -137,9 +143,7 @@ class TestFullPoolOfflineAcceptance(unittest.TestCase):
                 mode="analyze", max_candidates=2, from_snapshot=snap,
                 clef_base_url="http://127.0.0.1:9", clef_model=MODEL,
                 clef_transport=httpx.MockTransport(handler),
-                qwen_systemone_base_url="http://127.0.0.1:1919/v1",
-                qwen_systemone_model="test-qwen",
-                qwen_systemone_transport=httpx.MockTransport(handler),
+                triage_model_override=_failed_routing_model(),
                 model_override=FunctionModel(_model),
                 source_override=_NoOpenAlex()))
             self.assertEqual(result.exit_code, 3)
@@ -165,9 +169,8 @@ class TestFullPoolOfflineAcceptance(unittest.TestCase):
                 mode="analyze", max_candidates=2, from_snapshot=snap,
                 clef_base_url="http://127.0.0.1:9", clef_model=MODEL,
                 clef_transport=httpx.MockTransport(handler),
-                qwen_systemone_base_url="http://127.0.0.1:1919/v1",
-                qwen_systemone_model="test-qwen",
-                qwen_systemone_transport=httpx.MockTransport(handler),
+                triage_model_override=FunctionModel(lambda messages, info: ModelResponse(parts=[ToolCallPart(
+                    info.output_tools[0].name, {"responses": []})])),
                 model_override=FunctionModel(_model),
                 source_override=_NoOpenAlex()))
             self.assertEqual(result.exit_code, 3)

@@ -134,19 +134,6 @@ def build_parser() -> argparse.ArgumentParser:
         "(default 60). Failed CLEF can use a separate bounded Qwen stage.",
     )
     parser.add_argument(
-        "--qwen-systemone-base-url",
-        default=None,
-        help="Qwen fallback native SystemOne endpoint (or QWEN_SYSTEMONE_BASE_URL; "
-        "otherwise the configured FreeToken base URL). Must support /v1/systemone; "
-        "no chat substitution.",
-    )
-    parser.add_argument(
-        "--qwen-systemone-model",
-        default=None,
-        help="Qwen SystemOne served model id (or QWEN_SYSTEMONE_MODEL; "
-        "otherwise the configured FreeToken model id).",
-    )
-    parser.add_argument(
         "--triage-output",
         default=None,
         metavar="PATH",
@@ -177,8 +164,6 @@ def main(argv: list[str] | None = None) -> int:
         clef_timeout_s=args.clef_timeout,
         triage_timeout_s=args.triage_timeout,
         triage_output=args.triage_output,
-        qwen_systemone_base_url=args.qwen_systemone_base_url,
-        qwen_systemone_model=args.qwen_systemone_model,
     )
     result = run(request)
     for note in result.stderr_notes:

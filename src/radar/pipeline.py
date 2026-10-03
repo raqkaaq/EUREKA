@@ -75,12 +75,10 @@ class PipelineRequest:
     clef_timeout_s: float = 10.0
     triage_timeout_s: float = 60.0
     triage_output: str | None = None
-    qwen_systemone_base_url: str | None = None
-    qwen_systemone_model: str | None = None
     # Injected doubles (tests only; production leaves all None).
     source_override: Any | None = None
     model_override: Any | None = None
-    qwen_systemone_transport: Any | None = None
+    triage_model_override: Any | None = None
     clef_transport: Any | None = None
     triage_scorer: (
         Callable[[Sequence[CollectedWork], "_RadarProfile"], "_TriageBatch"] | None
@@ -295,28 +293,32 @@ def _screen_full_pool(request: PipelineRequest, pool: list[CollectedWork],
         raise PipelineUsageError(str(exc)) from exc
 
     def fallback(reason: str) -> "_TriageBatch":
-        from radar.provider import qwen_systemone
+        from radar.agent import paper_triage
 
+        if request.triage_model_override is None:
+            try:
+                _freetoken.resolve_base_url(request.base_url)
+            except _freetoken.FreeTokenError:
+                raise PipelineUsageError(
+                    "Qwen fallback requires a plain private-LAN FreeToken chat "
+                    "endpoint: set FREETOKEN_BASE_URL or pass --base-url, "
+                    "without embedded credentials."
+                ) from None
         try:
-            config = qwen_systemone.resolve_config(
-                base_url=request.qwen_systemone_base_url,
-                model=request.qwen_systemone_model,
-                freetoken_base_url=request.base_url, freetoken_model=request.model,
-                request_timeout_s=clef_timeout, overall_timeout_s=triage_timeout)
-        except ValueError as exc:
-            raise PipelineUsageError(str(exc)) from None
-        try:
-            batch = qwen_systemone.screen_works(
-                pool, profile, config=config, fallback_reason=reason,
-                transport=request.qwen_systemone_transport)
+            batch = paper_triage.screen_works(
+                pool, profile, model=request.triage_model_override,
+                model_id="qwen-test-model" if request.triage_model_override else None,
+                base_url=request.base_url, configured_model=request.model,
+                overall_timeout_s=triage_timeout,
+                disable_thinking=_freetoken.resolve_disable_thinking(request.disable_thinking),
+                fallback_reason=reason)
             return _check_batch_shape(batch, pool)
         except PipelineAnalysisError:
             raise
         except Exception:
             raise PipelineAnalysisError(
-                "Qwen fallback routing failed; the configured LAN server must "
-                "support POST /v1/systemone. No chat fallback or synthesis was "
-                "attempted; snapshot preserved."
+                "Qwen fallback routing failed; check the configured FreeToken "
+                "chat endpoint/model. No synthesis was attempted; snapshot preserved."
             ) from None
 
     if request.triage_scorer is None:
@@ -393,8 +395,8 @@ def _analyze_pool(
             f"{_deadline_count(batch)} deadline "
             f"(model={summary['model_id']} rubric={summary['rubric_version']}); "
             "stopping before FreeToken synthesis with the last valid "
-            "snapshot preserved. Routing requires native POST /v1/systemone; "
-            "a Chat Completions-only server is not compatible."
+            "snapshot preserved. Qwen routing uses FreeToken Chat Completions "
+            "with Pydantic-validated SystemOne answer contracts."
         )
     shortlist = select_candidates(pool_full, batch, request.max_candidates)
     included = _agent.select_for_prompt(shortlist, request.max_candidates)

@@ -1,4 +1,4 @@
-"""Mandatory routing integration: preferred CLEF, native Qwen fallback,
+"""Mandatory routing integration: preferred CLEF, typed Qwen chat fallback,
 config validation, sidecars, coverage, and failed-both-backend safeguards.
 External HTTP/model boundaries are substituted; no services or .env reads.
 """
@@ -11,8 +11,6 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
-
-import httpx
 
 from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
@@ -99,6 +97,12 @@ def _fixed_model() -> FunctionModel:
     return FunctionModel(_impl)
 
 
+def _failed_routing_model() -> FunctionModel:
+    def unavailable(messages, info):
+        raise RuntimeError("simulated provider outage")
+    return FunctionModel(unavailable)
+
+
 class TestClefConfigRequired(unittest.TestCase):
     def test_both_endpoints_unconfigured_is_exit4_with_zero_model_calls(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -106,7 +110,7 @@ class TestClefConfigRequired(unittest.TestCase):
                 mode="analyze", max_candidates=2,
                 source_override=DictTransport(_pages(6))))
         self.assertEqual(result.exit_code, 4)
-        self.assertTrue(any("QWEN_SYSTEMONE_BASE_URL" in n for n in result.stderr_notes))
+        self.assertTrue(any("FREETOKEN_BASE_URL" in n for n in result.stderr_notes))
 
     def test_missing_endpoint_checked_even_with_model_override(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -256,9 +260,7 @@ class TestMandatoryRoutingIntegration(unittest.TestCase):
             result = _run_pipeline(PipelineRequest(
                 mode="analyze", max_candidates=1, from_snapshot=snap,
                 model_override=FunctionModel(_model),
-                qwen_systemone_base_url="http://127.0.0.1:1919/v1",
-                qwen_systemone_model="test-qwen",
-                qwen_systemone_transport=httpx.MockTransport(lambda r: httpx.Response(503)),
+                triage_model_override=_failed_routing_model(),
                 triage_scorer=_all_failed))
             self.assertEqual(result.exit_code, 3)
             self.assertEqual(seen, [])
@@ -280,9 +282,7 @@ class TestMandatoryRoutingIntegration(unittest.TestCase):
             result = _run_pipeline(PipelineRequest(
                 mode="analyze", max_candidates=1, from_snapshot=snap,
                 model_override=FunctionModel(_model),
-                qwen_systemone_base_url="http://127.0.0.1:1919/v1",
-                qwen_systemone_model="test-qwen",
-                qwen_systemone_transport=httpx.MockTransport(lambda r: httpx.Response(503)),
+                triage_model_override=_failed_routing_model(),
                 triage_scorer=_failing_scorer))
             self.assertEqual(result.exit_code, 3)
             self.assertEqual(seen, [])
