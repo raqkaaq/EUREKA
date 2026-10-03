@@ -51,6 +51,7 @@ src/radar/
     triage_input.py    canonical model/state/questions input for both backends
     ranking.py         deterministic scoring/selection (pool → ranked topN)
     evidence.py        evidence index resolution/validation
+    link_validation.py pure publisher-link / OpenAlex identity validation
     triage.py          CLEF shortlist policy (scored rank + unknown slot)
   storage/
     snapshots.py       full-pool snapshots, deltas, coverage, strict v1
@@ -167,6 +168,24 @@ contribution sizes are validated in code with bounded retries. No agent has
 research tools or PDF access; abstracts alone cannot establish quality,
 causality, global novelty, replication or deployment safety. Specialization
 adds inference cost/latency; metadata-only refreshes remain model-free.
+
+### Evidence boundary
+
+Model citation indices must be actual integers: booleans, numeric strings
+and floats are rejected by the shared Pydantic draft schema, not silently
+converted to a different paper index. The JSON wire schema still declares
+integers. Specialist and synthesis calls retain their bounded validation
+retry; persistent invalid citations fail without a successful report.
+
+Evidence links are attached in code. Publisher URLs must be HTTP(S) with a
+valid authority/port, no embedded credentials and no raw whitespace, controls,
+backslashes, quotes or angle brackets. A malformed publisher URL falls back
+to the validated OpenAlex work URL instead of aborting the report. If neither
+link is safe, that citation is omitted; the opportunity and other valid links
+remain. Source normalization requires an HTTP(S) `openalex.org/W...` identity
+without ports, query strings or fragments, rather than a domain substring.
+No snapshot migration, URL fetching, DNS lookup or reachability claim is
+involved; legacy cached rows remain readable but unsafe links are not emitted.
 
 ## Offline transport acceptance
 

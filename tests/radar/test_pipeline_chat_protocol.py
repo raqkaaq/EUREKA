@@ -499,6 +499,60 @@ class TestPipelineChatProtocol(unittest.TestCase):
         for token in ("pool=200", "scored=192", "unknown=8", "selected=2", "analyzed=2"):
             self.assertIn(token, " ".join(result.stderr_notes))
 
+    def test_coerced_specialist_citations_are_rejected_and_retried_on_the_wire(self):
+        for index in (True, "1", 1.0):
+            with self.subTest(index_type=type(index).__name__):
+                seen = []
+
+                def chat(request):
+                    body = json.loads(request.content)
+                    stage = "triage" if is_triage(body) else research_role(body)
+                    seen.append(stage)
+                    output = valid_output(body)
+                    if stage == "ml_methods" and seen.count(stage) == 1:
+                        output["opportunities"][0]["evidence"] = [index]
+                    return completion(body, output)
+
+                result, _, client_count = self.run_cached(paper_pool()[1:3], chat)
+                self.assertEqual(result.exit_code, 0, result.stderr_notes)
+                self.assertEqual(seen.count("ml_methods"), 2)
+                self.assertEqual(seen.count("synthesis"), 1)
+                self.assertEqual(client_count, 2)
+
+    def test_coerced_final_citations_fail_closed_after_bounded_retries(self):
+        seen = []
+
+        def chat(request):
+            body = json.loads(request.content)
+            stage = "triage" if is_triage(body) else research_role(body)
+            seen.append(stage)
+            output = valid_output(body)
+            if stage == "synthesis":
+                output["opportunities"][0]["evidence"] = [True]
+            return completion(body, output)
+
+        result, _, client_count = self.run_cached(paper_pool()[1:3], chat)
+        self.assertEqual(result.exit_code, 3)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(seen.count("synthesis"), 2)
+        self.assertEqual(client_count, 2)
+
+    def test_malformed_publisher_url_no_longer_aborts_a_valid_cached_report(self):
+        pool = paper_pool()[1:3]
+        for work in pool:
+            work.primary_url = "http://[malformed"
+
+        def chat(request):
+            body = json.loads(request.content)
+            return completion(body, valid_output(body))
+
+        result, _, client_count = self.run_cached(pool, chat)
+        self.assertEqual(result.exit_code, 0, result.stderr_notes)
+        self.assertEqual(client_count, 2)
+        self.assertIn("**Evidence:**", result.stdout)
+        self.assertIn("https://openalex.org/W1", result.stdout)
+        self.assertNotIn("http://[malformed", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

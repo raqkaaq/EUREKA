@@ -8,7 +8,7 @@ never writes URLs, so it cannot hallucinate them.
 
 from __future__ import annotations
 
-import urllib.parse as _urlparse
+from radar.processing.link_validation import is_http_link, is_openalex_work_link
 
 from radar.schema.opportunities import (
     EvidenceLink,
@@ -25,10 +25,12 @@ def _link_for(index: int, candidates: list[CollectedWork]) -> EvidenceLink | Non
     if not (0 <= index < len(candidates)):
         return None
     work = candidates[index]
-    url = work.primary_url or work.openalex_id
-    parsed = _urlparse.urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    if is_http_link(work.primary_url):
+        url = work.primary_url
+    elif is_openalex_work_link(work.openalex_id):
         url = work.openalex_id
+    else:
+        return None  # No safe source link: never invent or emit an unsafe fallback.
     return EvidenceLink(
         index=index,
         title=work.title or "(untitled)",
