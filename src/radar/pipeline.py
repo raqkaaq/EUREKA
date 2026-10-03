@@ -130,6 +130,21 @@ def _validate_request(request: PipelineRequest) -> None:
         validate_lookback_days(request.lookback_days)
     except ValueError as exc:
         raise PipelineUsageError(str(exc)) from exc
+    # Validate editable policy before any source, provider or storage I/O.
+    from radar.config.searches import search_config
+    from radar.prompts.catalog import (
+        opportunity_analysis_prompt, paper_triage_prompt, screening_questions,
+    )
+
+    try:
+        if request.from_snapshot is None:
+            search_config()
+        if request.mode == "analyze":
+            screening_questions()
+            paper_triage_prompt()
+            opportunity_analysis_prompt()
+    except ValueError as exc:
+        raise PipelineUsageError(str(exc)) from exc
 
 
 def _keywords(request: PipelineRequest) -> list[str]:
@@ -137,10 +152,10 @@ def _keywords(request: PipelineRequest) -> list[str]:
 
 
 def _collect_live(request: PipelineRequest) -> list[CollectedWork]:
+    from radar.config.searches import build_query_plan
     from radar.source.openalex import (
         HttpxTransport,
         RetryingTransport,
-        build_query_plan,
         collect,
     )
 

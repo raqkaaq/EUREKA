@@ -20,7 +20,12 @@ class TestServiceFreeLeaves(unittest.TestCase):
             "sys.modules['httpx'] = None; sys.modules['httpx2'] = None;"
             "sys.modules['pydantic_ai'] = None; sys.modules['openai'] = None;"
             "import radar.schema.papers, radar.schema.opportunities,"
-            " radar.config.runtime, radar.config.interests;"
+            " radar.config.runtime, radar.config.interests, radar.config.searches,"
+            " radar.schema.configuration, radar.prompts.catalog;"
+            "from radar.config.interests import default_profile;"
+            "from radar.config.searches import build_query_plan;"
+            "from radar.prompts.catalog import screening_questions;"
+            "build_query_plan(default_profile()); screening_questions();"
             "print('service-free-ok')"
         )
         env = dict(os.environ)

@@ -19,7 +19,8 @@ from radar.output import triage as _out_triage
 from radar.pipeline import PipelineRequest, run as _run_pipeline
 from radar.schema.opportunities import RadarDraft
 from radar.schema.papers import CollectedWork
-from radar.source.openalex import DictTransport, build_query_plan
+from radar.config.searches import build_query_plan
+from radar.source.openalex import DictTransport
 from radar.config.interests import default_profile
 from radar.storage import triage as _triage_store
 
@@ -57,7 +58,9 @@ def _pages(n: int) -> dict:
                 "abstract_inverted_index": {"x": [0]},
                 "doi": "", "publication_year": 2026, "cited_by_count": i})
             i += 1
-        pages[q.terms] = {"results": rows}
+        # Relevance and recent requests may share terms. Preserve their
+        # canned pool instead of overwriting the earlier request's rows.
+        pages.setdefault(q.terms, {"results": []})["results"].extend(rows)
     return pages
 
 

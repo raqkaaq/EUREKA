@@ -1,4 +1,4 @@
-"""OpenAlex discovery source: HTTPX requests, query plans, retry/quota policy,
+"""OpenAlex discovery source: HTTPX requests, retry/quota policy,
 normalization, dedup, and pre-scoring hooks.
 
 Owns all OpenAlex HTTP. No ranking (see :mod:`radar.processing.ranking`),
@@ -8,7 +8,6 @@ or raw bodies.
 
 from __future__ import annotations
 
-import datetime as _dt
 import json as _json
 import math as _math
 import os as _os
@@ -17,7 +16,6 @@ from typing import Any, Protocol
 
 import httpx as _httpx
 
-from radar.config.interests import RadarProfile
 from radar.config.runtime import (
     DEFAULT_RETRY_AFTER_S,
     DEFAULT_TIMEOUT_S,
@@ -386,53 +384,8 @@ def _safe_str(value: Any, limit: int = 2000) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Query plan + request construction
+# Request construction (query policy lives in radar.config.searches)
 # ---------------------------------------------------------------------------
-
-
-def build_query_plan(profile: RadarProfile, max_queries: int = 4) -> QueryPlan:
-    """Build a bounded plan: semantic queries + one recency-biased query.
-
-    Every query carries ``from_date`` derived from ``profile.lookback_days``
-    so the configured lookback window applies to the whole plan. Semantic
-    queries preserve OpenAlex relevance ranking (no ``sort`` param); only
-    the recent query sorts by ``publication_date:desc`` (see
-    :func:`build_request`).
-    """
-    keywords = [k for k in profile.keywords if k]
-    if not keywords:
-        raise ValueError("profile must contain at least one non-empty keyword")
-    n = max(1, min(int(max_queries), MAX_QUERIES))
-    from_date = (
-        _dt.date.today() - _dt.timedelta(days=profile.lookback_days)
-    ).isoformat()
-    # Semantic queries: one per keyword, capped.
-    queries: list[PlannedQuery] = []
-    for kw in keywords[:n]:
-        terms = kw if not profile.domains else f"{kw} {' '.join(profile.domains[:2])}"
-        queries.append(
-            PlannedQuery(
-                kind="semantic", terms=terms[:300], per_page=25, from_date=from_date
-            )
-        )
-        if len(queries) >= n - 1 and n > 1:
-            break
-    # Recent-keyword query: newest-first slice over the lookback window.
-    if n > 1 or not queries:
-        recent_terms = " ".join(keywords[:3])[:300]
-        queries.append(
-            PlannedQuery(
-                kind="recent",
-                terms=recent_terms,
-                per_page=25,
-                from_date=from_date,
-            )
-        )
-    queries = queries[:n]
-    if not queries:
-        raise ValueError("could not build a non-empty query plan")
-    summary = f"keywords={len(keywords)} domains={len(profile.domains)}"
-    return QueryPlan(queries=queries, profile_summary=summary)
 
 
 def build_request(
