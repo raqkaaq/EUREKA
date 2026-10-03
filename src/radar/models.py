@@ -104,6 +104,19 @@ class RadarDraft(BaseModel):
     ignore: list[str] = Field(default_factory=list, max_length=10)
     next_move: str = Field(default="", max_length=2000)
 
+    @field_validator("ignore", mode="before")
+    @classmethod
+    def _coerce_ignore(cls, v: object) -> object:
+        """Coerce non-string ignore items (models emit ints/nulls).
+
+        Mirrors the downstream ``str()`` coercion in evidence attachment:
+        nulls are dropped, the rest stringified. Live-evidenced 2026-10-03
+        (``ignore.0: string_type`` first-try validation failures).
+        """
+        if isinstance(v, list):
+            return [str(x) for x in v if x is not None]
+        return v
+
 
 class EvidenceLink(BaseModel):
     """Deterministically attached candidate reference (never model-written)."""

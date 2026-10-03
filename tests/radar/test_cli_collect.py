@@ -35,11 +35,14 @@ class FakeTransport:
             ]
         }
 
+    def close(self):
+        pass
+
 
 class TestCollectCandidatesBounds(unittest.TestCase):
     def test_small_max_still_executes_whole_plan(self):
         fake = FakeTransport()
-        with patch.object(_cli, "UrllibTransport", lambda: fake):
+        with patch.object(_cli, "HttpxTransport", lambda: fake):
             works = _cli.collect_candidates(
                 max_candidates=1, lookback_days=90, timeout=10.0, keywords=None
             )

@@ -15,62 +15,30 @@ import argparse
 import json
 import math as _math
 import sys
-import time
-import urllib.error as _urlerror
 
 from radar import freetoken as _freetoken
 from radar import refresh as _refresh
 from radar.analyze import analyze_candidates
 from radar.models import CollectedWork
-from radar.openalex import MAX_TOTAL_WORKS, UrllibTransport, build_query_plan, collect
+from radar.openalex import (
+    DEFAULT_RETRY_AFTER_S,
+    MAX_RETRY_AFTER_S,
+    MAX_TOTAL_WORKS,
+    HttpxTransport,
+    RetryingTransport,
+    build_query_plan,
+    collect,
+)
 from radar.profile import default_profile
 from radar.prompt import MAX_CANDIDATES_IN_PROMPT, bound_candidates
 from radar.report import attach_evidence, render_markdown
 
+# Re-exported so existing callers keep one import site for retry policy.
+__all__ = ["RetryingTransport"]
+
 DEFAULT_MAX_CANDIDATES = 12
 MAX_MAX_CANDIDATES = 25
 DEFAULT_TIMEOUT_S = 10.0
-# Bounded 429 handling: honor Retry-After (capped) with few retries so the
-# one-command run survives transient OpenAlex search-cluster throttling.
-MAX_429_RETRIES = 2
-MAX_RETRY_AFTER_S = 45.0
-# Small bounded backoff when Retry-After is missing or malformed; valid
-# values are still honored (floored at 1s, capped at MAX_RETRY_AFTER_S).
-DEFAULT_RETRY_AFTER_S = 2.0
-
-
-class RetryingTransport:
-    """Wrap an OpenAlex transport with bounded 429 retries.
-
-    Retries only HTTP 429, honoring the server's ``Retry-After`` header up
-    to ``MAX_RETRY_AFTER_S``. All other errors propagate immediately.
-    """
-
-    def __init__(self, inner: UrllibTransport, max_retries: int = MAX_429_RETRIES):
-        self._inner = inner
-        self._max_retries = max(0, min(int(max_retries), 5))
-
-    def get_json(self, url, params, headers, timeout):
-        attempts = 0
-        while True:
-            try:
-                return self._inner.get_json(url, params, headers, timeout)
-            except _urlerror.HTTPError as exc:
-                if exc.code != 429 or attempts >= self._max_retries:
-                    raise
-                attempts += 1
-                wait = DEFAULT_RETRY_AFTER_S
-                try:
-                    retry_after = exc.headers.get("Retry-After") if exc.headers else None
-                    if retry_after is not None:
-                        parsed = float(retry_after)
-                        if not _math.isfinite(parsed):
-                            raise ValueError("non-finite Retry-After")
-                        wait = min(MAX_RETRY_AFTER_S, max(1.0, parsed))
-                    # Missing header: keep small bounded DEFAULT_RETRY_AFTER_S.
-                except (TypeError, ValueError):
-                    wait = DEFAULT_RETRY_AFTER_S
-                time.sleep(wait)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -215,13 +183,17 @@ def collect_pool(
     # Five default AI/ML themes plus the newest-first query fit the hard
     # six-request plan bound, so no default theme is silently omitted.
     plan = build_query_plan(profile, max_queries=6)
-    return collect(
-        plan,
-        RetryingTransport(UrllibTransport()),
-        keywords_for_scoring=profile.keywords,
-        timeout=timeout,
-        max_total=MAX_TOTAL_WORKS,
-    )
+    base = HttpxTransport()
+    try:
+        return collect(
+            plan,
+            RetryingTransport(base),
+            keywords_for_scoring=profile.keywords,
+            timeout=timeout,
+            max_total=MAX_TOTAL_WORKS,
+        )
+    finally:
+        base.close()
 
 
 def collect_candidates(
@@ -360,20 +332,22 @@ def main(argv: list[str] | None = None) -> int:
 
     # Validate private-network config early for a fast, clear model error, then
     # resolve the model (FREETOKEN_MODEL env or local /models endpoint).
+    # The session owns its HTTP client; it is closed deterministically below.
     try:
         config = _freetoken.FreeTokenConfig.resolve(base_url=args.base_url, model=args.model)
-        model = _freetoken.build_model(config)
+        session = _freetoken.build_session(config)
     except _freetoken.FreeTokenError as exc:
         return _fail(str(exc), 3)
 
     try:
         draft, _prompt = analyze_candidates(
             works,
-            model=model,
+            model=None,
             max_candidates=args.max_candidates,
             analysis_timeout_s=analysis_timeout,
             max_tokens=args.max_tokens,
             disable_thinking=disable_thinking,
+            session=session,
         )
     except _freetoken.FreeTokenError as exc:
         return _fail(str(exc), 3)

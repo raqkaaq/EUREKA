@@ -73,6 +73,10 @@ def build_prompt(candidates: list[CollectedWork], max_candidates: int = MAX_CAND
         "replication sketch), evidence (candidate indices). "
         "Also list weak/duplicate candidates to ignore and one next_move for the radar."
     )
+    lines.append(
+        f"Valid evidence indices for this run: 0..{len(bounded) - 1}. "
+        "Cite only these integers; never invent others."
+    )
     prompt = "\n".join(lines)
     if len(prompt) > MAX_PROMPT_CHARS:
         prompt = prompt[:MAX_PROMPT_CHARS].rstrip() + "\n[truncated: prompt budget]"

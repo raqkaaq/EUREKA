@@ -18,6 +18,20 @@ then analyze them with a local **FreeToken** model through **PydanticAI**
 - Tests inject `TestModel`/`FunctionModel` (see
   https://ai.pydantic.dev/guides/testing/) — no network, no LLM.
 
+## Networking (httpx)
+
+- All direct HTTP (OpenAlex discovery, FreeToken `/models`) uses standard
+  `httpx` (direct dependency), injected via `httpx.MockTransport` in tests.
+  OpenAlex clients ignore proxy env and never follow redirects; transport
+  errors are redacted (no URLs, credentials, headers, or bodies).
+- Inference stays PydanticAI-only (`Agent[None, RadarDraft]` over
+  `OpenAIChatModel`/`OpenAIProvider`; no raw SDK calls). The provider
+  receives an explicitly owned `httpx2.AsyncClient` (the PydanticAI 2.52
+  typed seam; the legacy `httpx.AsyncClient` path warns), closed
+  deterministically after each run. Per-run `max_tokens`/timeout/usage
+  limits apply; the model never writes URLs (evidence indices only, with
+  the valid `0..N-1` range stated in the prompt).
+
 ## Usage
 
 ```sh

@@ -290,24 +290,19 @@ class TestLookbackAndBounds(unittest.TestCase):
         self.assertIn("beta", top1[0].matched_queries)
 
 
-def _http_error(
-    code: int, headers: dict | None = None, body: bytes = b""
-) -> "HTTPError":
-    """Build a real HTTPError fixture (no network)."""
-    import io
-    from email.message import Message
-    from urllib.error import HTTPError
+def _mock_transport(status: int, headers: dict | None = None,
+                    body: bytes = b"") -> "HttpxTransport":
+    """HttpxTransport backed by an httpx.MockTransport (no network)."""
+    import httpx
 
-    msg = Message()
-    for key, value in (headers or {}).items():
-        msg[key] = value
-    return HTTPError(
-        "https://api.openalex.org/works?search=x",
-        code,
-        "HTTP error",
-        msg,
-        io.BytesIO(body),
-    )
+    from radar.openalex import HttpxTransport
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, headers=headers or {}, content=body,
+                              request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    return HttpxTransport(client=client)
 
 
 def _quota_body() -> bytes:
@@ -327,44 +322,36 @@ def _quota_headers(retry_after: str = "79188") -> dict:
 
 
 class TestDailyQuota(unittest.TestCase):
-    """Confirmed daily-budget 429s fail fast with a typed non-HTTPError.
+    """Confirmed daily-budget 429s fail fast with a typed non-HTTP error.
 
-    Transient 429s must stay plain HTTPErrors so the existing bounded
-    retry wrapper still handles them; other statuses are untouched.
+    Transient 429s stay redacted transport errors so the bounded retry
+    wrapper still handles them; other statuses are untouched. No network.
     """
 
-    def _get_json_raising(self, exc: BaseException) -> BaseException:
-        from unittest.mock import patch
-
-        from radar.openalex import UrllibTransport
-
-        with patch(
-            "radar.openalex._request.urlopen", side_effect=exc
-        ):
-            try:
-                UrllibTransport().get_json(
-                    "https://api.openalex.org/works",
-                    {"search": "x", "api_key": "SECRET-KEY-123"},
-                    {},
-                    10.0,
-                )
-            except BaseException as got:  # noqa: BLE001
-                return got
+    def _get_json_raising(self, status: int, headers: dict | None,
+                          body: bytes) -> BaseException:
+        try:
+            _mock_transport(status, headers, body).get_json(
+                "https://api.openalex.org/works",
+                {"search": "x", "api_key": "SECRET-KEY-123"},
+                {},
+                10.0,
+            )
+        except BaseException as got:  # noqa: BLE001
+            return got
         raise AssertionError("get_json did not raise")
 
     def test_confirmed_quota_raises_typed_error(self):
-        from urllib.error import HTTPError
+        import httpx
 
         from radar.openalex import OpenAlexQuotaError
 
-        exc = _http_error(429, _quota_headers(), _quota_body())
-        got = self._get_json_raising(exc)
+        got = self._get_json_raising(429, _quota_headers(), _quota_body())
         self.assertIsInstance(got, OpenAlexQuotaError)
-        self.assertNotIsInstance(got, HTTPError)
+        self.assertNotIsInstance(got, httpx.HTTPError)
 
     def test_quota_message_actionable_and_redacted(self):
-        exc = _http_error(429, _quota_headers(), _quota_body())
-        got = self._get_json_raising(exc)
+        got = self._get_json_raising(429, _quota_headers(), _quota_body())
         text = str(got)
         self.assertIn("OPENALEX_API_KEY", text)
         self.assertNotIn("SECRET-KEY-123", text)
@@ -374,52 +361,49 @@ class TestDailyQuota(unittest.TestCase):
     def test_headers_alone_confirm_quota(self):
         from radar.openalex import OpenAlexQuotaError
 
-        exc = _http_error(429, _quota_headers(), b"")
-        got = self._get_json_raising(exc)
+        got = self._get_json_raising(429, _quota_headers(), b"")
         self.assertIsInstance(got, OpenAlexQuotaError)
 
     def test_transient_429_stays_http_error(self):
-        from urllib.error import HTTPError
+        from radar.openalex import OpenAlexHttpError
 
-        exc = _http_error(429, {"Retry-After": "2"}, b"busy, try again")
-        got = self._get_json_raising(exc)
-        self.assertIsInstance(got, HTTPError)
+        got = self._get_json_raising(429, {"Retry-After": "2"}, b"busy, try again")
+        self.assertIsInstance(got, OpenAlexHttpError)
+        self.assertEqual(got.status_code, 429)
 
     def test_zero_remaining_short_retry_not_quota_without_body(self):
-        from urllib.error import HTTPError
+        from radar.openalex import OpenAlexHttpError
 
         headers = {"Retry-After": "5", "X-RateLimit-Remaining": "0"}
-        got = self._get_json_raising(_http_error(429, headers, b""))
-        self.assertIsInstance(got, HTTPError)
+        got = self._get_json_raising(429, headers, b"")
+        self.assertIsInstance(got, OpenAlexHttpError)
+        self.assertEqual(got.status_code, 429)
 
     def test_malformed_body_transient_headers_stays_http_error(self):
-        from urllib.error import HTTPError
+        from radar.openalex import OpenAlexHttpError
 
-        exc = _http_error(429, {"Retry-After": "2"}, b"{not json###")
-        got = self._get_json_raising(exc)
-        self.assertIsInstance(got, HTTPError)
+        got = self._get_json_raising(429, {"Retry-After": "2"}, b"{not json###")
+        self.assertIsInstance(got, OpenAlexHttpError)
+        self.assertEqual(got.status_code, 429)
 
     def test_missing_headers_and_body_stays_http_error(self):
-        from urllib.error import HTTPError
+        from radar.openalex import OpenAlexHttpError
 
-        exc = _http_error(429, {}, b"")
-        exc.fp = None
-        got = self._get_json_raising(exc)
-        self.assertIsInstance(got, HTTPError)
+        got = self._get_json_raising(429, {}, b"")
+        self.assertIsInstance(got, OpenAlexHttpError)
+        self.assertEqual(got.status_code, 429)
 
     def test_non_429_status_untouched(self):
-        from urllib.error import HTTPError
+        from radar.openalex import OpenAlexHttpError
 
-        exc = _http_error(503, _quota_headers(), _quota_body())
-        got = self._get_json_raising(exc)
-        self.assertIsInstance(got, HTTPError)
-        self.assertEqual(got.code, 503)
+        got = self._get_json_raising(503, _quota_headers(), _quota_body())
+        self.assertIsInstance(got, OpenAlexHttpError)
+        self.assertEqual(got.status_code, 503)
 
     def test_quota_fail_fast_no_retry_sleep(self):
         from unittest.mock import patch
 
-        from radar.cli import RetryingTransport
-        from radar.openalex import OpenAlexQuotaError
+        from radar.openalex import OpenAlexQuotaError, RetryingTransport
 
         calls: list = []
 
@@ -436,24 +420,71 @@ class TestDailyQuota(unittest.TestCase):
 
     def test_transient_429_still_retried(self):
         from unittest.mock import patch
-        from urllib.error import HTTPError
 
-        from radar.cli import RetryingTransport
+        import httpx
 
-        transient = _http_error(429, {"Retry-After": "1"}, b"busy")
+        from radar.openalex import RetryingTransport
+
         calls: list = []
 
-        class FlakyInner:
-            def get_json(self, url, params, headers, timeout):
-                calls.append(1)
-                if len(calls) == 1:
-                    raise transient
-                return {"results": []}
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) == 1:
+                return httpx.Response(429, headers={"Retry-After": "1"},
+                                      content=b"busy", request=request)
+            return httpx.Response(200, content=b'{"results": []}',
+                                  request=request)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        from radar.openalex import HttpxTransport, RetryingTransport
 
         with patch("time.sleep"):
-            out = RetryingTransport(FlakyInner()).get_json("u", {}, {}, 1.0)
+            out = RetryingTransport(HttpxTransport(client=client)).get_json(
+                "https://api.openalex.org/works", {}, {}, 1.0)
         self.assertEqual(out, {"results": []})
         self.assertEqual(len(calls), 2)
+
+
+class TestHttpxTransportConfig(unittest.TestCase):
+    """Direct-network-call guarantees: timeouts, no proxy env, no redirects."""
+
+    def test_success_returns_parsed_envelope(self):
+        import httpx
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=b'{"results": [], "meta": {}}',
+                                  request=request)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        from radar.openalex import HttpxTransport
+
+        out = HttpxTransport(client=client).get_json("https://u", {"a": "b"}, {}, 5.0)
+        self.assertEqual(out, {"results": [], "meta": {}})
+
+    def test_client_ignores_proxy_env_and_redirects(self):
+        from radar.openalex import default_client
+
+        client = default_client()
+        try:
+            self.assertFalse(client.trust_env)
+            self.assertFalse(client.follow_redirects)
+        finally:
+            client.close()
+
+    def test_timeout_surfaces_without_request_details(self):
+        import httpx
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectTimeout("slow", request=request)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        from radar.openalex import HttpxTransport
+
+        with self.assertRaises(Exception) as ctx:
+            HttpxTransport(client=client).get_json(
+                "https://api.openalex.org/works",
+                {"search": "x", "api_key": "SECRET-KEY-123"}, {}, 5.0)
+        self.assertNotIn("SECRET-KEY-123", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -284,11 +284,12 @@ class TestCliSeams(unittest.TestCase):
                 with mock.patch(
                     "radar.cli._freetoken.FreeTokenConfig.resolve"
                 ) as fake_resolve:
-                    with mock.patch("radar.cli._freetoken.build_model") as fake_build:
+                    with mock.patch("radar.cli._freetoken.build_session") as fake_build:
                         fake_resolve.return_value = mock.Mock()
-                        fake_build.return_value = object()
-                        with mock.patch("builtins.print") as fake_print:
-                            code = main(["--max-candidates", "15"])
+                        fake_build.return_value = mock.Mock(model=object())
+                        with mock.patch("radar.cli._freetoken.close_session"):
+                            with mock.patch("builtins.print") as fake_print:
+                                code = main(["--max-candidates", "15"])
         self.assertEqual(code, 0)
         # LLM received the full bounded set including index 14.
         _, kwargs = fake_analyze.call_args
@@ -307,10 +308,12 @@ class TestCliSeams(unittest.TestCase):
         with mock.patch("radar.cli.collect_candidates", return_value=works):
             with mock.patch("radar.cli.analyze_candidates", return_value=(draft, "p")):
                 with mock.patch("radar.cli._freetoken.FreeTokenConfig.resolve", return_value=mock.Mock()):
-                    with mock.patch("radar.cli._freetoken.build_model", return_value=object()):
-                        with mock.patch("radar.cli.attach_evidence", side_effect=RuntimeError("boom")):
-                            with mock.patch("builtins.print") as fake_print:
-                                code = main(["--max-candidates", "1"])
+                    with mock.patch("radar.cli._freetoken.build_session",
+                                       return_value=mock.Mock(model=object())):
+                        with mock.patch("radar.cli._freetoken.close_session"):
+                            with mock.patch("radar.cli.attach_evidence", side_effect=RuntimeError("boom")):
+                                with mock.patch("builtins.print") as fake_print:
+                                    code = main(["--max-candidates", "1"])
         self.assertEqual(code, 3)
         self.assertIn("Report generation failed", fake_print.call_args.args[0])
 

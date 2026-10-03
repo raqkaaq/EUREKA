@@ -171,10 +171,11 @@ class TestCachedSnapshot(unittest.TestCase):
                                    return_value=(draft, "p")):
                 with mock.patch.object(_cli._freetoken.FreeTokenConfig,
                                        "resolve", return_value=mock.Mock()):
-                    with mock.patch.object(_cli._freetoken, "build_model",
-                                           return_value=object()):
-                        with mock.patch("builtins.print"):
-                            code = _cli.main(["--from-snapshot", path])
+                    with mock.patch.object(_cli._freetoken, "build_session",
+                                           return_value=mock.Mock(model=object())):
+                        with mock.patch.object(_cli._freetoken, "close_session"):
+                            with mock.patch("builtins.print"):
+                                code = _cli.main(["--from-snapshot", path])
             self.assertEqual(code, 0)
             self.assertEqual(open(path, "rb").read(), before)
 
@@ -187,6 +188,50 @@ class TestCoverageGuard(unittest.TestCase):
             with self.assertRaises(_refresh.RefreshError):
                 _refresh.update_llm_coverage(
                     tmp, 1, 0, expect_collected_at="2099-01-01T00:00:00+00:00")
+
+
+class TestValidationCategories(unittest.TestCase):
+    def test_invalid_model_output_reports_safe_categories(self):
+        from pydantic_ai.messages import ModelResponse, ToolCallPart
+
+        def _invalid(messages, info):
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="final_result",
+                args={"opportunities": [{
+                    "title": "T", "wow": "W", "investigate": "I",
+                    "reproduce": "R",
+                    "evidence": ["MARKER-BAD-VALUE-9z"]}],
+                    "ignore": [], "next_move": "n"})])
+
+        with self.assertRaises(_ft.FreeTokenError) as ctx:
+            _analyze.analyze_candidates(
+                [_work("https://openalex.org/W1")],
+                model=FunctionModel(_invalid))
+        text = str(ctx.exception)
+        self.assertIn("evidence", text)
+        self.assertNotIn("MARKER-BAD-VALUE-9z", text)
+
+    def test_prompt_states_valid_evidence_range(self):
+        from radar.prompt import build_prompt
+
+        prompt = build_prompt(
+            [_work(f"https://openalex.org/W{i}") for i in range(3)],
+            max_candidates=3)
+        self.assertIn("0..2", prompt)
+
+    def test_non_string_ignore_items_coerced(self):
+        from pydantic_ai.messages import ModelResponse, ToolCallPart
+
+        def _ints_in_ignore(messages, info):
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="final_result",
+                args={"opportunities": [], "ignore": [7, None, "dup"],
+                      "next_move": "n"})])
+
+        draft, _ = _analyze.analyze_candidates(
+            [_work("https://openalex.org/W1")],
+            model=FunctionModel(_ints_in_ignore))
+        self.assertEqual(draft.ignore, ["7", "dup"])
 
 
 if __name__ == "__main__":

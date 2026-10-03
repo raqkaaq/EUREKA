@@ -2,11 +2,12 @@
 abstract reconstruction, normalization, dedup, provenance, pre-scoring.
 
 Constraints honored:
-- stdlib + pydantic only, no LLM calls;
+- standard httpx + pydantic only, no LLM calls;
 - strict timeouts; bounded requests/results;
 - optional OPENALEX_API_KEY;
-- injectable HTTP transport for tests;
-- all remote text treated as untrusted (coerced, truncated, never eval'd).
+- injectable HTTP transport for tests (httpx.MockTransport);
+- all remote text treated as untrusted (coerced, truncated, never eval'd);
+- errors never carry request URLs, credentials, headers, or raw bodies.
 """
 
 from __future__ import annotations
@@ -15,10 +16,10 @@ import datetime as _dt
 import json as _json
 import math as _math
 import os as _os
-import urllib.error as _urlerror
-import urllib.parse as _parse
-import urllib.request as _request
+import time as _time
 from typing import Any, Protocol
+
+import httpx as _httpx
 
 from radar.models import (
     CollectedWork,
@@ -33,12 +34,21 @@ DEFAULT_TIMEOUT_S = 10.0
 MAX_TIMEOUT_S = 30.0
 MAX_TOTAL_WORKS = 200
 MAX_ABSTRACT_CHARS = 20000
+#: Bound on a single response body kept in memory (~2MB cap).
+RESPONSE_READ_LIMIT = 2_000_000
 # Bound the `select` payload; respected by current OpenAlex /works API.
 SELECT_FIELDS = (
     "id,title,abstract_inverted_index,doi,publication_year,"
     "primary_location,best_oa_location,locations,cited_by_count"
 )
 USER_AGENT = "eureka-radar-prototype/0.1 (mailto:prototype@example.com)"
+# Bounded 429 handling: honor Retry-After (capped) with few retries so the
+# one-command run survives transient OpenAlex search-cluster throttling.
+MAX_429_RETRIES = 2
+MAX_RETRY_AFTER_S = 45.0
+# Small bounded backoff when Retry-After is missing or malformed; valid
+# values are still honored (floored at 1s, capped at MAX_RETRY_AFTER_S).
+DEFAULT_RETRY_AFTER_S = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -54,23 +64,77 @@ class OpenAlexTransport(Protocol):
     ) -> dict[str, Any]: ...
 
 
-class UrllibTransport:
-    """Default stdlib transport with strict timeouts."""
+class OpenAlexHttpError(RuntimeError):
+    """Non-quota OpenAlex transport failure (redacted, typed by status).
+
+    Carries only the numeric ``status_code`` (None for transport-level
+    failures such as timeouts). Never carries request URLs, query params,
+    credentials, headers, or raw bodies.
+    """
+
+    def __init__(self, status_code: int | None, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def default_client() -> _httpx.Client:
+    """Build the default OpenAlex client: no proxy env, no redirects."""
+    return _httpx.Client(trust_env=False, follow_redirects=False)
+
+
+class HttpxTransport:
+    """Default httpx transport with strict timeouts and redacted errors."""
+
+    def __init__(self, client: _httpx.Client | None = None):
+        self._client = client if client is not None else default_client()
+        self._owned = client is None
+
+    def close(self) -> None:
+        """Close the owned client; safe to call for injected clients too."""
+        if self._owned:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+
+    def __enter__(self) -> "HttpxTransport":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
     def get_json(self, url, params, headers, timeout):
         timeout = _check_timeout(timeout)
-        qs = _parse.urlencode(params)
-        full = f"{url}?{qs}" if qs else url
-        req = _request.Request(full, headers=headers or {}, method="GET")
         try:
-            with _request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-                raw = resp.read(2_000_000)  # bound: ~2MB cap per response
-        except _urlerror.HTTPError as exc:
-            if getattr(exc, "code", None) == 429:
-                quota = quota_error_from_http_error(exc)
+            resp = self._client.get(
+                url, params=params, headers=headers or {}, timeout=timeout
+            )
+            resp.raise_for_status()
+        except _httpx.HTTPStatusError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 429 and exc.response is not None:
+                quota = _quota_error_from_parts(
+                    exc.response.status_code,
+                    exc.response.headers,
+                    bytes(exc.response.content[:QUOTA_BODY_READ_LIMIT]),
+                )
                 if quota is not None:
-                    raise quota from exc
-            raise
+                    raise quota from None
+                raise OpenAlexHttpError(
+                    status, f"OpenAlex request failed with HTTP {status} (transient)."
+                ) from None
+            raise OpenAlexHttpError(
+                status,
+                f"OpenAlex request failed with HTTP {status}."
+                if status is not None
+                else "OpenAlex request failed (no HTTP status).",
+            ) from None
+        except (_httpx.TimeoutException, _httpx.TransportError) as exc:
+            raise OpenAlexHttpError(
+                None, f"OpenAlex request failed ({type(exc).__name__}); "
+                "check network access to https://api.openalex.org."
+            ) from None
+        raw = resp.content[:RESPONSE_READ_LIMIT]
         try:
             data = _json.loads(raw.decode("utf-8", errors="replace"))
         except (ValueError, UnicodeError) as exc:
@@ -78,6 +142,74 @@ class UrllibTransport:
         if not isinstance(data, dict):
             raise ValueError("OpenAlex returned malformed envelope (not an object)")
         return data
+
+
+class RetryingTransport:
+    """Wrap a transport with bounded 429 retries plus quota fast-fail.
+
+    Retries only transient HTTP 429s, honoring the server's ``Retry-After``
+    header up to ``MAX_RETRY_AFTER_S``. Confirmed quota exhaustion
+    (:class:`OpenAlexQuotaError`) and all other errors propagate
+    immediately, never sleeping.
+    """
+
+    def __init__(self, inner: OpenAlexTransport, max_retries: int = MAX_429_RETRIES):
+        self._inner = inner
+        self._max_retries = max(0, min(int(max_retries), 5))
+
+    def get_json(self, url, params, headers, timeout):
+        attempts = 0
+        while True:
+            try:
+                return self._inner.get_json(url, params, headers, timeout)
+            except Exception as exc:
+                if isinstance(exc, OpenAlexQuotaError):
+                    raise
+                wait = _transient_429_wait(exc, attempts, self._max_retries)
+                if wait is None:
+                    raise
+                attempts += 1
+                _time.sleep(wait)
+
+
+def _transient_429_wait(exc: BaseException, attempts: int, max_retries: int) -> float | None:
+    """Bounded backoff for a transient 429, else None (propagate)."""
+    status: int | None = None
+    retry_after: float | None = None
+    if isinstance(exc, OpenAlexHttpError):
+        status = exc.status_code
+        retry_after = _retry_after_value(getattr(exc, "retry_after", None))
+    else:
+        # Legacy urllib shape (older test doubles): honor ``code``.
+        code = getattr(exc, "code", None)
+        if isinstance(code, int):
+            status = code
+        elif getattr(exc, "response", None) is not None:
+            try:
+                status = int(exc.response.status_code)
+            except (TypeError, ValueError):
+                status = None
+        headers = getattr(exc, "headers", None)
+        if headers is not None:
+            retry_after = _retry_after_value(_header_first(headers, "retry-after"))
+    if status != 429 or attempts >= max_retries:
+        return None
+    if retry_after is None:
+        return DEFAULT_RETRY_AFTER_S
+    return min(MAX_RETRY_AFTER_S, max(1.0, retry_after))
+
+
+def _retry_after_value(raw: Any) -> float | None:
+    """Parse Retry-After seconds; None when missing, negative, or malformed."""
+    if raw is None:
+        return None
+    try:
+        seconds = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if not _math.isfinite(seconds) or seconds < 0:
+        return None
+    return seconds
 
 
 # ---------------------------------------------------------------------------
@@ -95,23 +227,11 @@ LONG_QUOTA_RESET_S = 3600.0
 class OpenAlexQuotaError(RuntimeError):
     """Confirmed OpenAlex daily-budget exhaustion: fail fast, do not retry.
 
-    Deliberately NOT an HTTPError, so the bounded 429 retry wrapper lets
-    it through without sleeping. The message carries only safe scalars
+    Deliberately NOT an HTTP error type, so the bounded 429 retry wrapper
+    lets it through without sleeping. The message carries only safe scalars
     (remaining/reset summary plus the remediation); never request URLs,
     credentials, or raw error bodies.
     """
-
-
-def _response_headers(exc: _urlerror.HTTPError) -> Any:
-    """Return the error's headers mapping, or None when absent."""
-    for attr in ("headers", "hdrs"):
-        try:
-            value = getattr(exc, attr, None)
-        except Exception:
-            continue
-        if value is not None:
-            return value
-    return None
 
 
 def _header_first(headers: Any, *names: str) -> str | None:
@@ -144,46 +264,21 @@ def _header_first(headers: Any, *names: str) -> str | None:
     return None
 
 
-def _retry_after_seconds(exc: _urlerror.HTTPError) -> float | None:
-    """Parse Retry-After seconds; None when missing or malformed."""
-    raw = _header_first(_response_headers(exc), "retry-after")
-    if raw is None:
-        return None
-    try:
-        seconds = float(raw.strip())
-    except (TypeError, ValueError):
-        return None
-    if not _math.isfinite(seconds) or seconds < 0:
-        return None
-    return seconds
+def _retry_after_seconds(headers: Any) -> float | None:
+    """Parse Retry-After seconds from headers; None when missing/malformed."""
+    raw = _header_first(headers, "retry-after")
+    return _retry_after_value(raw)
 
 
-def _remaining_budget(exc: _urlerror.HTTPError) -> int | None:
+def _remaining_budget(headers: Any) -> int | None:
     """Parse the remaining-budget header; None when missing or malformed."""
-    raw = _header_first(
-        _response_headers(exc), "x-ratelimit-remaining", "ratelimit-remaining"
-    )
+    raw = _header_first(headers, "x-ratelimit-remaining", "ratelimit-remaining")
     if raw is None:
         return None
     try:
         return int(raw.strip())
     except (TypeError, ValueError):
         return None
-
-
-def _read_error_body(exc: _urlerror.HTTPError) -> bytes:
-    """Peek at most QUOTA_BODY_READ_LIMIT bytes; b"" on any problem."""
-    try:
-        read = exc.read
-    except AttributeError:
-        return b""
-    try:
-        chunk = read(QUOTA_BODY_READ_LIMIT)
-    except Exception:
-        return b""
-    if not isinstance(chunk, (bytes, bytearray)):
-        return b""
-    return bytes(chunk[:QUOTA_BODY_READ_LIMIT])
 
 
 def _body_confirms_budget_exhaustion(raw: bytes) -> bool:
@@ -195,22 +290,23 @@ def _body_confirms_budget_exhaustion(raw: bytes) -> bool:
     return "insufficient" in text and "budget" in text
 
 
-def quota_error_from_http_error(
-    exc: _urlerror.HTTPError,
+def _quota_error_from_parts(
+    status: int | None,
+    headers: Any,
+    body: bytes,
 ) -> OpenAlexQuotaError | None:
-    """Classify a 429 as confirmed daily-budget exhaustion, or None.
+    """Classify a response as confirmed daily-budget exhaustion, or None.
 
     Confirmed when the bounded error body explicitly reports an
     insufficient budget, or when headers show remaining budget 0 with a
     long (daily-scale) Retry-After. Anything else -- including remaining 0
     with a short Retry-After and no explicit body -- returns None so the
-    caller re-raises the original transient HTTPError. Never raises, never
-    exposes credentials, URLs, or raw bodies.
+    caller treats the failure as transient. Never raises, never exposes
+    credentials, URLs, or raw bodies.
     """
-    if getattr(exc, "code", None) != 429:
+    if status != 429:
         return None
-    body = _read_error_body(exc)
-    retry_after = _retry_after_seconds(exc)
+    retry_after = _retry_after_seconds(headers)
     if _body_confirms_budget_exhaustion(body):
         detail = (
             f"shared anonymous daily budget exhausted (remaining 0"
@@ -221,7 +317,7 @@ def quota_error_from_http_error(
             )
             + ")."
         )
-    elif _remaining_budget(exc) == 0 and (
+    elif _remaining_budget(headers) == 0 and (
         retry_after is not None and retry_after >= LONG_QUOTA_RESET_S
     ):
         detail = (

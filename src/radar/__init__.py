@@ -22,7 +22,8 @@ from radar.models import (
 )
 from radar.openalex import (
     BASE_URL,
-    UrllibTransport,
+    HttpxTransport,
+    RetryingTransport,
     build_query_plan,
     build_request,
     cheap_score,
@@ -39,6 +40,7 @@ __all__ = [
     "BASE_URL",
     "CollectedWork",
     "EvidenceLink",
+    "HttpxTransport",
     "LocationInfo",
     "Opportunity",
     "OpportunityDraft",
@@ -47,7 +49,7 @@ __all__ = [
     "RadarDraft",
     "RadarProfile",
     "RadarReport",
-    "UrllibTransport",
+    "RetryingTransport",
     "analyze_candidates",
     "attach_evidence",
     "build_agent",

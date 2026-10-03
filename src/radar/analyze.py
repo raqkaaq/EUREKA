@@ -15,11 +15,16 @@ from __future__ import annotations
 
 import asyncio as _asyncio
 import math as _math
-from typing import Any
+from typing import TYPE_CHECKING
 
 from radar import freetoken as _freetoken
 from radar.models import CollectedWork, RadarDraft
 from radar.prompt import build_prompt
+
+if TYPE_CHECKING:
+    from pydantic_ai.models import Model as _Model
+    from pydantic_ai.settings import ModelSettings as _ModelSettings
+    from pydantic_ai.usage import UsageLimits as _UsageLimits
 
 
 def _check_timeout(value: float, name: str = "--analysis-timeout") -> float:
@@ -40,7 +45,7 @@ def run_bounds(
     request_timeout_s: float = _freetoken.ANALYSIS_REQUEST_TIMEOUT_S,
     request_limit: int = _freetoken.ANALYSIS_REQUEST_LIMIT,
     analysis_timeout_s: float = _freetoken.ANALYSIS_TIMEOUT_S,
-) -> tuple[dict[str, Any], Any, int]:
+) -> tuple["_ModelSettings", "_UsageLimits", int]:
     """Build the bounded per-run settings: ``(model_settings, usage_limits, retries)``.
 
     Pure seam: no network, no model. ``request_timeout_s`` must fit inside
@@ -66,15 +71,15 @@ def run_bounds(
         raise ValueError("request timeout must be within (0, overall deadline]s") from exc
     if not _math.isfinite(per_request) or not (0 < per_request <= analysis_timeout):
         raise ValueError("request timeout must be within (0, overall deadline]s")
-    settings: dict[str, Any] = {"max_tokens": tokens, "timeout": per_request}
+    settings: _ModelSettings = {"max_tokens": tokens, "timeout": per_request}  # type: ignore[typeddict-item]
     if disable_thinking:
-        settings["extra_body"] = _freetoken.thinking_extra_body()
+        settings["extra_body"] = _freetoken.thinking_extra_body()  # type: ignore[typeddict-unknown-key]
     from pydantic_ai.usage import UsageLimits
 
     return settings, UsageLimits(request_limit=limit), _freetoken.ANALYSIS_RETRIES
 
 
-def build_agent(model: Any | None = None, output_type: type[RadarDraft] = RadarDraft):
+def build_agent(model: "_Model | None" = None, output_type: type[RadarDraft] = RadarDraft):
     """Build the analysis agent.
 
     ``model`` is a PydanticAI model instance (injectable for tests). When
@@ -89,6 +94,31 @@ def build_agent(model: Any | None = None, output_type: type[RadarDraft] = RadarD
     return Agent(model, output_type=output_type, retries=_freetoken.ANALYSIS_RETRIES)
 
 
+def _validation_categories(exc: BaseException) -> list[str]:
+    """Summarize output-validation failures as ``loc: error-type`` entries.
+
+    Only field paths and error types are recorded -- never offending values,
+    prompts, or secrets -- so the summary is safe for errors and logs.
+    """
+    categories: list[str] = []
+    node: BaseException | None = exc
+    seen = 0
+    while node is not None and seen < 8:
+        if type(node).__name__ == "ValidationError":
+            errors = getattr(node, "errors", None)
+            if callable(errors):
+                try:
+                    for entry in errors(include_url=False):
+                        if isinstance(entry, dict):
+                            loc = ".".join(str(p) for p in entry.get("loc", ()))
+                            categories.append(f"{loc or '?'}: {entry.get('type', '?')}")
+                except Exception:
+                    pass
+        node = node.__cause__
+        seen += 1
+    return categories[:12]
+
+
 def _actionable(exc: Exception, disable_thinking: bool) -> _freetoken.FreeTokenError:
     text = str(exc)
     lowered = text.lower()
@@ -100,8 +130,14 @@ def _actionable(exc: Exception, disable_thinking: bool) -> _freetoken.FreeTokenE
             f"({type(exc).__name__}: {exc}). Rerun without --disable-thinking; "
             "that server-specific key is not supported by every backend."
         )
+    categories = _validation_categories(exc)
+    detail = (
+        f" Output failed validation ({'; '.join(categories)})"
+        if categories
+        else ""
+    )
     return _freetoken.FreeTokenError(
-        f"FreeToken inference failed ({type(exc).__name__}: {exc}). "
+        f"FreeToken inference failed ({type(exc).__name__}: {exc}).{detail} "
         "Check that your user-owned FreeToken server is serving "
         "OpenAI-compatible Chat Completions at the configured private-network "
         "endpoint from FREETOKEN_BASE_URL/--base-url and that "
@@ -111,18 +147,22 @@ def _actionable(exc: Exception, disable_thinking: bool) -> _freetoken.FreeTokenE
 
 async def analyze_candidates_async(
     candidates: list[CollectedWork],
-    model: Any | None = None,
+    model: "_Model | None" = None,
     max_candidates: int = 12,
     analysis_timeout_s: float = _freetoken.ANALYSIS_TIMEOUT_S,
     max_tokens: int = _freetoken.ANALYSIS_MAX_TOKENS,
     request_limit: int = _freetoken.ANALYSIS_REQUEST_LIMIT,
     disable_thinking: bool = False,
+    session: "_freetoken.FreeTokenSession | None" = None,
 ) -> tuple[RadarDraft, str]:
     """Run the radar analysis under a hard overall deadline.
 
     The deadline cancels the async ``Agent.run`` itself (a blocked sync run
-    could not be interrupted). Raises :class:`freetoken.FreeTokenError` on
-    deadline breach or inference failure.
+    could not be interrupted). When ``session`` is given, its model is used
+    and its HTTP client is closed in the same event loop once the run
+    settles (including on cancellation), so cleanup is deterministic.
+    Raises :class:`freetoken.FreeTokenError` on deadline breach or
+    inference failure.
     """
     settings, limits, retries = run_bounds(
         disable_thinking=disable_thinking,
@@ -134,6 +174,8 @@ async def analyze_candidates_async(
         request_limit=request_limit,
     )
     prompt = build_prompt(candidates, max_candidates=max_candidates)
+    if session is not None:
+        model = session.model
     agent = build_agent(model)
     try:
         async with _asyncio.timeout(float(analysis_timeout_s)):
@@ -154,6 +196,14 @@ async def analyze_candidates_async(
         raise
     except Exception as exc:
         raise _actionable(exc, disable_thinking) from exc
+    finally:
+        if session is not None:
+            # Same-loop deterministic cleanup, including on cancellation.
+            # A close failure must not mask the analysis outcome.
+            try:
+                await session.http_client.aclose()
+            except Exception:
+                pass
     output = result.output
     if not isinstance(output, RadarDraft):
         # Defensive: Agent(output_type=RadarDraft) must return RadarDraft;
@@ -169,12 +219,13 @@ async def analyze_candidates_async(
 
 def analyze_candidates(
     candidates: list[CollectedWork],
-    model: Any | None = None,
+    model: "_Model | None" = None,
     max_candidates: int = 12,
     analysis_timeout_s: float = _freetoken.ANALYSIS_TIMEOUT_S,
     max_tokens: int = _freetoken.ANALYSIS_MAX_TOKENS,
     request_limit: int = _freetoken.ANALYSIS_REQUEST_LIMIT,
     disable_thinking: bool = False,
+    session: "_freetoken.FreeTokenSession | None" = None,
 ) -> tuple[RadarDraft, str]:
     """Run the radar analysis; return ``(draft, prompt)``.
 
@@ -192,5 +243,6 @@ def analyze_candidates(
             max_tokens=max_tokens,
             request_limit=request_limit,
             disable_thinking=disable_thinking,
+            session=session,
         )
     )
