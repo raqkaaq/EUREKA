@@ -56,6 +56,16 @@ MAX_ANALYSIS_OPPORTUNITIES = 2
 MAX_OPPORTUNITIES = 5
 MAX_EVIDENCE_PER_OPP = 3
 
+# --- CLEF triage bounds (mandatory main routing stage; server not yet running) ---
+CLEF_DEFAULT_MODEL = "clef-flash"
+CLEF_DEFAULT_REQUEST_TIMEOUT_S = 10.0
+CLEF_DEFAULT_OVERALL_TIMEOUT_S = 60.0
+CLEF_DEFAULT_CONCURRENCY = 4
+CLEF_MAX_TEXT_JSON_BYTES = 65536
+CLEF_MAX_REQUEST_TIMEOUT_S = 60.0
+CLEF_MAX_OVERALL_TIMEOUT_S = 300.0
+CLEF_MAX_CONCURRENCY = 16
+
 
 def validate_analysis_timeout(value: float) -> float:
     """Overall analysis deadline: finite seconds in (0, 300]."""
@@ -100,6 +110,36 @@ def validate_openalex_timeout(value: float) -> float:
     return float(timeout)
 
 
+def validate_clef_request_timeout(value: float) -> float:
+    """Per-request CLEF timeout in (0, 60]."""
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"--clef-timeout must be within (0, {CLEF_MAX_REQUEST_TIMEOUT_S}]"
+        ) from exc
+    if not _math.isfinite(timeout) or not (0 < timeout <= CLEF_MAX_REQUEST_TIMEOUT_S):
+        raise ValueError(
+            f"--clef-timeout must be within (0, {CLEF_MAX_REQUEST_TIMEOUT_S}]"
+        )
+    return float(timeout)
+
+
+def validate_clef_overall_timeout(value: float) -> float:
+    """Overall CLEF batch timeout in (0, 300]."""
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"--triage-timeout must be within (0, {CLEF_MAX_OVERALL_TIMEOUT_S}]"
+        ) from exc
+    if not _math.isfinite(timeout) or not (0 < timeout <= CLEF_MAX_OVERALL_TIMEOUT_S):
+        raise ValueError(
+            f"--triage-timeout must be within (0, {CLEF_MAX_OVERALL_TIMEOUT_S}]"
+        )
+    return float(timeout)
+
+
 __all__ = [
     "ANALYSIS_MAX_TIMEOUT_S",
     "ANALYSIS_MAX_TOKENS",
@@ -133,6 +173,8 @@ __all__ = [
     "QUOTA_BODY_READ_LIMIT",
     "RESPONSE_READ_LIMIT",
     "validate_analysis_timeout",
+    "validate_clef_overall_timeout",
+    "validate_clef_request_timeout",
     "validate_max_tokens",
     "validate_openalex_timeout",
 ]

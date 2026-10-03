@@ -222,6 +222,19 @@ class TestPromptBounds(unittest.TestCase):
         self.assertEqual(links[0].url, "https://example.org/paper-14")
         self.assertIn("paper 14", links[0].title.lower())
 
+def _all_scored_scorer(pool, profile):
+    from types import SimpleNamespace
+
+    assert profile.keywords, "active profile keywords must reach the scorer"
+    scored = []
+    for pos, w in enumerate(pool):
+        scored.append(SimpleNamespace(
+            work_id=w.openalex_id, status="scored",
+            ai_ml_relevance=round(0.99 - 0.01 * pos, 4),
+            cross_domain_potential=0.1))
+    return SimpleNamespace(
+        model_id="test-clef", rubric_version="r1", results=scored)
+
 
 class TestCliSeams(unittest.TestCase):
     def test_collect_bounds_validated(self):
@@ -296,7 +309,8 @@ class TestCliSeams(unittest.TestCase):
             result = run(PipelineRequest(
                 mode="analyze", max_candidates=1,
                 base_url="https://api.openai.com/v1",
-                source_override=DictTransport(pages)))
+                source_override=DictTransport(pages),
+                triage_scorer=_all_scored_scorer))
         self.assertEqual(result.exit_code, 3)
 
     def test_analysis_report_flow_retains_evidence_above_index_11(self):
@@ -341,7 +355,8 @@ class TestCliSeams(unittest.TestCase):
         result = run(PipelineRequest(
             mode="analyze", max_candidates=15,
             source_override=DictTransport(pages),
-            model_override=FunctionModel(_impl)))
+            model_override=FunctionModel(_impl),
+            triage_scorer=_all_scored_scorer))
         self.assertEqual(result.exit_code, 0)
         self.assertIn("https://openalex.org/W14", result.stdout)
 
@@ -369,7 +384,8 @@ class TestCliSeams(unittest.TestCase):
             result = run(PipelineRequest(
                 mode="analyze", max_candidates=1,
                 source_override=DictTransport(pages),
-                model_override=FunctionModel(_empty)))
+                model_override=FunctionModel(_empty),
+                triage_scorer=_all_scored_scorer))
         self.assertEqual(result.exit_code, 3)
         self.assertTrue(any("Report generation failed" in note
                             for note in result.stderr_notes))

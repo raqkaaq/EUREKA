@@ -22,6 +22,9 @@ from radar.config.runtime import (
     ANALYSIS_MAX_TIMEOUT_S,
     ANALYSIS_TIMEOUT_S,
     ANALYSIS_MAX_TOKENS,
+    CLEF_DEFAULT_MODEL,
+    CLEF_DEFAULT_OVERALL_TIMEOUT_S,
+    CLEF_DEFAULT_REQUEST_TIMEOUT_S,
     DEFAULT_MAX_CANDIDATES,
     MAX_MAX_CANDIDATES,
 )
@@ -106,6 +109,36 @@ def build_parser() -> argparse.ArgumentParser:
         "(or set FREETOKEN_DISABLE_THINKING=1). Default omits it; not every "
         "backend supports it.",
     )
+    parser.add_argument(
+        "--clef-base-url",
+        default=None,
+        help="CLEF/SystemOne base URL for mandatory full-pool screening "
+        "(or set CLEF_BASE_URL; user-owned LAN server, never launched).",
+    )
+    parser.add_argument(
+        "--clef-model",
+        default=None,
+        help=f"CLEF model id (default {CLEF_DEFAULT_MODEL}; or set CLEF_MODEL).",
+    )
+    parser.add_argument(
+        "--clef-timeout",
+        type=float,
+        default=CLEF_DEFAULT_REQUEST_TIMEOUT_S,
+        help="Per-request CLEF timeout in seconds, (0, 60] (default 10).",
+    )
+    parser.add_argument(
+        "--triage-timeout",
+        type=float,
+        default=CLEF_DEFAULT_OVERALL_TIMEOUT_S,
+        help="Overall CLEF screening deadline in seconds, (0, 300] (default 60).",
+    )
+    parser.add_argument(
+        "--triage-output",
+        default=None,
+        metavar="PATH",
+        help="Write an atomic triage.json sidecar inside DIRECTORY PATH; "
+        "strict v1 metadata snapshots are never mutated.",
+    )
     return parser
 
 
@@ -125,6 +158,11 @@ def main(argv: list[str] | None = None) -> int:
         disable_thinking=args.disable_thinking,
         base_url=args.base_url,
         model=args.model,
+        clef_base_url=args.clef_base_url,
+        clef_model=args.clef_model,
+        clef_timeout_s=args.clef_timeout,
+        triage_timeout_s=args.triage_timeout,
+        triage_output=args.triage_output,
     )
     result = run(request)
     for note in result.stderr_notes:
