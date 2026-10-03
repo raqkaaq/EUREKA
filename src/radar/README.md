@@ -39,6 +39,7 @@ uv run python -m radar --keywords "graph neural networks" --lookback-days 30
 | `FREETOKEN_BASE_URL` | User-owned loopback or private-LAN endpoint | required unless `--base-url` is passed |
 | `FREETOKEN_MODEL` | Model id (skips `/models` lookup) | first id from `GET {base}/models` |
 | `FREETOKEN_API_KEY` | Local API key placeholder | `freetoken-local` |
+| `FREETOKEN_DISABLE_THINKING` | Opt-in server-specific thinking-disable key | unset (omitted) |
 | `OPENALEX_API_KEY` | Optional polite OpenAlex pool | unset |
 
 Loopback, RFC 1918, IPv6 ULA, and RFC 6598 endpoints are allowed. Public,
@@ -60,10 +61,45 @@ list, and a **Next move**.
 OpenAlex requests ≤ 6/plan, ≤ 50/page, ≤ 200 total (hard candidate-pool
 cap), timeout ≤ 30 s; candidates ≤ 25 (`--max-candidates` bounds the final
 ranked output slice, never plan execution); prompt ≤ 25 candidates /
-12 000 chars; model validation retries ≤ 1; model HTTP timeout 60 s.
+12 000 chars, at most 2 opportunities with short fields; per-run model
+output ≤ 2000 tokens (`--max-tokens` 128..8000), request limit 2,
+validation retries 0; overall analysis deadline 90 s
+(`--analysis-timeout` (0, 300]); per-request model timeout fits inside it.
 Transient OpenAlex HTTP 429 responses are retried at most twice; valid
 `Retry-After` values are capped at 45 seconds, while missing or malformed
 values use a two-second backoff.
+
+## Cached snapshot synthesis (no OpenAlex calls)
+
+```sh
+# Inspect a cached snapshot (no network, no LLM).
+uv run python -m radar --collect-only --from-snapshot data/radar/snapshot.json
+
+# Analyze cached metadata (zero OpenAlex calls; needs FreeToken).
+uv run python -m radar --from-snapshot data/radar/snapshot.json --max-candidates 2
+
+# Known-working LAN synthesis (model must be served; SYNTHETIC fixture label
+# applies until a free OpenAlex key restores real discovery):
+uv run python -m radar --from-snapshot data/radar/live/fixture_synthetic.json \
+  --max-candidates 2 --base-url http://192.168.0.166:1919/v1 \
+  --model Qwen3.6-35B-A3B-NVFP4 --disable-thinking
+```
+
+`--from-snapshot` loads a valid producer-v1 snapshot, reproducibly selects
+the ranked topN (score desc, OpenAlex ID asc), and discloses the collection
+timestamp/staleness on stderr. Invalid sources are rejected before any
+model call; `--from-snapshot` + `--refresh-dir` is refused (cached
+synthesis never rewrites works). Coverage updates to a refreshed snapshot
+are generation-aware: a stale run never stomps fresher coverage.
+
+## Opt-in thinking disable
+
+`--disable-thinking` (or `FREETOKEN_DISABLE_THINKING=1`) sends the
+server-specific `extra_body.chat_template_kwargs.enable_thinking=false` key
+(probed once against the LAN FreeToken: accepted, honoring not confirmed).
+The key is omitted by default and assumed supported by no backend; a server
+rejection produces a clear rerun-without-it error. Never used to force
+empty or fake output: few or zero opportunities remain valid.
 
 ## Lookback
 
@@ -108,8 +144,10 @@ broad AI/ML plus behavioral/economic lenses. No PDFs are downloaded.
 
 ## Next work
 
-Hard overall LLM deadline, batched full-pool triage, evals, and a
-personal interest profile.
+Batched full-pool triage, evals, and a personal interest profile. Real
+OpenAlex discovery stays blocked until a free API key is configured
+(currently quota-exhausted); synthetic-fixture runs are not end-to-end
+passes.
 
 ## Tests
 

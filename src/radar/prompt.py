@@ -67,9 +67,10 @@ def build_prompt(candidates: list[CollectedWork], max_candidates: int = MAX_CAND
         lines.append(f"--- end untrusted candidate {i} data ---")
     lines.append("")
     lines.append(
-        "TASK: Return up to 5 opportunities. For each: title, wow (the single most "
-        "surprising/testable claim, <=3 sentences), investigate (concrete next experiment "
-        "or analysis), reproduce (minimal replication sketch), evidence (candidate indices). "
+        "TASK: Return at most 2 opportunities. For each: title, wow (the single "
+        "most surprising/testable claim, <=2 sentences), investigate (one sentence: "
+        "concrete next experiment or analysis), reproduce (one sentence: minimal "
+        "replication sketch), evidence (candidate indices). "
         "Also list weak/duplicate candidates to ignore and one next_move for the radar."
     )
     prompt = "\n".join(lines)

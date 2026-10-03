@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import datetime as _dt
 import json as _json
+import math as _math
 import os as _os
+import urllib.error as _urlerror
 import urllib.parse as _parse
 import urllib.request as _request
 from typing import Any, Protocol
@@ -60,8 +62,15 @@ class UrllibTransport:
         qs = _parse.urlencode(params)
         full = f"{url}?{qs}" if qs else url
         req = _request.Request(full, headers=headers or {}, method="GET")
-        with _request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-            raw = resp.read(2_000_000)  # bound: ~2MB cap per response
+        try:
+            with _request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+                raw = resp.read(2_000_000)  # bound: ~2MB cap per response
+        except _urlerror.HTTPError as exc:
+            if getattr(exc, "code", None) == 429:
+                quota = quota_error_from_http_error(exc)
+                if quota is not None:
+                    raise quota from exc
+            raise
         try:
             data = _json.loads(raw.decode("utf-8", errors="replace"))
         except (ValueError, UnicodeError) as exc:
@@ -69,6 +78,164 @@ class UrllibTransport:
         if not isinstance(data, dict):
             raise ValueError("OpenAlex returned malformed envelope (not an object)")
         return data
+
+
+# ---------------------------------------------------------------------------
+# Daily-quota boundary
+# ---------------------------------------------------------------------------
+
+#: Bounded peek into a 429 error body; quota verdicts never need more.
+QUOTA_BODY_READ_LIMIT = 4096
+
+#: A Retry-After at or above this (with Remaining 0) means a daily budget
+#: reset, not transient throttling. Well below the observed ~22h reset.
+LONG_QUOTA_RESET_S = 3600.0
+
+
+class OpenAlexQuotaError(RuntimeError):
+    """Confirmed OpenAlex daily-budget exhaustion: fail fast, do not retry.
+
+    Deliberately NOT an HTTPError, so the bounded 429 retry wrapper lets
+    it through without sleeping. The message carries only safe scalars
+    (remaining/reset summary plus the remediation); never request URLs,
+    credentials, or raw error bodies.
+    """
+
+
+def _response_headers(exc: _urlerror.HTTPError) -> Any:
+    """Return the error's headers mapping, or None when absent."""
+    for attr in ("headers", "hdrs"):
+        try:
+            value = getattr(exc, attr, None)
+        except Exception:
+            continue
+        if value is not None:
+            return value
+    return None
+
+
+def _header_first(headers: Any, *names: str) -> str | None:
+    """Case-insensitive first present header value, else None."""
+    if headers is None:
+        return None
+    try:
+        get = headers.get
+    except AttributeError:
+        return None
+    for name in names:
+        try:
+            value = get(name)
+        except Exception:
+            continue
+        if value is not None:
+            return str(value)
+    # Fallback for plain-dict headers without case-insensitive lookup.
+    try:
+        items = list(headers.items())
+    except Exception:
+        return None
+    lowered = {n.lower() for n in names}
+    for key, value in items:
+        try:
+            if str(key).lower() in lowered:
+                return str(value)
+        except Exception:
+            continue
+    return None
+
+
+def _retry_after_seconds(exc: _urlerror.HTTPError) -> float | None:
+    """Parse Retry-After seconds; None when missing or malformed."""
+    raw = _header_first(_response_headers(exc), "retry-after")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw.strip())
+    except (TypeError, ValueError):
+        return None
+    if not _math.isfinite(seconds) or seconds < 0:
+        return None
+    return seconds
+
+
+def _remaining_budget(exc: _urlerror.HTTPError) -> int | None:
+    """Parse the remaining-budget header; None when missing or malformed."""
+    raw = _header_first(
+        _response_headers(exc), "x-ratelimit-remaining", "ratelimit-remaining"
+    )
+    if raw is None:
+        return None
+    try:
+        return int(raw.strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_error_body(exc: _urlerror.HTTPError) -> bytes:
+    """Peek at most QUOTA_BODY_READ_LIMIT bytes; b"" on any problem."""
+    try:
+        read = exc.read
+    except AttributeError:
+        return b""
+    try:
+        chunk = read(QUOTA_BODY_READ_LIMIT)
+    except Exception:
+        return b""
+    if not isinstance(chunk, (bytes, bytearray)):
+        return b""
+    return bytes(chunk[:QUOTA_BODY_READ_LIMIT])
+
+
+def _body_confirms_budget_exhaustion(raw: bytes) -> bool:
+    """Whether the bounded body explicitly reports an exhausted budget."""
+    try:
+        text = raw.decode("utf-8", errors="replace").lower()
+    except Exception:
+        return False
+    return "insufficient" in text and "budget" in text
+
+
+def quota_error_from_http_error(
+    exc: _urlerror.HTTPError,
+) -> OpenAlexQuotaError | None:
+    """Classify a 429 as confirmed daily-budget exhaustion, or None.
+
+    Confirmed when the bounded error body explicitly reports an
+    insufficient budget, or when headers show remaining budget 0 with a
+    long (daily-scale) Retry-After. Anything else -- including remaining 0
+    with a short Retry-After and no explicit body -- returns None so the
+    caller re-raises the original transient HTTPError. Never raises, never
+    exposes credentials, URLs, or raw bodies.
+    """
+    if getattr(exc, "code", None) != 429:
+        return None
+    body = _read_error_body(exc)
+    retry_after = _retry_after_seconds(exc)
+    if _body_confirms_budget_exhaustion(body):
+        detail = (
+            f"shared anonymous daily budget exhausted (remaining 0"
+            + (
+                f"; resets in ~{retry_after / 3600:.0f}h"
+                if retry_after is not None
+                else "; resets at midnight UTC"
+            )
+            + ")."
+        )
+    elif _remaining_budget(exc) == 0 and (
+        retry_after is not None and retry_after >= LONG_QUOTA_RESET_S
+    ):
+        detail = (
+            f"shared anonymous daily budget exhausted (remaining 0; "
+            f"retry-after ~{retry_after / 3600:.0f}h)."
+        )
+    else:
+        return None
+    return OpenAlexQuotaError(
+        f"OpenAlex {detail} Set a free OPENALEX_API_KEY for a personal "
+        f"budget (https://help.openalex.org/api/authentication/) or wait "
+        f"until reset. This failure happens before any snapshot write, so "
+        f"the last snapshot is preserved."
+    )
 
 
 class DictTransport:

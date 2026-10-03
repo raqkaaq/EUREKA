@@ -32,6 +32,35 @@ EXAMPLE_BASE_URL = "http://192.168.1.20:1919/v1"
 MODELS_TIMEOUT_S = 5.0
 MODEL_TIMEOUT_S = 60.0
 MODEL_MAX_RETRIES = 1  # PydanticAI output-validation retries (bounded)
+# Live-reliability analysis bounds (proven 2026-10-03 on LAN FreeToken):
+# full RadarDraft completes fast only with a compact prompt, capped output,
+# few requests, no validation retries, and a hard overall deadline.
+ANALYSIS_TIMEOUT_S = 90.0
+ANALYSIS_MAX_TIMEOUT_S = 300.0
+ANALYSIS_MAX_TOKENS = 2000
+ANALYSIS_REQUEST_TIMEOUT_S = 60.0
+ANALYSIS_REQUEST_LIMIT = 2
+ANALYSIS_RETRIES = 0
+DISABLE_THINKING_ENV_VAR = "FREETOKEN_DISABLE_THINKING"
+
+
+def resolve_disable_thinking(explicit: bool = False) -> bool:
+    """Whether to send the server-specific thinking-disable key.
+
+    Opt-in only: explicit flag wins, else the ``FREETOKEN_DISABLE_THINKING``
+    env var (1/true/yes/on). Default omits the key entirely -- no backend
+    is assumed to support it.
+    """
+    if explicit:
+        return True
+    return _os.environ.get(DISABLE_THINKING_ENV_VAR, "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def thinking_extra_body() -> dict[str, object]:
+    """Server-specific key disabling vLLM-style reasoning output (opt-in)."""
+    return {"chat_template_kwargs": {"enable_thinking": False}}
 
 _LOCALHOST_NAMES = frozenset({"localhost"})
 _ALLOWED_V4_NETWORKS = tuple(

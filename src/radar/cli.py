@@ -124,12 +124,56 @@ def build_parser() -> argparse.ArgumentParser:
         "snapshot (snapshot.json) in PATH, independent of FreeToken. "
         "Combine with --collect-only for unattended refresh (no LLM).",
     )
+    parser.add_argument(
+        "--from-snapshot",
+        default=None,
+        metavar="PATH",
+        help="Analyze cached snapshot metadata with zero OpenAlex calls. "
+        "Rejects --refresh-dir (no silent overwrite).",
+    )
+    parser.add_argument(
+        "--analysis-timeout",
+        type=float,
+        default=_freetoken.ANALYSIS_TIMEOUT_S,
+        help=f"Overall analysis deadline in seconds, (0, {_freetoken.ANALYSIS_MAX_TIMEOUT_S}] "
+        f"(default {_freetoken.ANALYSIS_TIMEOUT_S}).",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=_freetoken.ANALYSIS_MAX_TOKENS,
+        help=f"Per-run model output cap, 128..8000 (default {_freetoken.ANALYSIS_MAX_TOKENS}).",
+    )
+    parser.add_argument(
+        "--disable-thinking",
+        action="store_true",
+        help="Opt-in: send the server-specific thinking-disable key "
+        "(or set FREETOKEN_DISABLE_THINKING=1). Default omits it; not every "
+        "backend supports it.",
+    )
     return parser
 
 
 def _fail(message: str, code: int) -> int:
     print(f"radar: error: {message}", file=sys.stderr)
     return code
+
+
+def _analyze_timeout(value: float) -> float:
+    """Validate the overall analysis deadline: finite seconds in (0, 300]."""
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"--analysis-timeout must be within (0, {_freetoken.ANALYSIS_MAX_TIMEOUT_S}]s"
+        ) from exc
+    if not _math.isfinite(timeout) or not (
+        0 < timeout <= _freetoken.ANALYSIS_MAX_TIMEOUT_S
+    ):
+        raise ValueError(
+            f"--analysis-timeout must be within (0, {_freetoken.ANALYSIS_MAX_TIMEOUT_S}]s"
+        )
+    return timeout
 
 
 def work_to_json(work: CollectedWork) -> dict:
@@ -198,6 +242,27 @@ def collect_candidates(
     return collect_pool(lookback_days, timeout, keywords)[:max_candidates]
 
 
+def _snapshot_age_note(collected_at_utc: str) -> str:
+    """Human-readable staleness disclosure for a cached snapshot timestamp."""
+    import datetime as _dt
+
+    try:
+        taken = _dt.datetime.fromisoformat(collected_at_utc)
+        if taken.tzinfo is None:
+            taken = taken.replace(tzinfo=_dt.timezone.utc)
+        age = _dt.datetime.now(_dt.timezone.utc) - taken
+        seconds = max(0, int(age.total_seconds()))
+    except (ValueError, TypeError):
+        return f"snapshot collected at {collected_at_utc} (age unknown)"
+    if seconds < 90:
+        age_note = f"{seconds}s old"
+    elif seconds < 5400:
+        age_note = f"{seconds // 60}m old"
+    else:
+        age_note = f"{seconds // 3600}h old"
+    return f"snapshot collected at {collected_at_utc} ({age_note})"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -205,29 +270,61 @@ def main(argv: list[str] | None = None) -> int:
         return _fail(
             f"--max-candidates must be within 1..{MAX_MAX_CANDIDATES}", 4
         )
-    pool: list[CollectedWork] | None = None
     try:
-        if args.refresh_dir:
-            # Refresh persists the full pool, not just the topN slice.
-            pool = collect_pool(args.lookback_days, args.timeout, args.keywords)
-        else:
-            pool = collect_candidates(
-                args.max_candidates, args.lookback_days, args.timeout, args.keywords
-            )
+        analysis_timeout = _analyze_timeout(args.analysis_timeout)
     except ValueError as exc:
         return _fail(str(exc), 4)
-    except Exception as exc:
-        return _fail(
-            f"OpenAlex collection failed ({type(exc).__name__}: {exc}). "
-            "Check network access to https://api.openalex.org and retry; "
-            "per-request timeouts are bounded by --timeout.",
-            2,
-        )
-    assert pool is not None
+    if not (isinstance(args.max_tokens, int) and 128 <= args.max_tokens <= 8000):
+        return _fail("--max-tokens must be an integer within 128..8000", 4)
+    disable_thinking = _freetoken.resolve_disable_thinking(args.disable_thinking)
 
+    cached_works: list[CollectedWork] | None = None
+    cached_meta: dict | None = None
+    if args.from_snapshot:
+        # Cached synthesis: zero OpenAlex calls; never combined with refresh.
+        if args.refresh_dir:
+            return _fail(
+                "--from-snapshot cannot be combined with --refresh-dir; "
+                "cached analysis never overwrites snapshot state.",
+                4,
+            )
+        import os as _os
+
+        if not _os.path.exists(args.from_snapshot):
+            return _fail(f"snapshot not found: {args.from_snapshot}", 4)
+        try:
+            cached_works, cached_meta = _refresh.load_snapshot(args.from_snapshot)
+        except _refresh.RefreshError as exc:
+            return _fail(f"invalid snapshot source ({exc}). No model was called.", 3)
+        pool = _refresh.select_topn(cached_works, args.max_candidates)
+        print(_snapshot_age_note(str(cached_meta["collected_at_utc"])),
+              file=sys.stderr)
+    else:
+        pool = None
+        try:
+            if args.refresh_dir:
+                # Refresh persists the full pool, not just the topN slice.
+                pool = collect_pool(args.lookback_days, args.timeout, args.keywords)
+            else:
+                pool = collect_candidates(
+                    args.max_candidates, args.lookback_days, args.timeout, args.keywords
+                )
+        except ValueError as exc:
+            return _fail(str(exc), 4)
+        except Exception as exc:
+            return _fail(
+                f"OpenAlex collection failed ({type(exc).__name__}: {exc}). "
+                "Check network access to https://api.openalex.org and retry; "
+                "per-request timeouts are bounded by --timeout.",
+                2,
+            )
+        assert pool is not None
+
+    refresh_collected_at: str | None = None
     if args.refresh_dir:
         try:
             summary = _refresh.refresh_pool(pool, args.refresh_dir)
+            refresh_collected_at = str(summary["collected_at_utc"])
         except _refresh.RefreshError as exc:
             return _fail(
                 f"refresh failed ({exc}). Previous snapshot preserved.",
@@ -235,7 +332,17 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     if args.collect_only:
-        if args.refresh_dir:
+        if cached_meta is not None:
+            print(json.dumps({
+                "snapshot": args.from_snapshot,
+                "collected_at_utc": cached_meta["collected_at_utc"],
+                "coverage": cached_meta["coverage"],
+                "discovery": cached_meta["discovery"],
+                "disclosure": _refresh.DISCLOSURE,
+                "selected": len(pool),
+                "works": [work_to_json(w) for w in pool],
+            }, indent=2))
+        elif args.refresh_dir:
             print(json.dumps(summary, indent=2))
         else:
             print(
@@ -261,13 +368,26 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         draft, _prompt = analyze_candidates(
-            works, model=model, max_candidates=args.max_candidates
+            works,
+            model=model,
+            max_candidates=args.max_candidates,
+            analysis_timeout_s=analysis_timeout,
+            max_tokens=args.max_tokens,
+            disable_thinking=disable_thinking,
         )
     except _freetoken.FreeTokenError as exc:
         return _fail(str(exc), 3)
     # Evidence must resolve against the same bounded candidate set supplied
     # to the LLM (shared helper guarantees no hardcoded-slice drift).
     evidence_candidates = bound_candidates(works, args.max_candidates)
+    # Explicit coverage: only the bounded selection ever reaches the LLM,
+    # never the whole pool.
+    print(
+        f"radar: coverage selected={len(evidence_candidates)} "
+        f"analyzed={len(draft.opportunities)} "
+        f"(pool={len(pool)}; bounded discovery sample, not all of OpenAlex)",
+        file=sys.stderr,
+    )
     try:
         report = attach_evidence(draft, evidence_candidates)
         print(render_markdown(report))
@@ -277,13 +397,15 @@ def main(argv: list[str] | None = None) -> int:
             3,
         )
     if args.refresh_dir:
-        # Best-effort: record LLM counts in the already-persisted snapshot.
-        # The metadata snapshot stands even when this patch cannot run.
+        # Best-effort, generation-aware: record LLM counts only in the
+        # snapshot this run wrote. The metadata snapshot stands even when
+        # this patch cannot run.
         try:
             _refresh.update_llm_coverage(
                 args.refresh_dir,
                 llm_selected=len(evidence_candidates),
                 llm_analyzed=len(draft.opportunities),
+                expect_collected_at=refresh_collected_at,
             )
         except _refresh.RefreshError as exc:
             print(f"radar: warning: could not update refresh coverage ({exc})",
