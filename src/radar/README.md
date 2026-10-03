@@ -2,8 +2,9 @@
 
 One-command radar: discover recent AI/ML papers via **OpenAlex** (the sole
 scholarly discovery API; arXiv appears only as an OpenAlex location string),
-then analyze them with a local **FreeToken** model through **PydanticAI**
-(typed outcomes, Chat Completions path).
+screen the full pool with **CLEF/SystemOne** (mandatory LAN routing stage),
+then analyze the shortlist with a local **FreeToken** model through
+**PydanticAI** (typed outcomes, Chat Completions path).
 
 > Refactor note (issue #34, finished): the code now lives in the
 > responsibility layout below. Old flat modules moved to their new homes
@@ -23,6 +24,8 @@ src/radar/
                        normalization, dedup, provenance
   provider/
     freetoken.py       LAN PydanticAI model construction + client lifecycle
+    clef.py            LAN CLEF/SystemOne screening client (native HTTPX,
+                       batch triage, deadlines, fail-fast)
   agent/
     opportunity_analysis.py  typed Agent[None, RadarDraft], prompt +
                        instructions (no separate prompt file), deadline/usage,
@@ -30,15 +33,19 @@ src/radar/
   processing/
     ranking.py         deterministic scoring/selection (pool → ranked topN)
     evidence.py        evidence index resolution/validation
+    triage.py          CLEF shortlist policy (scored rank + unknown slot)
   storage/
     snapshots.py       full-pool snapshots, deltas, coverage, strict v1
                        validation, atomic writes, locking
+    triage.py          atomic triage sidecar (never mutates snapshots)
   output/
     markdown.py        Markdown report rendering only
     json.py            JSON output shaping only (collect-only envelopes)
+    triage.py          triage coverage summaries (considered/scored/unknown/failed)
   schema/
     papers.py          paper/plan contracts (CollectedWork and friends)
     opportunities.py   analysis/briefing contracts (RadarDraft and friends)
+    triage.py          screening contracts (TriageBatch/TriageResult)
 ```
 
 Dependency direction: `cli → pipeline → {config, source, provider, agent,
@@ -58,6 +65,13 @@ framework.
   the inference HTTP client lifecycle (upstream internal `httpx2`,
   explicitly opened and deterministically closed per run). No prompts,
   no analysis.
+- **CLEF routing** (`provider/clef.py` + `processing/triage.py`) decides
+  *what* gets analyzed: the provider screens every collected paper over
+  native HTTPX SystemOne calls (typed batch results, deadlines,
+  concurrency, fail-fast — deliberately not an OpenAI chat model), and
+  the pure shortlist policy ranks scored works with one reserved unknown
+  slot (only when unknowns exist and the shortlist holds two or more).
+  This is decision routing; the synthesis agent below does the thinking.
 - **Agent** (`agent/opportunity_analysis.py`) does the thinking: it builds
   the prompt and instructions, runs the typed PydanticAI agent under a
   hard overall deadline with per-run token/request/usage caps, and
@@ -70,19 +84,21 @@ framework.
 # Collect-only: bounded real OpenAlex candidates as JSON (no LLM).
 uv run --env-file .env python -m radar --collect-only --max-candidates 8
 
-# Full run: collect + local-model analysis as Markdown.
+# Full run: collect + CLEF screening + local-model analysis as Markdown
+# (requires CLEF_BASE_URL).
 uv run --env-file .env python -m radar --max-candidates 8
 
 # Unattended metadata refresh (full pool snapshot, no LLM).
 uv run --env-file .env python -m radar --collect-only --refresh-dir data/radar
 
-# Cached synthesis: zero OpenAlex calls (needs FreeToken for analysis).
+# Cached synthesis: zero OpenAlex calls (CLEF screening still mandatory,
+# needs CLEF endpoint plus FreeToken for analysis).
 uv run --env-file .env python -m radar --from-snapshot data/radar/snapshot.json --max-candidates 2
 
 # Analysis with CLEF routing (CLEF server user-owned, not running yet).
-# Endpoint below is a placeholder: replace with your LAN CLEF server.
+# Set CLEF_BASE_URL to your LAN CLEF server; no endpoint is ever guessed.
 uv run --env-file .env python -m radar --max-candidates 8 \
-  --clef-base-url http://192.168.1.20:1921/v1 --triage-output data/radar/triage
+  --triage-output data/radar/triage
 
 # Options.
 uv run --env-file .env python -m radar --help
@@ -139,8 +155,12 @@ secrets involved):
   blind retries. Transient 429s get bounded retries. Source errors never
   carry URLs, credentials, or bodies.
 - Three distinct counts, never conflated: **collected** (full bounded
-  pool persisted by refresh), **selected/analyzed** (the ranked topN slice
+  pool persisted by refresh), **selected/analyzed** (the shortlist slice
   the LLM actually saw), and **opportunities** (what the model proposed).
+  CLEF screening adds its own buckets: **considered** (entire pool accounted
+  for),
+  **scored**, **unknown** (missing abstracts, oversize, deadlines), and
+  **failed**, with model/rubric provenance on the coverage line.
   Metadata-only runs honestly report `llm_selected/llm_analyzed` as zero.
 - Discovery is a bounded OpenAlex sample (lookback window applies to
   every query): counts describe the snapshot only, never all of OpenAlex.
@@ -174,13 +194,14 @@ model's candidate indices (the model never writes URLs), a global
 
 ## Baseline vs refactor status
 
-Verified on the finished layout (`b925eb2`, 125/125 tests green):
-metadata refresh of 106 real works in 3s with an idempotent rerun
-(0 new / 0 changed / 106 unchanged), cached 3-paper briefing exit 0 in
-17s, and gated 8-paper briefing exit 0 in 19s (selected=8 analyzed=8
-opportunities=2 pool=106), all with evidence URLs inside the pool and
-the snapshot preserved. The five-hour automation stays aligned to
-validated paths only.
+Historical pre-CLEF baseline only (not current verification): 125/125
+tests green with a 106-work refresh in 3s, cached 3-paper briefing in
+17s, and gated 8-paper briefing in 19s on heuristic ranking plus Qwen
+synthesis. Current status: 171/171 tests green including a 106-work
+offline acceptance (102 synthetic SystemOne decisions, 4 missing-abstract
+  unknowns, shortlist 8) — synthetic router decisions, not real CLEF model
+  quality. No live CLEF runs exist; the CLEF server is absent and is never
+  launched by radar.
 
 ## Tests
 
@@ -191,4 +212,4 @@ uv run python -m unittest discover -s tests/radar -v
 Boundaries, all offline: `httpx.MockTransport` at the source HTTP seam,
 `FunctionModel`/`TestModel` at the agent seam, real temp filesystems for
 storage, CLI exit-code/output-shape tests at the pipeline boundary, and
-import/AST checks enforcing the dependency direction above.
+import/dependency-boundary checks enforcing the dependency direction above.
