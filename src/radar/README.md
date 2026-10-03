@@ -3,8 +3,9 @@
 One-command radar: discover recent AI/ML papers via **OpenAlex** (the sole
 scholarly discovery API; arXiv appears only as an OpenAlex location string),
 screen the full pool with **CLEF** (preferred) or **Qwen** (chat fallback),
-then analyze the shortlist with a local **FreeToken** model through
-**PydanticAI** (typed outcomes, Chat Completions path).
+then analyze the shortlist with three specialists and a synthesizer using
+the local **FreeToken** model through **PydanticAI** (typed outcomes,
+Chat Completions path).
 
 > Refactor note (issue #34, finished): the code now lives in the
 > responsibility layout below. Old flat modules moved to their new homes
@@ -27,6 +28,9 @@ src/radar/
     screening_questions.yaml   shared SystemOne questions and true/false criteria
     paper_triage.yaml          Qwen screening-agent instructions
     opportunity_analysis.yaml synthesis instructions, header and task template
+    ml_methods.yaml           technical mechanisms and controlled evaluation
+    behavioral_economics.yaml behavioral/economic transfer and identification
+    evidence_review.yaml      falsification, evidence gaps and replication
     catalog.py                typed access to the prompt documents
   source/
     openalex.py        HTTPX discovery requests, retry/quota,
@@ -36,6 +40,8 @@ src/radar/
     clef.py            LAN CLEF/SystemOne screening client (native HTTPX,
                        batch triage, deadlines, fail-fast)
   agent/
+    research_team.py   common evidence cohort, specialists, shared deadline,
+                       bounded contributions, synthesis and client cleanup
     paper_triage.py    same screening inputs/answer models over PydanticAI
                        FreeToken chat, complete-paper batches and deadlines
     opportunity_analysis.py  typed Agent[None, RadarDraft], complete-paper prompt
@@ -70,7 +76,7 @@ framework.
 ## Editable searches, questions and prompts
 
 YAML is the source of truth for baseline search policy, shared screening
-questions, and both agents' instructions. Python owns expansion, transport,
+questions, and the agents' instructions. Python owns expansion, transport,
 output schemas and hard safety limits; there is no second hardcoded search
 algorithm or inline instruction fallback.
 
@@ -78,7 +84,8 @@ algorithm or inline instruction fallback.
   (`semantic` = keyword relevance ranking, not embedding search; `recent` =
   newest first), `terms`, optional `scope`, `repeat`, `limit` and `per_page`.
   Defaults separately cover broad AI/ML, newest AI/ML, behavioral/economic
-  intersections, and individual AI/ML topics. Every request shares the active
+  intersections, generative-AI human/economic effects, methods/evaluation and
+  causal/strategic mechanisms. Every request shares the active
   lookback filter. The planner lives in `config/searches.py`, replacing the
   old planner in the OpenAlex adapter.
 - Search `{keywords}` and `{domains}` expand to OR-separated quoted profile
@@ -94,11 +101,14 @@ algorithm or inline instruction fallback.
   use the existing screening profile formatting. Quote the YAML keys
   `"true"`/`"false"` so they remain strings. Native CLEF and Qwen chat share
   the same rendered dictionaries and unchanged Pydantic answer schema.
+  `rubric_version: clef-triage-v2` identifies the expanded guidance; both
+  backends record its canonical configuration SHA-256 as `rubric_hash` in
+  triage sidecars. `version: 1` is separately the configuration schema version.
 - `prompts/paper_triage.yaml`: Qwen screening-agent instructions.
 - `prompts/opportunity_analysis.yaml`: synthesis-agent instructions,
   `candidate_header`, and `task_template`. Task placeholders are
   `{max_opportunities}` and `{valid_range}`; Python supplies the actual run
-  bounds. Both agents pass instructions through PydanticAI's `instructions`
+  bounds. All chat agents pass instructions through PydanticAI's `instructions`
   interface, separate from untrusted user/paper data. Combined instructions
   and user messages retain the existing prompt budget and complete-block policy.
 
@@ -114,6 +124,79 @@ process after edits; a new CLI refresh loads the edits automatically.
 
 Metadata collection does not need agent prompts or inference. This slice
 adds no autonomous search tool loop; bounded LLM exploration remains separate.
+
+## Specialized research team
+
+Normal analysis uses three actual PydanticAI specialists, followed by final
+opportunity synthesis. Their YAML documents specify mission, method, evidence
+restrictions and output/task standards. All share the configured LAN model;
+they are not independent models or additional scientific sources.
+
+- ML methods: learning/inference mechanisms, assumptions, evaluation blind
+  spots, robustness and efficiency trade-offs.
+- Behavioral/economics: grounded transfers through incentives, constructs,
+  causal designs and human-system effects; no superficial analogies.
+- Evidence/replication: independently examine the same abstracts for missing
+  controls, alternatives and replication needs. This reviewer does not receive
+  or approve the other specialists' proposals.
+- Synthesis: reconcile contributions against original candidate data, retain
+  uncertainty, deduplicate and propose at most two falsifiable opportunities.
+  Agreement between agents is not scientific corroboration.
+
+Each specialist returns a typed `RadarDraft`: at most one opportunity and
+1000 serialized characters. `ResearchResult` retains role-attributed reports,
+the final draft/prompt and actual included papers for in-process callers.
+The CLI renders the final report and names the roles in coverage notes;
+specialist reports are not separately persisted. They remain untrusted
+hypotheses, never source evidence or instructions.
+
+At most two specialists run concurrently. Each stage permits two PydanticAI
+requests including one validation retry, so analysis normally uses four
+requests and at most eight; provider/SDK transport retries remain separate.
+Specialist output caps are 1000 tokens (or the smaller CLI cap), and synthesis
+retains the CLI cap. One `--analysis-timeout` covers all specialist and
+synthesis calls. Failure cancels outstanding work, closes the owned session
+and produces no partial-success report.
+
+Every stage sees the same complete candidate blocks and indices. Selection
+reserves 3500 characters for intermediate context, within the combined
+12,000-character instruction/user-message budget. Richer prompts can reduce
+the actual analyzed shortlist; coverage reports that cohort, not the requested
+size or all discovered papers. Evidence indices, opportunity counts and
+contribution sizes are validated in code with bounded retries. No agent has
+research tools or PDF access; abstracts alone cannot establish quality,
+causality, global novelty, replication or deployment safety. Specialization
+adds inference cost/latency; metadata-only refreshes remain model-free.
+
+## Offline transport acceptance
+
+The full pipeline can be verified without an inference server or OpenAlex
+access. The integration suite in `tests/radar/test_pipeline_chat_protocol.py`
+substitutes only HTTP responses, preserving the real PydanticAI agents,
+Chat Completions provider, native CLEF adapter, prompt documents, routing,
+snapshot/sidecar storage, evidence attachment and Markdown rendering.
+
+```sh
+PYDANTIC_AI_NO_BANNER=1 uv run --locked python -m unittest discover \
+  -s tests/radar -p test_pipeline_chat_protocol.py -v
+```
+
+It exercises fresh collection through all six searches, deduplication and
+full-pool snapshot coverage; a cached 106-paper pool with 102 abstract-bearing
+papers and the maximum 200-paper pool (192 abstracts, eight missing); native
+CLEF preference and complete chat rerouting after native
+failure; three specialists plus synthesis over shared indices; actual wire
+token caps and opt-in thinking settings; validation retries, malformed or
+unstructured answers, cancellation, client cleanup and redacted errors.
+Source/analysis failures preserve previous snapshots and produce no false
+successful report. Metadata-only cached runs perform no inference.
+
+These tests use synthetic papers and predetermined HTTP model responses.
+They neither read `.env` nor open network sockets, and do not establish model
+quality, server compatibility or a successful live research run. As of
+2026-10-03 the operator is retiring FreeToken; live inference checks are stopped
+pending replacement details. Existing provider configuration is retained,
+not silently repointed or migrated to an unchosen service.
 
 ## Source vs provider vs agent
 
@@ -142,11 +225,10 @@ adds no autonomous search tool loop; bounded LLM exploration remains separate.
   batch/work-ID correlation, not a different question/rubric or truncated
   paper text. Backend scores are never mixed. Qwen probabilities are
   prompted estimates, explicitly distinguished from native CLEF `noul` values.
-- **Agent** (`agent/opportunity_analysis.py`) does the thinking: it builds
-  the prompt and instructions, runs the typed PydanticAI agent under a
-  hard overall deadline with per-run token/request/usage caps, and
-  validates the structured outcome. It never touches the network
-  directly; the model never writes URLs (evidence indices only).
+- **Research team** (`agent/research_team.py`) runs the specialized workflow
+  and final synthesis. `agent/opportunity_analysis.py` owns reusable complete-
+  block prompt assembly and the standalone synthesis seam. Neither resolves
+  providers or fetches sources; evidence URLs are attached in code.
 
 ## Usage
 
@@ -193,7 +275,8 @@ Pydantic models. Batch work IDs must match exactly, with one bounded
 validation retry. The questions, criteria and full paper data are shared;
 there is no heuristic substitute, rewritten decision task, or need for
 FreeToken to expose `/v1/systemone`. PydanticAI controls Qwen routing and
-synthesis; the existing synthesis provider/agent wiring is unchanged.
+synthesis. Provider endpoints are unchanged; normal synthesis now follows
+the specialist workflow described above.
 
 `--clef-timeout` bounds CLEF requests (default 10 s). Qwen chat requests
 are bounded by 60 s (or the smaller remaining overall budget), with at
@@ -288,7 +371,7 @@ model's candidate indices (the model never writes URLs), a global
 Historical pre-CLEF baseline only (not current verification): 125/125
 tests green with a 106-work refresh in 3s, cached 3-paper briefing in
 17s, and gated 8-paper briefing in 19s on heuristic ranking plus Qwen
-synthesis. Current offline status: 190/190 tests green, including 19 typed
+synthesis. The Qwen fallback originally passed 190/190 tests, including 19 typed
 Qwen chat regressions and 106-work acceptance (102 synthetic decisions,
 4 missing-abstract unknowns, shortlist 8). Mock tests are not real model
 quality evidence. CLEF is absent and never launched; Qwen uses FreeToken chat.

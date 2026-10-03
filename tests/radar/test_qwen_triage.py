@@ -118,7 +118,8 @@ class TestQwenTriage(unittest.TestCase):
             work.abstract = "x" * 20000
         batch = screen_works(pool, default_profile(), model=answers_model(calls))
         self.assertTrue(all(r.status == "scored" for r in batch.results))
-        self.assertEqual([len(chunk) for chunk in calls], [3, 3])
+        # Richer shared questions consume bytes too; preserve complete papers.
+        self.assertEqual([len(chunk) for chunk in calls], [2, 2, 2])
         self.assertTrue(all(len(p["input"]["state"]["abstract"]) == 20000 for c in calls for p in c))
 
     def test_missing_and_unicode_oversized_papers_need_no_model(self):
@@ -218,11 +219,13 @@ class TestQwenPipeline(unittest.TestCase):
             result, synthesis = self.pipeline(pool, routing=answers_model(calls), max_candidates=8, triage_output=out)
             sidecar = json.loads(Path(out + "/triage.json").read_text())
         self.assertEqual(result.exit_code, 0, result.stderr_notes)
-        self.assertEqual(synthesis, [1])
+        self.assertEqual(synthesis, [1, 1, 1, 1])  # three specialists + synthesis
         self.assertEqual(sum(len(chunk) for chunk in calls), 102)
         for token in ("pool=106", "considered=106", "scored=102", "unknown=4", "selected=8", "backend=qwen"):
             self.assertIn(token, " ".join(result.stderr_notes))
         self.assertEqual(sidecar["probability_kind"], "prompted_estimate")
+        self.assertEqual(sidecar["rubric_version"], "clef-triage-v2")
+        self.assertEqual(len(sidecar["rubric_hash"]), 64)
         self.assertEqual(sidecar["fallback_reason"], "missing_endpoint")
 
     def test_native_and_chat_inputs_identical_except_served_model(self):
@@ -234,7 +237,7 @@ class TestQwenPipeline(unittest.TestCase):
             keywords=("psychometrics",), clef_base_url="http://127.0.0.1:9", clef_model="test-clef",
             clef_transport=httpx.MockTransport(down))
         self.assertEqual(result.exit_code, 0, result.stderr_notes)
-        self.assertEqual(synthesis, [1])
+        self.assertEqual(synthesis, [1, 1, 1, 1])
         chat = dict(calls[0][0]["input"])
         native = dict(native[0])
         chat.pop("model")
@@ -253,7 +256,7 @@ class TestQwenPipeline(unittest.TestCase):
             clef_base_url="http://127.0.0.1:9", clef_transport=httpx.MockTransport(clef))
         self.assertEqual(result.exit_code, 0, result.stderr_notes)
         self.assertEqual(calls, [])
-        self.assertEqual(synthesis, [1])
+        self.assertEqual(synthesis, [1, 1, 1, 1])
 
     def test_malformed_clef_and_clef_deadline_fall_back(self):
         async def stall(request):
@@ -264,7 +267,7 @@ class TestQwenPipeline(unittest.TestCase):
                 clef_base_url="http://127.0.0.1:9", clef_transport=transport, triage_timeout_s=0.04)
             self.assertEqual(result.exit_code, 0, result.stderr_notes)
             self.assertEqual(sum(len(c) for c in calls), 3)
-            self.assertEqual(synthesis, [1])
+            self.assertEqual(synthesis, [1, 1, 1, 1])
 
     def test_bad_qwen_answers_block_all_synthesis(self):
         calls = []
@@ -314,5 +317,5 @@ class TestQwenPipeline(unittest.TestCase):
             sidecar = json.loads(Path(out + "/triage.json").read_text())
         self.assertEqual(result.exit_code, 0, result.stderr_notes)
         self.assertEqual(sum(len(c) for c in calls), 6)
-        self.assertEqual(synthesis, [1])
+        self.assertEqual(synthesis, [1, 1, 1, 1])
         self.assertTrue(all(r["ai_ml_relevance"] == 0.8 for r in sidecar["results"]))

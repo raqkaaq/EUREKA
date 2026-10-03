@@ -23,7 +23,8 @@ from radar.config.interests import RadarProfile
 from radar.provider.freetoken import FreeTokenError, check_local_network
 from radar.processing.triage_input import build_input
 from radar.schema.papers import CollectedWork
-from radar.schema.triage import RUBRIC_VERSION, SystemOneResponse, TriageBatch, TriageResult
+from radar.schema.triage import SystemOneResponse, TriageBatch, TriageResult
+from radar.prompts.catalog import screening_questions
 
 DEFAULT_MODEL = "clef-flash"
 CLEF_BASE_URL_ENV = "CLEF_BASE_URL"
@@ -264,7 +265,8 @@ def screen_works(
         )
     return TriageBatch(
         model_id=config.model,
-        rubric_version=RUBRIC_VERSION,
+        rubric_version=screening_questions().rubric_version,
+        rubric_hash=screening_questions().fingerprint,
         results=[results[wid] for wid in order],
     )
 

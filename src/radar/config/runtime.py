@@ -52,6 +52,12 @@ MAX_TITLE_IN_PROMPT = 200
 MAX_PROMPT_CHARS = 12_000
 MAX_ANALYSIS_OPPORTUNITIES = 2
 
+# --- Specialist research team (three bounded contributions + synthesis) ---
+SPECIALIST_CONCURRENCY = 2
+SPECIALIST_MAX_TOKENS = 1000
+SPECIALIST_MAX_REPORT_CHARS = 1000
+SPECIALIST_CONTEXT_CHARS = 3500
+
 # --- Analysis output schema caps ---
 MAX_OPPORTUNITIES = 5
 MAX_EVIDENCE_PER_OPP = 3
@@ -172,6 +178,10 @@ __all__ = [
     "MIN_ANALYSIS_TOKENS",
     "QUOTA_BODY_READ_LIMIT",
     "RESPONSE_READ_LIMIT",
+    "SPECIALIST_CONCURRENCY",
+    "SPECIALIST_CONTEXT_CHARS",
+    "SPECIALIST_MAX_REPORT_CHARS",
+    "SPECIALIST_MAX_TOKENS",
     "validate_analysis_timeout",
     "validate_clef_overall_timeout",
     "validate_clef_request_timeout",

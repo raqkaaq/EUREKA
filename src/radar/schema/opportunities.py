@@ -6,6 +6,8 @@ or any other service dependency.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator
 
 from radar.config.runtime import MAX_EVIDENCE_PER_OPP, MAX_OPPORTUNITIES
@@ -43,6 +45,16 @@ class RadarDraft(BaseModel):
         if isinstance(v, list):
             return [str(x) for x in v if x is not None]
         return v
+
+
+SpecialistRole = Literal["ml_methods", "behavioral_economics", "evidence_review"]
+
+
+class SpecialistContribution(BaseModel):
+    """A role-attributed model hypothesis, not additional scientific evidence."""
+
+    role: SpecialistRole
+    draft: RadarDraft
 
 
 class EvidenceLink(BaseModel):

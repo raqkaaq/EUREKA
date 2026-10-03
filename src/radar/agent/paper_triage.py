@@ -15,10 +15,10 @@ from typing import TYPE_CHECKING
 from radar.config.interests import RadarProfile
 from radar.config.runtime import MAX_TOTAL_WORKS, validate_clef_overall_timeout
 from radar.processing.triage_input import build_input
-from radar.prompts.catalog import paper_triage_prompt
+from radar.prompts.catalog import paper_triage_prompt, screening_questions
 from radar.provider import freetoken
 from radar.schema.papers import CollectedWork
-from radar.schema.triage import QwenResponses, RUBRIC_VERSION, TriageBatch, TriageResult
+from radar.schema.triage import QwenResponses, TriageBatch, TriageResult
 
 if TYPE_CHECKING:
     from pydantic_ai.models import Model
@@ -136,7 +136,8 @@ async def screen_works_async(
         if session is not None:
             await session.http_client.aclose()
     return TriageBatch(
-        model_id=name, rubric_version=RUBRIC_VERSION, backend="qwen",
+        model_id=name, rubric_version=screening_questions().rubric_version,
+        rubric_hash=screening_questions().fingerprint, backend="qwen",
         probability_kind="prompted_estimate", fallback_reason=fallback_reason,
         results=[results[wid] for wid in ids])
 

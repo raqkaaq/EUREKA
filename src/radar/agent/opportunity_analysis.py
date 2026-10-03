@@ -37,6 +37,7 @@ from radar.prompts.catalog import opportunity_analysis_prompt
 from radar.provider import freetoken as _freetoken
 from radar.schema.opportunities import RadarDraft
 from radar.schema.papers import CollectedWork
+from radar.schema.configuration import AnalysisPrompt
 
 if TYPE_CHECKING:
     from pydantic_ai import Agent as _Agent
@@ -52,8 +53,8 @@ def _truncate(text: str, limit: int) -> str:
     return text
 
 
-def _header() -> str:
-    return opportunity_analysis_prompt().candidate_header
+def _header(spec: AnalysisPrompt) -> str:
+    return spec.candidate_header
 
 
 def _candidate_block(index: int, work: CollectedWork) -> str:
@@ -68,18 +69,21 @@ def _candidate_block(index: int, work: CollectedWork) -> str:
     )
 
 
-def _footer(included: int) -> str:
+def _footer(included: int, spec: AnalysisPrompt) -> str:
     if included <= 0:
         valid_range = "none (no candidates)"
     else:
         valid_range = f"0..{included - 1}"
-    return opportunity_analysis_prompt().task_template.format(
-        max_opportunities=MAX_ANALYSIS_OPPORTUNITIES, valid_range=valid_range)
+    return spec.task_template.format(
+        max_opportunities=spec.max_opportunities, valid_range=valid_range)
 
 
 def select_for_prompt(
     candidates: list[CollectedWork],
     max_candidates: int = MAX_CANDIDATES_IN_PROMPT,
+    *,
+    prompt_spec: AnalysisPrompt | None = None,
+    reserved_context_chars: int = 0,
 ) -> list[CollectedWork]:
     """Budget-aware complete-block selection for the prompt.
 
@@ -89,12 +93,15 @@ def select_for_prompt(
     is present verbatim in the submitted input.
     """
     bounded = bound_candidates(candidates, max_candidates)
-    header = _header()
-    footer = _footer(len(bounded))
+    spec = prompt_spec if prompt_spec is not None else opportunity_analysis_prompt()
+    if not 0 <= reserved_context_chars <= MAX_PROMPT_CHARS:
+        raise ValueError("invalid reserved prompt context budget")
+    header = _header(spec)
+    footer = _footer(len(bounded), spec)
     # Reserve the worst-case footer (index width only shrinks when fewer
     # papers are included, so fitting against the full footer is safe).
     # Instructions travel separately, but still consume the same prompt budget.
-    used = len(opportunity_analysis_prompt().instructions) + len(header) + len(footer) + 4
+    used = len(spec.instructions) + len(header) + len(footer) + reserved_context_chars + 6
     included: list[CollectedWork] = []
     for index, work in enumerate(bounded):
         block = _candidate_block(index, work)
@@ -108,12 +115,19 @@ def select_for_prompt(
 def build_prompt(
     candidates: list[CollectedWork],
     max_candidates: int = MAX_CANDIDATES_IN_PROMPT,
+    *,
+    prompt_spec: AnalysisPrompt | None = None,
+    context: str = "",
 ) -> str:
     """Build the bounded analysis prompt (complete blocks + intact footer)."""
-    included = select_for_prompt(candidates, max_candidates)
-    parts = [_header()]
+    spec = prompt_spec if prompt_spec is not None else opportunity_analysis_prompt()
+    included = select_for_prompt(candidates, max_candidates, prompt_spec=spec,
+                                 reserved_context_chars=len(context))
+    parts = [_header(spec)]
     parts.extend(_candidate_block(i, work) for i, work in enumerate(included))
-    parts.append(_footer(len(included)))
+    if context:
+        parts.append(context)
+    parts.append(_footer(len(included), spec))
     return "\n".join(parts)
 
 

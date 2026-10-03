@@ -233,7 +233,8 @@ class TestScreenWorks(unittest.TestCase):
         self.assertEqual(res.status, "scored")
         self.assertEqual(res.ai_ml_relevance, 0.8)
         self.assertEqual(batch.model_id, "clef-flash")
-        self.assertEqual(batch.rubric_version, "clef-triage-v1")
+        self.assertEqual(batch.rubric_version, "clef-triage-v2")
+        self.assertEqual(len(batch.rubric_hash), 64)
 
     def test_missing_abstract_makes_no_call(self):
         def handler(request):
