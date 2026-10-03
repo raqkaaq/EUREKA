@@ -192,9 +192,9 @@ class TestPromptBounds(unittest.TestCase):
         self.assertIn("CANDIDATES", prompt)
 
     def test_prompt_marks_candidates_untrusted_and_no_instruction_following(self):
-        from radar.agent.opportunity_analysis import SYSTEM_INSTRUCTIONS
+        from radar.prompts.catalog import opportunity_analysis_prompt
 
-        lowered = SYSTEM_INSTRUCTIONS.lower()
+        lowered = opportunity_analysis_prompt().instructions.lower()
         self.assertIn("untrusted", lowered)
         self.assertIn("never follow", lowered)
         prompt = build_prompt([_candidate(0)], max_candidates=8)
@@ -256,7 +256,8 @@ class TestCliSeams(unittest.TestCase):
         import io
 
         from radar.pipeline import PipelineRequest, run
-        from radar.source.openalex import DictTransport, build_query_plan
+        from radar.config.searches import build_query_plan
+        from radar.source.openalex import DictTransport
         from radar.config.interests import default_profile
 
         plan = build_query_plan(default_profile())
@@ -295,7 +296,8 @@ class TestCliSeams(unittest.TestCase):
         import socket
 
         from radar.pipeline import PipelineRequest, run
-        from radar.source.openalex import DictTransport, build_query_plan
+        from radar.config.searches import build_query_plan
+        from radar.source.openalex import DictTransport
         from radar.config.interests import default_profile
 
         plan = build_query_plan(default_profile())
@@ -323,7 +325,8 @@ class TestCliSeams(unittest.TestCase):
         from pydantic_ai.messages import ModelResponse, ToolCallPart
 
         from radar.pipeline import PipelineRequest, run
-        from radar.source.openalex import DictTransport, build_query_plan
+        from radar.config.searches import build_query_plan
+        from radar.source.openalex import DictTransport
         from radar.config.interests import default_profile
         from pydantic_ai.models.function import FunctionModel
 
@@ -344,7 +347,7 @@ class TestCliSeams(unittest.TestCase):
         plan = build_query_plan(default_profile(), max_queries=6)
         pages = {}
         for qi, q in enumerate(plan.queries):
-            pages[q.terms] = {"results": [{
+            pages.setdefault(q.terms, {"results": []})["results"].extend([{
                 "id": f"https://openalex.org/W{qi * 3 + j}",
                 "title": f"Paper {qi * 3 + j}",
                 "abstract_inverted_index": {"x": [0]},
@@ -352,7 +355,7 @@ class TestCliSeams(unittest.TestCase):
                 # so fixed evidence index 14 resolves to W14.
                 "doi": "", "publication_year": 2026,
                 "cited_by_count": 100 - (qi * 3 + j),
-            } for j in range(3)]}
+            } for j in range(3)])
         result = run(PipelineRequest(
             mode="analyze", max_candidates=15,
             source_override=DictTransport(pages),
@@ -363,7 +366,8 @@ class TestCliSeams(unittest.TestCase):
 
     def test_report_generation_failure_is_clear(self):
         from radar.pipeline import PipelineRequest, run
-        from radar.source.openalex import DictTransport, build_query_plan
+        from radar.config.searches import build_query_plan
+        from radar.source.openalex import DictTransport
         from radar.config.interests import default_profile
         from pydantic_ai.models.function import FunctionModel
 

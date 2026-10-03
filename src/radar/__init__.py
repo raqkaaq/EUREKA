@@ -22,6 +22,7 @@ _LAZY: dict[str, str] = {
     # config/interests.py
     "RadarProfile": "radar.config.interests",
     "default_profile": "radar.config.interests",
+    "build_query_plan": "radar.config.searches",
     # source/openalex.py
     "BASE_URL": "radar.source.openalex",
     "DictTransport": "radar.source.openalex",
@@ -29,7 +30,6 @@ _LAZY: dict[str, str] = {
     "OpenAlexHttpError": "radar.source.openalex",
     "OpenAlexQuotaError": "radar.source.openalex",
     "RetryingTransport": "radar.source.openalex",
-    "build_query_plan": "radar.source.openalex",
     "build_request": "radar.source.openalex",
     "collect": "radar.source.openalex",
     "default_client": "radar.source.openalex",

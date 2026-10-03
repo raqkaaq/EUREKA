@@ -26,7 +26,7 @@ AI_ML_KEYWORDS: tuple[str, ...] = (
     "diffusion models",
 )
 
-# Behavioral / economic cross-domain lenses appended to semantic queries.
+# Behavioral / economic lenses used by the separate intersection search.
 CROSS_DOMAIN_TERMS: tuple[str, ...] = (
     "behavioral science",
     "behavioral economics",

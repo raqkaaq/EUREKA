@@ -1,0 +1,16 @@
+version: 1
+questions:
+  ai_ml_relevance:
+    type: noul
+    instructions: "Is this paper relevant to AI/ML ({keywords})?"
+    criteria:
+      "true": "The paper is relevant to AI/ML research or methods."
+      "false": "The paper is not relevant to AI/ML."
+  cross_domain_potential:
+    type: noul
+    instructions: >-
+      Does this paper show cross-domain transfer potential between AI/ML and
+      {domains} (either direction)?
+    criteria:
+      "true": "The paper connects AI/ML with behavioral or economic ideas."
+      "false": "No such cross-domain connection."

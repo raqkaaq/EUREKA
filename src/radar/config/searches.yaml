@@ -1,0 +1,19 @@
+version: 1
+# Ordered baseline definitions, expanded up to the code-owned request cap.
+# Disjunctions preserve broad coverage; intersections are a separate branch.
+queries:
+  - name: broad_ai_ml
+    kind: semantic
+    terms: "{keywords}"
+  - name: newest_ai_ml
+    kind: recent
+    terms: "{keywords}"
+  - name: behavioral_economic_transfer
+    kind: semantic
+    scope: cross_domain
+    terms: "({keywords}) AND ({domains})"
+  - name: individual_ai_ml_topics
+    kind: semantic
+    terms: "{keyword}"
+    repeat: keywords
+    limit: 3

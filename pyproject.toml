@@ -11,6 +11,7 @@ dependencies = [
     "httpx>=0.28",
     "pydantic>=2.13.5",
     "pydantic-ai-slim[openai]>=2.52.0",
+    "PyYAML>=6.0.3,<7",
 ]
 
 [project.scripts]
@@ -19,6 +20,9 @@ eureka = "eureka:main"
 [build-system]
 requires = ["uv_build>=0.11.8,<0.12.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = ["eureka", "radar"]
 
 [dependency-groups]
 dev = [

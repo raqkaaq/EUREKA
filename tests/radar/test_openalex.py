@@ -9,11 +9,11 @@ import unittest
 from pydantic import ValidationError
 
 from radar.config.interests import RadarProfile
+from radar.config.searches import build_query_plan
 from radar.processing.ranking import cheap_score, rank_works
 from radar.schema.papers import PlannedQuery, QueryPlan
 from radar.source.openalex import (
     DictTransport,
-    build_query_plan,
     build_request,
     collect,
     normalize_work,

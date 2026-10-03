@@ -19,9 +19,17 @@ src/radar/
   config/
     interests.py       interest profile (AI/ML core + behavioral/economic lenses)
     runtime.py         all numeric bounds (service-free)
+    searches.yaml      editable baseline search definitions
+    searches.py        profile/template expansion, bounded query plan
+    yaml.py            safe YAML parsing and typed package-resource loading
     triage_questions.py identical routing questions/criteria for both endpoints
+  prompts/
+    screening_questions.yaml   shared SystemOne questions and true/false criteria
+    paper_triage.yaml          Qwen screening-agent instructions
+    opportunity_analysis.yaml synthesis instructions, header and task template
+    catalog.py                typed access to the prompt documents
   source/
-    openalex.py        HTTPX discovery, query plan/requests, retry/quota,
+    openalex.py        HTTPX discovery requests, retry/quota,
                        normalization, dedup, provenance
   provider/
     freetoken.py       LAN PydanticAI model construction + client lifecycle
@@ -30,8 +38,8 @@ src/radar/
   agent/
     paper_triage.py    same screening inputs/answer models over PydanticAI
                        FreeToken chat, complete-paper batches and deadlines
-    opportunity_analysis.py  typed Agent[None, RadarDraft], prompt +
-                       instructions (no separate prompt file), deadline/usage,
+    opportunity_analysis.py  typed Agent[None, RadarDraft], complete-paper prompt
+                       assembly + YAML instructions, deadline/usage,
                        output validation
   processing/
     triage_input.py    canonical model/state/questions input for both backends
@@ -51,12 +59,61 @@ src/radar/
     opportunities.py   analysis/briefing contracts (RadarDraft and friends)
     triage.py          shared SystemOneResponse, Qwen batch correlation,
                        TriageBatch/TriageResult and strict probabilities
+    configuration.py   immutable Pydantic search/question/prompt contracts
 ```
 
 Dependency direction: `cli → pipeline → {config, source, provider, agent,
 processing, storage, output, schema}`; adapters never depend on
-cli/pipeline/output; `schema` and `config` are service-free. No plugin
+cli/pipeline/output; `schema`, `config` and `prompts` are service-free. No plugin
 framework.
+
+## Editable searches, questions and prompts
+
+YAML is the source of truth for baseline search policy, shared screening
+questions, and both agents' instructions. Python owns expansion, transport,
+output schemas and hard safety limits; there is no second hardcoded search
+algorithm or inline instruction fallback.
+
+- `config/searches.yaml`: ordered definitions with `name`, `kind`
+  (`semantic` = keyword relevance ranking, not embedding search; `recent` =
+  newest first), `terms`, optional `scope`, `repeat`, `limit` and `per_page`.
+  Defaults separately cover broad AI/ML, newest AI/ML, behavioral/economic
+  intersections, and individual AI/ML topics. Every request shares the active
+  lookback filter. The planner lives in `config/searches.py`, replacing the
+  old planner in the OpenAlex adapter.
+- Search `{keywords}` and `{domains}` expand to OR-separated quoted profile
+  phrases. `{keyword}` is available only with `repeat: keywords`; `limit`
+  bounds that expansion. `scope: cross_domain` skips a definition when the
+  profile has no domains. Profile terms are quoted/escaped as literal phrases.
+  Identical requests are deduplicated (relevance/recent remain distinct), and
+  expansion stops at the code-owned six-request cap. Overlong rendered queries
+  are rejected, not silently truncated; split the configured query or shorten
+  the profile instead. CLI `--keywords` and `--lookback-days` still apply.
+- `prompts/screening_questions.yaml`: the fixed two named questions, their
+  `type: noul`, instruction templates and criteria. `{keywords}`/`{domains}`
+  use the existing screening profile formatting. Quote the YAML keys
+  `"true"`/`"false"` so they remain strings. Native CLEF and Qwen chat share
+  the same rendered dictionaries and unchanged Pydantic answer schema.
+- `prompts/paper_triage.yaml`: Qwen screening-agent instructions.
+- `prompts/opportunity_analysis.yaml`: synthesis-agent instructions,
+  `candidate_header`, and `task_template`. Task placeholders are
+  `{max_opportunities}` and `{valid_range}`; Python supplies the actual run
+  bounds. Both agents pass instructions through PydanticAI's `instructions`
+  interface, separate from untrusted user/paper data. Combined instructions
+  and user messages retain the existing prompt budget and complete-block policy.
+
+Documents require `version: 1` (configuration schema version), are safely
+parsed and validated into immutable Pydantic models, and are loaded from
+package resources rather than the working directory. Both root packages
+and the YAML resources are included in built distributions. Unknown/duplicate
+keys, unsafe YAML tags, blank text, unsupported versions/placeholders and
+oversized documents fail closed with a redacted configuration error (CLI
+exit 4), before source/model calls. No environment interpolation or credentials
+belong in these files. Defaults are cached per process: restart a long-running
+process after edits; a new CLI refresh loads the edits automatically.
+
+Metadata collection does not need agent prompts or inference. This slice
+adds no autonomous search tool loop; bounded LLM exploration remains separate.
 
 ## Source vs provider vs agent
 
