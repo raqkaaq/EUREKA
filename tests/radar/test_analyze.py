@@ -278,6 +278,8 @@ class TestCliSeams(unittest.TestCase):
         self.assertTrue(any("OpenAlex" in note for note in result.stderr_notes))
 
     def test_public_base_url_rejected_before_inference(self):
+        import socket
+
         from radar.pipeline import PipelineRequest, run
         from radar.source.openalex import DictTransport, build_query_plan
         from radar.config.interests import default_profile
@@ -287,10 +289,14 @@ class TestCliSeams(unittest.TestCase):
             "id": "https://openalex.org/W0", "title": "T",
             "abstract_inverted_index": {"x": [0]},
             "doi": "", "publication_year": 2026, "cited_by_count": 0}]}}
-        result = run(PipelineRequest(
-            mode="analyze", max_candidates=1,
-            base_url="https://api.openai.com/v1",
-            source_override=DictTransport(pages)))
+        public_answer = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))
+        ]
+        with mock.patch("socket.getaddrinfo", return_value=public_answer):
+            result = run(PipelineRequest(
+                mode="analyze", max_candidates=1,
+                base_url="https://api.openai.com/v1",
+                source_override=DictTransport(pages)))
         self.assertEqual(result.exit_code, 3)
 
     def test_analysis_report_flow_retains_evidence_above_index_11(self):

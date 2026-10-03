@@ -1,50 +1,91 @@
-# AI/ML Opportunity Radar (prototype)
+# AI/ML Opportunity Radar
 
 One-command radar: discover recent AI/ML papers via **OpenAlex** (the sole
 scholarly discovery API; arXiv appears only as an OpenAlex location string),
 then analyze them with a local **FreeToken** model through **PydanticAI**
-(structured output, Chat Completions path).
+(typed outcomes, Chat Completions path).
 
-## Official API basis (verified 2026-09-30)
+> Refactor note (issue #34, finished): the code now lives in the
+> responsibility layout below. Old flat modules moved to their new homes
+> with no compatibility shims.
 
-- Package: `pydantic-ai-slim[openai]` (per
-  https://ai.pydantic.dev/models/openai/ and
-  https://ai.pydantic.dev/models/compatible-apis/).
-- Custom OpenAI-compatible endpoint: `OpenAIChatModel(model_name,
-  provider=OpenAIProvider(base_url=..., api_key=...))`
-  (see "Other endpoints" in the compatible-APIs guide).
-- Structured output: `Agent(model, output_type=RadarDraft)`; `run_sync(...).output`
-  is a validated `RadarDraft`.
-- Tests inject `TestModel`/`FunctionModel` (see
-  https://ai.pydantic.dev/guides/testing/) — no network, no LLM.
+## Responsibility architecture
 
-## Networking (httpx)
+```text
+src/radar/
+  cli.py               args, output printing, exit codes 0/2/3/4 (thin)
+  pipeline.py          orchestration only (no HTTP, prompts, or rendering)
+  config/
+    interests.py       interest profile (AI/ML core + behavioral/economic lenses)
+    runtime.py         all numeric bounds (service-free)
+  source/
+    openalex.py        HTTPX discovery, query plan/requests, retry/quota,
+                       normalization, dedup, provenance
+  provider/
+    freetoken.py       LAN PydanticAI model construction + client lifecycle
+  agent/
+    opportunity_analysis.py  typed Agent[None, RadarDraft], prompt +
+                       instructions (no separate prompt file), deadline/usage,
+                       output validation
+  processing/
+    ranking.py         deterministic scoring/selection (pool → ranked topN)
+    evidence.py        evidence index resolution/validation
+  storage/
+    snapshots.py       full-pool snapshots, deltas, coverage, strict v1
+                       validation, atomic writes, locking
+  output/
+    markdown.py        Markdown report rendering only
+    json.py            JSON output shaping only (collect-only envelopes)
+  schema/
+    papers.py          paper/plan contracts (CollectedWork and friends)
+    opportunities.py   analysis/briefing contracts (RadarDraft and friends)
+```
 
-- All direct HTTP (OpenAlex discovery, FreeToken `/models`) uses standard
-  `httpx` (direct dependency), injected via `httpx.MockTransport` in tests.
-  OpenAlex clients ignore proxy env and never follow redirects; transport
-  errors are redacted (no URLs, credentials, headers, or bodies).
-- Inference stays PydanticAI-only (`Agent[None, RadarDraft]` over
-  `OpenAIChatModel`/`OpenAIProvider`; no raw SDK calls). The provider
-  receives an explicitly owned `httpx2.AsyncClient` (the PydanticAI 2.52
-  typed seam; the legacy `httpx.AsyncClient` path warns), closed
-  deterministically after each run. Per-run `max_tokens`/timeout/usage
-  limits apply; the model never writes URLs (evidence indices only, with
-  the valid `0..N-1` range stated in the prompt).
+Dependency direction: `cli → pipeline → {config, source, provider, agent,
+processing, storage, output, schema}`; adapters never depend on
+cli/pipeline/output; `schema` and `config` are service-free. No plugin
+framework.
+
+## Source vs provider vs agent
+
+- **Source** (`source/openalex.py`) talks to the outside scholarly world:
+  bounded OpenAlex requests over standard HTTPX, transient-429 backoff,
+  confirmed-daily-quota fast-fail, and normalization into paper contracts.
+  No LLM calls. Errors are redacted (no URLs, credentials, headers, or
+  raw bodies).
+- **Provider** (`provider/freetoken.py`) talks to your LAN machine: it
+  validates the private-network endpoint, resolves the model id, and owns
+  the inference HTTP client lifecycle (upstream internal `httpx2`,
+  explicitly opened and deterministically closed per run). No prompts,
+  no analysis.
+- **Agent** (`agent/opportunity_analysis.py`) does the thinking: it builds
+  the prompt and instructions, runs the typed PydanticAI agent under a
+  hard overall deadline with per-run token/request/usage caps, and
+  validates the structured outcome. It never touches the network
+  directly; the model never writes URLs (evidence indices only).
 
 ## Usage
 
 ```sh
 # Collect-only: bounded real OpenAlex candidates as JSON (no LLM).
-uv run python -m radar --collect-only --max-candidates 8
+uv run --env-file .env python -m radar --collect-only --max-candidates 8
 
 # Full run: collect + local-model analysis as Markdown.
-uv run python -m radar --max-candidates 8
+uv run --env-file .env python -m radar --max-candidates 8
+
+# Unattended metadata refresh (full pool snapshot, no LLM).
+uv run --env-file .env python -m radar --collect-only --refresh-dir data/radar
+
+# Cached synthesis: zero OpenAlex calls (needs FreeToken for analysis).
+uv run --env-file .env python -m radar --from-snapshot data/radar/snapshot.json --max-candidates 2
 
 # Options.
-uv run python -m radar --help
-uv run python -m radar --keywords "graph neural networks" --lookback-days 30
+uv run --env-file .env python -m radar --help
+uv run --env-file .env python -m radar --keywords "graph neural networks" --lookback-days 30
 ```
+
+Exit codes: 0 ok, 2 external-service (OpenAlex) failure, 3 analysis/report
+failure (including FreeToken), 4 usage/config error.
 
 ## Configuration (env)
 
@@ -54,117 +95,76 @@ uv run python -m radar --keywords "graph neural networks" --lookback-days 30
 | `FREETOKEN_MODEL` | Model id (skips `/models` lookup) | first id from `GET {base}/models` |
 | `FREETOKEN_API_KEY` | Local API key placeholder | `freetoken-local` |
 | `FREETOKEN_DISABLE_THINKING` | Opt-in server-specific thinking-disable key | unset (omitted) |
-| `OPENALEX_API_KEY` | Optional polite OpenAlex pool | unset |
+| `OPENALEX_API_KEY` | Optional personal OpenAlex budget | unset (shared anonymous pool) |
 
 Loopback, RFC 1918, IPv6 ULA, and RFC 6598 endpoints are allowed. Public,
 link-local, multicast, reserved, and unspecified destinations are refused;
 LAN hostnames must resolve exclusively to allowed addresses. The FreeToken
-server is user-owned: this tool never starts, stops, or alters it, and there
-are no cloud-model fallbacks. Configure it, for example, with
-`FREETOKEN_BASE_URL=http://192.168.1.20:1919/v1`.
+server is user-owned: this tool never starts, stops, or alters it, and
+there are no cloud-model fallbacks. Configured private-LAN example (no
+secrets involved):
+`--base-url http://192.168.0.166:1919/v1 --model Qwen3.6-35B-A3B-NVFP4`
+(or the equivalent `FREETOKEN_*` env vars).
+
+## Discovery, quota, and paper counts
+
+- OpenAlex requests ≤ 6/plan, ≤ 50/page, ≤ 200 total pool cap, timeout
+  ≤ 30 s. An `OPENALEX_API_KEY` is optional, but a free personal key
+  avoids the exhausted shared anonymous pool; without one, confirmed
+  daily-budget 429s fail fast with an actionable error instead of
+  blind retries. Transient 429s get bounded retries. Source errors never
+  carry URLs, credentials, or bodies.
+- Three distinct counts, never conflated: **collected** (full bounded
+  pool persisted by refresh), **selected/analyzed** (the ranked topN slice
+  the LLM actually saw), and **opportunities** (what the model proposed).
+  Metadata-only runs honestly report `llm_selected/llm_analyzed` as zero.
+- Discovery is a bounded OpenAlex sample (lookback window applies to
+  every query): counts describe the snapshot only, never all of OpenAlex.
+  Cross-domain discovery is broad AI/ML plus behavioral/economic lenses.
+  Abstracts/metadata only; no PDFs are downloaded, no fulltext, no
+  extra services.
+
+## Snapshots and cached synthesis
+
+`--refresh-dir PATH` writes one atomic `snapshot.json`: full normalized
+pool plus UTC timestamp, coverage counts, and an OpenAlex-ID-keyed delta
+(`new`/`changed`/`unchanged`, ignoring timestamp, ordering, and derived
+scores). Only strict producer-v1 snapshots are accepted as previous
+state; anything else is refused with the file left untouched. Overlapping
+refreshes are refused via a nonblocking lock; any collection, validation,
+or persistence failure preserves the last valid snapshot and exits
+nonzero. Runtime `data/radar/` is git-ignored.
+
+`--from-snapshot` analyzes cached metadata with zero OpenAlex calls and
+discloses snapshot staleness; it can never be combined with
+`--refresh-dir`. Analysis runs under a hard overall deadline
+(`--analysis-timeout`, default 90 s); `--disable-thinking` is strictly
+opt-in and backend-specific.
 
 ## Report
 
 Markdown sections per opportunity: **The Wow**, **Investigate**,
 **Reproduce**, plus **Evidence** links attached deterministically from the
-model's candidate indices (the model never writes URLs), a global **Ignore**
-list, and a **Next move**.
+model's candidate indices (the model never writes URLs), a global
+**Ignore** list, and a **Next move**.
 
-## Bounds
+## Baseline vs refactor status
 
-OpenAlex requests ≤ 6/plan, ≤ 50/page, ≤ 200 total (hard candidate-pool
-cap), timeout ≤ 30 s; candidates ≤ 25 (`--max-candidates` bounds the final
-ranked output slice, never plan execution); prompt ≤ 25 candidates /
-12 000 chars, at most 2 opportunities with short fields; per-run model
-output ≤ 2000 tokens (`--max-tokens` 128..8000), request limit 2,
-validation retries 0; overall analysis deadline 90 s
-(`--analysis-timeout` (0, 300]); per-request model timeout fits inside it.
-Transient OpenAlex HTTP 429 responses are retried at most twice; valid
-`Retry-After` values are capped at 45 seconds, while missing or malformed
-values use a two-second backoff.
-
-## Cached snapshot synthesis (no OpenAlex calls)
-
-```sh
-# Inspect a cached snapshot (no network, no LLM).
-uv run python -m radar --collect-only --from-snapshot data/radar/snapshot.json
-
-# Analyze cached metadata (zero OpenAlex calls; needs FreeToken).
-uv run python -m radar --from-snapshot data/radar/snapshot.json --max-candidates 2
-
-# Known-working LAN synthesis (model must be served; SYNTHETIC fixture label
-# applies until a free OpenAlex key restores real discovery):
-uv run python -m radar --from-snapshot data/radar/live/fixture_synthetic.json \
-  --max-candidates 2 --base-url http://192.168.0.166:1919/v1 \
-  --model Qwen3.6-35B-A3B-NVFP4 --disable-thinking
-```
-
-`--from-snapshot` loads a valid producer-v1 snapshot, reproducibly selects
-the ranked topN (score desc, OpenAlex ID asc), and discloses the collection
-timestamp/staleness on stderr. Invalid sources are rejected before any
-model call; `--from-snapshot` + `--refresh-dir` is refused (cached
-synthesis never rewrites works). Coverage updates to a refreshed snapshot
-are generation-aware: a stale run never stomps fresher coverage.
-
-## Opt-in thinking disable
-
-`--disable-thinking` (or `FREETOKEN_DISABLE_THINKING=1`) sends the
-server-specific `extra_body.chat_template_kwargs.enable_thinking=false` key
-(probed once against the LAN FreeToken: accepted, honoring not confirmed).
-The key is omitted by default and assumed supported by no backend; a server
-rejection produces a clear rerun-without-it error. Never used to force
-empty or fake output: few or zero opportunities remain valid.
-
-## Lookback
-
-`--lookback-days` (default 90, 1..3650) sets `from_date` on **every**
-discovery query: each request carries
-`filter=from_publication_date:<today-lookback>`. Semantic queries omit
-`sort` so OpenAlex relevance ranking applies; only the recent query adds
-`sort=publication_date:desc` for newest-first ordering.
-
-## Metadata-only refresh (no LLM)
-
-```sh
-# Unattended metadata refresh: persists the FULL bounded pool as one
-# atomic snapshot (data/radar/snapshot.json). No FreeToken needed.
-uv run python -m radar --collect-only --refresh-dir data/radar
-
-# Refresh, then run the optional FreeToken synthesis separately.
-uv run python -m radar --max-candidates 8
-```
-
-`--refresh-dir PATH` writes a single `snapshot.json` containing the full
-normalized pool (metadata, abstracts, locations, provenance) plus a UTC
-timestamp, explicit coverage counts (`collected`, `with_abstracts`,
-`missing_abstracts`, `llm_selected`, `llm_analyzed` -- zeros for
-metadata-only runs), and an OpenAlex-ID-keyed delta (`new`/`changed`/
-`unchanged` counts). Reruns with an unchanged pool report zero changes:
-delta identity ignores snapshot timestamp, work ordering, and the derived
-ranking score. Only producer schema v1 snapshots are accepted as the
-previous state; anything else (unknown schema, malformed entries, missing
-or duplicate OpenAlex IDs) is refused with a clear error and the previous
-file is left untouched, never silently healed. Works with missing abstracts are retained and counted, never dropped.
-Overlapping refreshes are refused via a nonblocking lock; collection,
-validation, or persistence failures preserve the last valid snapshot and
-exit nonzero. Runtime `data/radar/` is git-ignored.
-
-## Coverage limitations
-
-Discovery is a bounded OpenAlex sample (<= 6 requests, <= 50/page,
-<= 200 pooled works, `--lookback-days` window): coverage counts describe
-the snapshot only, never all of OpenAlex. Cross-domain discovery is
-broad AI/ML plus behavioral/economic lenses. No PDFs are downloaded.
-
-## Next work
-
-Batched full-pool triage, evals, and a personal interest profile. Real
-OpenAlex discovery stays blocked until a free API key is configured
-(currently quota-exhausted); synthetic-fixture runs are not end-to-end
-passes.
+Verified on the finished layout (`b925eb2`, 125/125 tests green):
+metadata refresh of 106 real works in 3s with an idempotent rerun
+(0 new / 0 changed / 106 unchanged), cached 3-paper briefing exit 0 in
+17s, and gated 8-paper briefing exit 0 in 19s (selected=8 analyzed=8
+opportunities=2 pool=106), all with evidence URLs inside the pool and
+the snapshot preserved. The five-hour automation stays aligned to
+validated paths only.
 
 ## Tests
 
 ```sh
 uv run python -m unittest discover -s tests/radar -v
 ```
+
+Boundaries, all offline: `httpx.MockTransport` at the source HTTP seam,
+`FunctionModel`/`TestModel` at the agent seam, real temp filesystems for
+storage, CLI exit-code/output-shape tests at the pipeline boundary, and
+import/AST checks enforcing the dependency direction above.
