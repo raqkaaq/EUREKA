@@ -33,8 +33,8 @@ import json as _json
 import os as _os
 from typing import Any
 
-from radar.models import MAX_QUERIES, CollectedWork
-from radar.openalex import MAX_TOTAL_WORKS
+from radar.config.runtime import MAX_QUERIES, MAX_TOTAL_WORKS
+from radar.schema.papers import CollectedWork
 
 SCHEMA_VERSION = 1
 SNAPSHOT_FILENAME = "snapshot.json"
@@ -203,6 +203,71 @@ def _load_previous(path: str) -> list[dict[str, Any]]:
     return works
 
 
+def load_snapshot(path: str) -> tuple[list[CollectedWork], dict[str, Any]]:
+    """Load a snapshot file: validated works plus collection metadata.
+
+    Strict producer-v1 validation (same rules as delta baselines); raises
+    :class:`RefreshError` without touching the file. Returns
+    ``(works, meta)`` where meta carries ``collected_at_utc``,
+    ``coverage``, and ``discovery``.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            payload = _json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise RefreshError(
+            f"snapshot {path} is unreadable ({type(exc).__name__}: {exc})"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RefreshError(f"snapshot {path} has an unrecognized shape")
+    version = payload.get("schema_version")
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != SCHEMA_VERSION
+    ):
+        raise RefreshError(
+            f"snapshot {path} has unsupported schema_version {version!r} "
+            f"(supports v{SCHEMA_VERSION} only)"
+        )
+    raw_works = payload.get("works")
+    if not isinstance(raw_works, list):
+        raise RefreshError(f"snapshot {path} has no works list")
+    works: list[CollectedWork] = []
+    seen: set[str] = set()
+    for pos, entry in enumerate(raw_works):
+        if not isinstance(entry, dict):
+            raise RefreshError(f"snapshot {path} works[{pos}] is not an object")
+        try:
+            work = CollectedWork.model_validate(entry)
+        except ValueError as exc:
+            raise RefreshError(
+                f"snapshot {path} works[{pos}] invalid: {exc}"
+            ) from exc
+        if not work.openalex_id.strip():
+            raise RefreshError(f"snapshot {path} works[{pos}] has an empty ID")
+        if work.openalex_id in seen:
+            raise RefreshError(
+                f"snapshot {path} has duplicate openalex_id {work.openalex_id!r}"
+            )
+        seen.add(work.openalex_id)
+        works.append(work)
+    collected_at = payload.get("collected_at_utc")
+    if not isinstance(collected_at, str) or not collected_at.strip():
+        raise RefreshError(f"snapshot {path} has no collected_at_utc timestamp")
+    coverage = payload.get("coverage")
+    if not isinstance(coverage, dict):
+        raise RefreshError(f"snapshot {path} has no coverage counts")
+    discovery = payload.get("discovery")
+    if not isinstance(discovery, dict):
+        raise RefreshError(f"snapshot {path} has no discovery disclosure")
+    return works, {
+        "collected_at_utc": collected_at,
+        "coverage": dict(coverage),
+        "discovery": dict(discovery),
+    }
+
+
 def _write_atomic(path: str, payload: dict[str, Any]) -> None:
     tmp_path = f"{path}.tmp-{_os.getpid()}"
     try:
@@ -285,6 +350,7 @@ def refresh_pool(
         _write_atomic(path, snapshot)
         return {
             "snapshot": path,
+            "collected_at_utc": snapshot["collected_at_utc"],
             "coverage": coverage,
             "delta": delta,
             "disclosure": DISCLOSURE,
@@ -294,9 +360,17 @@ def refresh_pool(
 
 
 def update_llm_coverage(
-    refresh_dir: str, llm_selected: int, llm_analyzed: int
+    refresh_dir: str,
+    llm_selected: int,
+    llm_analyzed: int,
+    expect_collected_at: str | None = None,
 ) -> dict[str, Any]:
-    """Patch LLM counts into an existing snapshot's coverage (post-analysis)."""
+    """Patch LLM counts into an existing snapshot's coverage (post-analysis).
+
+    Generation-aware: when ``expect_collected_at`` is given, the patch is
+    refused if the snapshot's timestamp differs (a fresher refresh landed
+    in between), so stale analysis never stomps fresh coverage.
+    """
     lock_path = _lock_path(refresh_dir)
     try:
         fd = _acquire_lock(lock_path)
@@ -315,6 +389,13 @@ def update_llm_coverage(
             ) from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("coverage"), dict):
             raise RefreshError(f"cannot update coverage: snapshot {path} has bad shape")
+        if expect_collected_at is not None and (
+            payload.get("collected_at_utc") != expect_collected_at
+        ):
+            raise RefreshError(
+                f"cannot update coverage: snapshot {path} changed since this "
+                "analysis started (stale run); leaving fresh coverage untouched"
+            )
         payload["coverage"]["llm_selected"] = int(llm_selected)
         payload["coverage"]["llm_analyzed"] = int(llm_analyzed)
         _write_atomic(path, payload)

@@ -1,11 +1,12 @@
-"""Regression: --max-candidates bounds final output, not plan execution."""
+"""Pipeline collection: the whole bounded plan executes; the output bound
+applies only to the final ranked slice. Fake source, no network."""
 
 from __future__ import annotations
 
+import json
 import unittest
-from unittest.mock import patch
 
-from radar import cli as _cli
+from radar.pipeline import PipelineRequest, run
 
 
 def _raw(wid: str, title: str, year: int = 2026) -> dict:
@@ -19,7 +20,7 @@ def _raw(wid: str, title: str, year: int = 2026) -> dict:
     }
 
 
-class FakeTransport:
+class FakeSource:
     """Serve one distinct work per planned query; record params."""
 
     def __init__(self):
@@ -36,13 +37,12 @@ class FakeTransport:
         }
 
 
-class TestCollectCandidatesBounds(unittest.TestCase):
+class TestPipelineCollectionBounds(unittest.TestCase):
     def test_small_max_still_executes_whole_plan(self):
-        fake = FakeTransport()
-        with patch.object(_cli, "UrllibTransport", lambda: fake):
-            works = _cli.collect_candidates(
-                max_candidates=1, lookback_days=90, timeout=10.0, keywords=None
-            )
+        fake = FakeSource()
+        result = run(PipelineRequest(
+            mode="collect", max_candidates=1, source_override=fake))
+        self.assertEqual(result.exit_code, 0)
         # Whole bounded plan (five themes + recent query) executes despite
         # an output max of 1.
         self.assertEqual(len(fake.calls), 6)
@@ -53,7 +53,8 @@ class TestCollectCandidatesBounds(unittest.TestCase):
         sorts = [p.get("sort") for p in fake.calls]
         self.assertEqual(sorts.count("publication_date:desc"), 1)
         # Output bound respected.
-        self.assertEqual(len(works), 1)
+        shown = json.loads(result.stdout)
+        self.assertEqual(len(shown), 1)
 
 
 if __name__ == "__main__":

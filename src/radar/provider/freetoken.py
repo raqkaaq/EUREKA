@@ -1,37 +1,50 @@
-"""Private-network FreeToken model adapter (PydanticAI only).
+"""Private-network FreeToken provider: LAN-only model configuration,
+PydanticAI model construction, and deterministic client lifetime.
 
-- Configure the endpoint with ``FREETOKEN_BASE_URL`` or ``--base-url``;
-  there is no assumed host because FreeToken may live elsewhere on the LAN.
-- Model resolution: ``FREETOKEN_MODEL`` env var, else the local
-  ``GET {base}/models`` endpoint (OpenAI-compatible ``{"data": [...]}``).
-- Inference goes exclusively through PydanticAI
-  (``OpenAIChatModel`` + ``Agent``); this module never imports the OpenAI
-  SDK directly and performs no HTTP calls except the ``/models`` lookup.
-- Public, link-local, multicast, reserved, and unspecified destinations are
-  rejected. Loopback, RFC 1918, IPv6 ULA, and RFC 6598 addresses are allowed.
-
-Official API reference (verified 2026-09-30):
-https://ai.pydantic.dev/models/openai/ (``OpenAIChatModel`` for Chat
-Completions endpoints) and
-https://ai.pydantic.dev/models/compatible-apis/#other-endpoints
-(``OpenAIProvider(base_url=..., api_key=...)`` for custom OpenAI-compatible
-endpoints). Package: ``pydantic-ai-slim[openai]``.
+Owns no prompts, no analysis bounds (see :mod:`radar.config.runtime`),
+no inference HTTP (PydanticAI owns that); this module owns the
+underlying client lifetime.
 """
 
 from __future__ import annotations
 
-import json as _json
+import asyncio as _asyncio
 import ipaddress as _ipaddress
 import os as _os
 import socket as _socket
 import urllib.parse as _parse
-import urllib.request as _request
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import httpx as _httpx
+
+if TYPE_CHECKING:
+    import httpx2 as _httpx2
+    from pydantic_ai.models import Model as _Model
 
 EXAMPLE_BASE_URL = "http://192.168.1.20:1919/v1"
 MODELS_TIMEOUT_S = 5.0
 MODEL_TIMEOUT_S = 60.0
-MODEL_MAX_RETRIES = 1  # PydanticAI output-validation retries (bounded)
+DISABLE_THINKING_ENV_VAR = "FREETOKEN_DISABLE_THINKING"
+
+
+def resolve_disable_thinking(explicit: bool = False) -> bool:
+    """Whether to send the server-specific thinking-disable key.
+
+    Opt-in only: explicit flag wins, else the ``FREETOKEN_DISABLE_THINKING``
+    env var (1/true/yes/on). Default omits the key entirely -- no backend
+    is assumed to support it.
+    """
+    if explicit:
+        return True
+    return _os.environ.get(DISABLE_THINKING_ENV_VAR, "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def thinking_extra_body() -> dict[str, object]:
+    """Server-specific key disabling vLLM-style reasoning output (opt-in)."""
+    return {"chat_template_kwargs": {"enable_thinking": False}}
 
 _LOCALHOST_NAMES = frozenset({"localhost"})
 _ALLOWED_V4_NETWORKS = tuple(
@@ -141,30 +154,38 @@ def _models_url(base_url: str) -> str:
 
 
 def list_models(base_url: str, timeout: float = MODELS_TIMEOUT_S) -> list[str]:
-    """List model ids from the local ``/models`` endpoint (stdlib only)."""
+    """List model ids from the local ``/models`` endpoint (httpx, bounded).
+
+    Never includes credentials, headers, or raw bodies in errors.
+    """
     base_url = check_local_network(base_url)
     if not (0 < timeout <= 30):
         raise FreeTokenError("models lookup timeout must be within (0, 30]s")
-    req = _request.Request(
-        _models_url(base_url),
-        headers={"Accept": "application/json"},
-        method="GET",
-    )
     try:
-        with _request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-            raw = resp.read(1_000_000)
-    except Exception as exc:
+        with _httpx.Client(trust_env=False, follow_redirects=False) as client:
+            resp = client.get(
+                _models_url(base_url),
+                headers={"Accept": "application/json"},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+    except _httpx.HTTPError as exc:
         raise FreeTokenError(
-            f"Cannot reach FreeToken at {base_url} ({exc}). Is the user-owned "
-            "FreeToken server running at that LAN endpoint? "
+            f"Cannot reach FreeToken at {base_url} ({type(exc).__name__}). "
+            "Is the user-owned FreeToken server running at that LAN endpoint? "
             "this tool never starts it for you."
-        ) from exc
-    try:
-        payload = _json.loads(raw.decode("utf-8", errors="replace"))
+        ) from None
     except ValueError as exc:
         raise FreeTokenError(
-            f"FreeToken at {base_url} returned a non-JSON /models payload: {exc}"
+            f"FreeToken at {base_url} returned a non-JSON /models payload."
         ) from exc
+    except Exception as exc:
+        raise FreeTokenError(
+            f"Cannot reach FreeToken at {base_url} ({type(exc).__name__}). "
+            "Is the user-owned FreeToken server running at that LAN endpoint? "
+            "this tool never starts it for you."
+        ) from None
     ids: list[str] = []
     data = payload.get("data") if isinstance(payload, dict) else None
     if isinstance(data, list):
@@ -217,32 +238,64 @@ class FreeTokenConfig:
         return cls(base_url=base, model=name, api_key=key, timeout_s=float(timeout_s))
 
 
-def _http_client(timeout_s: float):
-    """Best-effort timeout-bound HTTP client for the provider (optional)."""
-    try:
-        import httpx2  # provided transitively via pydantic-ai-slim[openai]
+def _provider_http_client(timeout_s: float) -> "_httpx2.AsyncClient":
+    """Build the owned inference HTTP client (typed httpx2 seam).
 
-        return httpx2.AsyncClient(timeout=timeout_s)
-    except Exception:
-        return None
+    PydanticAI 2.52 accepts ``httpx2.AsyncClient`` without warnings (the
+    legacy ``httpx.AsyncClient`` path warns); ``httpx2>=2.7`` is a declared
+    dependency of ``pydantic-ai-slim``. LAN safety: no proxy env, no
+    redirects, bounded timeout. The caller owns the client and must close
+    it via :func:`close_session` when the run settles.
+    """
+    import httpx2
+
+    return httpx2.AsyncClient(
+        timeout=timeout_s, follow_redirects=False, trust_env=False
+    )
 
 
-def build_model(config: FreeTokenConfig):
+@dataclass
+class FreeTokenSession:
+    """Owned inference session: PydanticAI model plus its HTTP client."""
+
+    model: "_Model"
+    http_client: "_httpx2.AsyncClient"
+
+
+def build_session(config: FreeTokenConfig) -> FreeTokenSession:
     """Build a PydanticAI Chat Completions model for the FreeToken endpoint.
 
     Uses ``OpenAIChatModel`` (Chat Completions path, correct for
     OpenAI-compatible local servers) with ``OpenAIProvider``. No direct
-    OpenAI SDK imports or calls; PydanticAI owns all inference HTTP.
+    OpenAI SDK imports or calls; PydanticAI owns all inference HTTP, while
+    this module owns the underlying client lifetime.
     """
     # Local imports so modules without a model dependency stay light.
     from pydantic_ai.models.openai import OpenAIChatModel
     from pydantic_ai.providers.openai import OpenAIProvider
 
-    client = _http_client(config.timeout_s)
-    if client is not None:
-        provider: object = OpenAIProvider(
-            base_url=config.base_url, api_key=config.api_key, http_client=client
-        )
+    client = _provider_http_client(config.timeout_s)
+    provider = OpenAIProvider(
+        base_url=config.base_url, api_key=config.api_key, http_client=client
+    )
+    return FreeTokenSession(
+        model=OpenAIChatModel(config.model, provider=provider),  # type: ignore[arg-type]
+        http_client=client,
+    )
+
+
+def close_session(session: FreeTokenSession) -> None:
+    """Deterministically close a session's HTTP client (sync-safe).
+
+    Safe when no loop is running (fresh loop) and when called inside a
+    running loop (scheduled, never nested). Only call once the run has
+    settled; prefer the in-loop cleanup in ``analyze`` for live runs.
+    """
+    try:
+        loop = _asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None and loop.is_running():
+        loop.create_task(session.http_client.aclose())
     else:
-        provider = OpenAIProvider(base_url=config.base_url, api_key=config.api_key)
-    return OpenAIChatModel(config.model, provider=provider)  # type: ignore[arg-type]
+        _asyncio.run(session.http_client.aclose())

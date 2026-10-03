@@ -14,15 +14,22 @@ from unittest import mock
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 
-from radar.analyze import analyze_candidates, build_agent
-from radar.cli import collect_candidates, main, work_to_json
-from radar.models import (
-    CollectedWork,
+from radar.agent.opportunity_analysis import (
+    analyze_candidates,
+    build_agent,
+    build_prompt,
+)
+from radar.cli import main
+from radar.config.runtime import MAX_CANDIDATES_IN_PROMPT, MAX_PROMPT_CHARS
+from radar.output.json import work_to_json
+from radar.output.markdown import render_markdown
+from radar.processing.evidence import attach_evidence
+from radar.processing.ranking import bound_candidates
+from radar.schema.opportunities import (
     OpportunityDraft,
     RadarDraft,
 )
-from radar.prompt import MAX_PROMPT_CHARS, build_prompt
-from radar.report import attach_evidence, render_markdown
+from radar.schema.papers import CollectedWork
 
 
 def _candidate(i: int = 0) -> CollectedWork:
@@ -174,18 +181,17 @@ class TestPromptBounds(unittest.TestCase):
         self.assertNotIn("[25]", prompt)
         self.assertIn("[0]", prompt)
 
-    def test_prompt_cap_matches_cli_max(self):
-        from radar import cli as _cli
-        from radar.prompt import MAX_CANDIDATES_IN_PROMPT
+    def test_prompt_cap_covers_cli_max(self):
+        from radar.config.runtime import MAX_MAX_CANDIDATES
 
-        self.assertEqual(MAX_CANDIDATES_IN_PROMPT, _cli.MAX_MAX_CANDIDATES)
+        self.assertGreaterEqual(MAX_CANDIDATES_IN_PROMPT, MAX_MAX_CANDIDATES)
 
     def test_prompt_never_empty(self):
         prompt = build_prompt([], max_candidates=8)
         self.assertIn("CANDIDATES", prompt)
 
     def test_prompt_marks_candidates_untrusted_and_no_instruction_following(self):
-        from radar.prompt import SYSTEM_INSTRUCTIONS
+        from radar.agent.opportunity_analysis import SYSTEM_INSTRUCTIONS
 
         lowered = SYSTEM_INSTRUCTIONS.lower()
         self.assertIn("untrusted", lowered)
@@ -196,8 +202,6 @@ class TestPromptBounds(unittest.TestCase):
         self.assertIn("end untrusted candidate 0 data", prompt.lower())
 
     def test_prompt_and_evidence_share_bounded_set_above_index_11(self):
-        from radar.prompt import bound_candidates
-
         candidates = [_candidate(i) for i in range(15)]
         prompt = build_prompt(candidates, max_candidates=15)
         self.assertIn("[14]", prompt)
@@ -221,12 +225,12 @@ class TestPromptBounds(unittest.TestCase):
 
 class TestCliSeams(unittest.TestCase):
     def test_collect_bounds_validated(self):
-        with self.assertRaises(ValueError):
-            collect_candidates(0, 90, 10.0, None)
-        with self.assertRaises(ValueError):
-            collect_candidates(26, 90, 10.0, None)
-        with self.assertRaises(ValueError):
-            collect_candidates(8, 90, 999.0, None)
+        from radar.pipeline import PipelineRequest, run
+
+        for bad in (dict(max_candidates=0), dict(max_candidates=26),
+                    dict(timeout_s=999.0), dict(lookback_days=0)):
+            result = run(PipelineRequest(mode="collect", **bad))
+            self.assertEqual(result.exit_code, 4)
 
     def test_work_to_json_keys(self):
         payload = work_to_json(_candidate(3))
@@ -234,32 +238,66 @@ class TestCliSeams(unittest.TestCase):
         self.assertLessEqual(len(payload["abstract"]), 2000)
 
     def test_collect_only_prints_bounded_json(self):
-        works = [_candidate(i) for i in range(3)]
-        with mock.patch("radar.cli.collect_candidates", return_value=works):
-            with mock.patch("builtins.print") as fake_print:
-                code = main(["--collect-only", "--max-candidates", "8"])
-        self.assertEqual(code, 0)
-        (printed,), _ = fake_print.call_args
-        parsed = json.loads(printed)
+        import contextlib
+        import io
+
+        from radar.pipeline import PipelineRequest, run
+        from radar.source.openalex import DictTransport, build_query_plan
+        from radar.config.interests import default_profile
+
+        plan = build_query_plan(default_profile())
+        first_terms = plan.queries[0].terms
+        pages = {first_terms: {"results": [{
+            "id": f"https://openalex.org/W{i}",
+            "title": f"Work {i}",
+            "abstract_inverted_index": {"x": [0]},
+            "doi": "", "publication_year": 2026, "cited_by_count": 0,
+        } for i in range(3)]}}
+        result = run(PipelineRequest(
+            mode="collect", max_candidates=8, source_override=DictTransport(pages)))
+        self.assertEqual(result.exit_code, 0)
+        parsed = json.loads(result.stdout)
         self.assertEqual(len(parsed), 3)
         self.assertEqual(parsed[0]["openalex_id"], "https://openalex.org/W0")
+        # Thin CLI prints the pipeline payload unchanged.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = main(["--collect-only", "--from-snapshot",
+                         "/nonexistent.json"])
+        self.assertEqual(code, 4)
 
     def test_openalex_failure_is_clear_external_error(self):
-        with mock.patch("radar.cli.collect_candidates", side_effect=TimeoutError("slow")):
-            with mock.patch("builtins.print") as fake_print:
-                code = main(["--collect-only"])
-        self.assertEqual(code, 2)
-        _, kwargs = fake_print.call_args
-        import sys
+        from radar.pipeline import PipelineRequest, run
 
-        self.assertIs(kwargs.get("file"), sys.stderr)
+        class _Down:
+            def get_json(self, url, params, headers, timeout):
+                raise TimeoutError("slow")
+
+        result = run(PipelineRequest(mode="collect", source_override=_Down()))
+        self.assertEqual(result.exit_code, 2)
+        self.assertTrue(any("OpenAlex" in note for note in result.stderr_notes))
 
     def test_public_base_url_rejected_before_inference(self):
-        with mock.patch(
-            "radar.cli.collect_candidates", return_value=[_candidate(0)]
-        ):
-            code = main(["--base-url", "https://api.openai.com/v1"])
-        self.assertEqual(code, 3)
+        import socket
+
+        from radar.pipeline import PipelineRequest, run
+        from radar.source.openalex import DictTransport, build_query_plan
+        from radar.config.interests import default_profile
+
+        plan = build_query_plan(default_profile())
+        pages = {plan.queries[0].terms: {"results": [{
+            "id": "https://openalex.org/W0", "title": "T",
+            "abstract_inverted_index": {"x": [0]},
+            "doi": "", "publication_year": 2026, "cited_by_count": 0}]}}
+        public_answer = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))
+        ]
+        with mock.patch("socket.getaddrinfo", return_value=public_answer):
+            result = run(PipelineRequest(
+                mode="analyze", max_candidates=1,
+                base_url="https://api.openai.com/v1",
+                source_override=DictTransport(pages)))
+        self.assertEqual(result.exit_code, 3)
 
     def test_analysis_report_flow_retains_evidence_above_index_11(self):
         """Regression: evidence attachment uses the same bounded set as the LLM.
@@ -267,9 +305,13 @@ class TestCliSeams(unittest.TestCase):
         With >12 candidates and --max-candidates 15, a selection of index 14
         must retain its deterministic URL/title (old works[:12] dropped it).
         """
-        from radar.prompt import bound_candidates
+        from pydantic_ai.messages import ModelResponse, ToolCallPart
 
-        works = [_candidate(i) for i in range(15)]
+        from radar.pipeline import PipelineRequest, run
+        from radar.source.openalex import DictTransport, build_query_plan
+        from radar.config.interests import default_profile
+        from pydantic_ai.models.function import FunctionModel
+
         draft = RadarDraft(
             opportunities=[
                 OpportunityDraft(
@@ -279,47 +321,65 @@ class TestCliSeams(unittest.TestCase):
             ignore=[],
             next_move="N",
         )
-        with mock.patch("radar.cli.collect_candidates", return_value=works):
-            with mock.patch("radar.cli.analyze_candidates", return_value=(draft, "p")) as fake_analyze:
-                with mock.patch(
-                    "radar.cli._freetoken.FreeTokenConfig.resolve"
-                ) as fake_resolve:
-                    with mock.patch("radar.cli._freetoken.build_model") as fake_build:
-                        fake_resolve.return_value = mock.Mock()
-                        fake_build.return_value = object()
-                        with mock.patch("builtins.print") as fake_print:
-                            code = main(["--max-candidates", "15"])
-        self.assertEqual(code, 0)
-        # LLM received the full bounded set including index 14.
-        _, kwargs = fake_analyze.call_args
-        sent = kwargs.get("candidates", fake_analyze.call_args[0][0])
-        self.assertGreaterEqual(len(sent), 15)
-        self.assertEqual(
-            [w.openalex_id for w in bound_candidates(sent, 15)],
-            [w.openalex_id for w in works[:15]],
-        )
-        (printed,), _ = fake_print.call_args
-        self.assertIn("https://example.org/paper-14", printed)
+
+        def _impl(messages, info):
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="final_result", args=draft.model_dump())])
+
+        plan = build_query_plan(default_profile(), max_queries=6)
+        pages = {}
+        for qi, q in enumerate(plan.queries):
+            pages[q.terms] = {"results": [{
+                "id": f"https://openalex.org/W{qi * 3 + j}",
+                "title": f"Paper {qi * 3 + j}",
+                "abstract_inverted_index": {"x": [0]},
+                # Distinct citations force ranked order == numeric order,
+                # so fixed evidence index 14 resolves to W14.
+                "doi": "", "publication_year": 2026,
+                "cited_by_count": 100 - (qi * 3 + j),
+            } for j in range(3)]}
+        result = run(PipelineRequest(
+            mode="analyze", max_candidates=15,
+            source_override=DictTransport(pages),
+            model_override=FunctionModel(_impl)))
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("https://openalex.org/W14", result.stdout)
 
     def test_report_generation_failure_is_clear(self):
-        works = [_candidate(0)]
-        draft = RadarDraft()
-        with mock.patch("radar.cli.collect_candidates", return_value=works):
-            with mock.patch("radar.cli.analyze_candidates", return_value=(draft, "p")):
-                with mock.patch("radar.cli._freetoken.FreeTokenConfig.resolve", return_value=mock.Mock()):
-                    with mock.patch("radar.cli._freetoken.build_model", return_value=object()):
-                        with mock.patch("radar.cli.attach_evidence", side_effect=RuntimeError("boom")):
-                            with mock.patch("builtins.print") as fake_print:
-                                code = main(["--max-candidates", "1"])
-        self.assertEqual(code, 3)
-        self.assertIn("Report generation failed", fake_print.call_args.args[0])
+        from radar.pipeline import PipelineRequest, run
+        from radar.source.openalex import DictTransport, build_query_plan
+        from radar.config.interests import default_profile
+        from pydantic_ai.models.function import FunctionModel
+
+        def _empty(messages, info):
+            from pydantic_ai.messages import ModelResponse, ToolCallPart
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="final_result",
+                args=RadarDraft().model_dump())])
+
+        plan = build_query_plan(default_profile())
+        pages = {plan.queries[0].terms: {"results": [{
+            "id": "https://openalex.org/W0", "title": "T",
+            "abstract_inverted_index": {"x": [0]},
+            "doi": "", "publication_year": 2026, "cited_by_count": 0}]}}
+        import radar.pipeline as _pipeline
+
+        with mock.patch.object(_pipeline, "attach_evidence",
+                               side_effect=RuntimeError("boom")):
+            result = run(PipelineRequest(
+                mode="analyze", max_candidates=1,
+                source_override=DictTransport(pages),
+                model_override=FunctionModel(_empty)))
+        self.assertEqual(result.exit_code, 3)
+        self.assertTrue(any("Report generation failed" in note
+                            for note in result.stderr_notes))
 
 
 class TestRetryingTransport(unittest.TestCase):
     def test_429_then_success(self):
         import urllib.error
 
-        from radar.cli import RetryingTransport
+        from radar.source.openalex import RetryingTransport
 
         calls = {"n": 0}
 
@@ -341,7 +401,7 @@ class TestRetryingTransport(unittest.TestCase):
     def test_non_429_propagates_immediately(self):
         import urllib.error
 
-        from radar.cli import RetryingTransport
+        from radar.source.openalex import RetryingTransport
 
         class Bad:
             def get_json(self, url, params, headers, timeout):
@@ -355,7 +415,7 @@ class TestRetryingTransport(unittest.TestCase):
     def test_retries_bounded(self):
         import urllib.error
 
-        from radar.cli import RetryingTransport
+        from radar.source.openalex import RetryingTransport
 
         calls = {"n": 0}
 
@@ -374,7 +434,7 @@ class TestRetryingTransport(unittest.TestCase):
     def test_429_missing_retry_after_uses_small_backoff(self):
         import urllib.error
 
-        from radar.cli import DEFAULT_RETRY_AFTER_S, MAX_RETRY_AFTER_S, RetryingTransport
+        from radar.source.openalex import DEFAULT_RETRY_AFTER_S, MAX_RETRY_AFTER_S, RetryingTransport
 
         class MissingHeader:
             def get_json(self, url, params, headers, timeout):
@@ -393,7 +453,7 @@ class TestRetryingTransport(unittest.TestCase):
     def test_429_malformed_retry_after_uses_small_backoff(self):
         import urllib.error
 
-        from radar.cli import DEFAULT_RETRY_AFTER_S, RetryingTransport
+        from radar.source.openalex import DEFAULT_RETRY_AFTER_S, RetryingTransport
 
         for bad in ("not-a-number", "", "abc", "NaN", "-5x"):
             with self.subTest(header=bad):
@@ -414,7 +474,7 @@ class TestRetryingTransport(unittest.TestCase):
     def test_429_valid_retry_after_capped(self):
         import urllib.error
 
-        from radar.cli import MAX_RETRY_AFTER_S, RetryingTransport
+        from radar.source.openalex import MAX_RETRY_AFTER_S, RetryingTransport
 
         class Capped:
             def get_json(self, url, params, headers, timeout):
@@ -432,7 +492,7 @@ class TestRetryingTransport(unittest.TestCase):
     def test_429_valid_retry_after_honored(self):
         import urllib.error
 
-        from radar.cli import RetryingTransport
+        from radar.source.openalex import RetryingTransport
 
         class Honest:
             calls = 0

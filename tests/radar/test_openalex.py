@@ -8,12 +8,13 @@ import unittest
 
 from pydantic import ValidationError
 
-from radar.models import PlannedQuery, QueryPlan, RadarProfile
-from radar.openalex import (
+from radar.config.interests import RadarProfile
+from radar.processing.ranking import cheap_score, rank_works
+from radar.schema.papers import PlannedQuery, QueryPlan
+from radar.source.openalex import (
     DictTransport,
     build_query_plan,
     build_request,
-    cheap_score,
     collect,
     normalize_work,
     reconstruct_abstract,
@@ -169,7 +170,7 @@ class TestCollect(unittest.TestCase):
         plan = build_query_plan(RadarProfile(keywords=["diffusion"]))
         terms = [q.terms for q in plan.queries]
         pages = {t: {"results": [_work()]} for t in terms}
-        works = collect(plan, DictTransport(pages), ["diffusion"])
+        works = rank_works(collect(plan, DictTransport(pages)), ["diffusion"])
         self.assertEqual(len(works), 1)
         self.assertGreaterEqual(works[0].score, 0.0)
 
@@ -184,7 +185,7 @@ class TestCollect(unittest.TestCase):
             "alpha": {"results": [_work()]},
             "beta": {"results": [_work()]},
         }
-        works = collect(plan, DictTransport(pages), ["diffusion"])
+        works = rank_works(collect(plan, DictTransport(pages)), ["diffusion"])
         self.assertEqual(len(works), 1)
         self.assertEqual(
             sorted(works[0].matched_queries), ["alpha", "beta"]
@@ -204,7 +205,7 @@ class TestCollect(unittest.TestCase):
                 ]
             }
         }
-        works = collect(plan, DictTransport(pages), ["diffusion"])
+        works = rank_works(collect(plan, DictTransport(pages)), ["diffusion"])
         self.assertEqual(len(works), 1)
 
     def test_prescore_deterministic(self):
@@ -279,7 +280,8 @@ class TestLookbackAndBounds(unittest.TestCase):
             "beta": {"results": [hit]},
         }
         transport = DictTransport(pages)
-        pool = collect(plan, transport, [scoring_kw], max_total=200)
+        pool = rank_works(
+            collect(plan, transport, max_total=200), [scoring_kw])
         # Whole bounded plan executed despite the small output bound.
         self.assertEqual(len(transport.calls), len(plan.queries))
         self.assertEqual(len(pool), 4)
@@ -288,6 +290,222 @@ class TestLookbackAndBounds(unittest.TestCase):
         top1 = pool[:1]
         self.assertEqual(top1[0].openalex_id, "https://openalex.org/WLATE")
         self.assertIn("beta", top1[0].matched_queries)
+
+
+def _mock_transport(status: int, headers: dict | None = None,
+                    body: bytes = b"") -> "HttpxTransport":
+    """HttpxTransport backed by an httpx.MockTransport (no network)."""
+    import httpx
+
+    from radar.source.openalex import HttpxTransport
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, headers=headers or {}, content=body,
+                              request=request)
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    return HttpxTransport(client=client)
+
+
+def _quota_body() -> bytes:
+    return (
+        b'{"error":"Rate limit exceeded","message":"Insufficient budget. '
+        b'This request has no API key ($0 remaining; resets at midnight UTC)."}'
+    )
+
+
+def _quota_headers(retry_after: str = "79188") -> dict:
+    return {
+        "Retry-After": retry_after,
+        "X-RateLimit-Limit": "1000",
+        "X-RateLimit-Remaining": "0",
+        "X-RateLimit-Reset": retry_after,
+    }
+
+
+class TestDailyQuota(unittest.TestCase):
+    """Confirmed daily-budget 429s fail fast with a typed non-HTTP error.
+
+    Transient 429s stay redacted transport errors so the bounded retry
+    wrapper still handles them; other statuses are untouched. No network.
+    """
+
+    def _get_json_raising(self, status: int, headers: dict | None,
+                          body: bytes) -> BaseException:
+        try:
+            _mock_transport(status, headers, body).get_json(
+                "https://api.openalex.org/works",
+                {"search": "x", "api_key": "SECRET-KEY-123"},
+                {},
+                10.0,
+            )
+        except BaseException as got:  # noqa: BLE001
+            return got
+        raise AssertionError("get_json did not raise")
+
+    def test_confirmed_quota_raises_typed_error(self):
+        import httpx
+
+        from radar.source.openalex import OpenAlexQuotaError
+
+        got = self._get_json_raising(429, _quota_headers(), _quota_body())
+        self.assertIsInstance(got, OpenAlexQuotaError)
+        self.assertNotIsInstance(got, httpx.HTTPError)
+
+    def test_quota_message_actionable_and_redacted(self):
+        got = self._get_json_raising(429, _quota_headers(), _quota_body())
+        text = str(got)
+        self.assertIn("OPENALEX_API_KEY", text)
+        self.assertNotIn("SECRET-KEY-123", text)
+        self.assertNotIn("api.openalex.org/works?search=x", text)
+        self.assertNotIn("Insufficient budget. This request", text)
+
+    def test_headers_alone_confirm_quota(self):
+        from radar.source.openalex import OpenAlexQuotaError
+
+        got = self._get_json_raising(429, _quota_headers(), b"")
+        self.assertIsInstance(got, OpenAlexQuotaError)
+
+    def test_transient_429_stays_http_error(self):
+        from radar.source.openalex import OpenAlexHttpError
+
+        got = self._get_json_raising(429, {"Retry-After": "2"}, b"busy, try again")
+        self.assertIsInstance(got, OpenAlexHttpError)
+        self.assertEqual(got.status_code, 429)
+
+    def test_zero_remaining_short_retry_not_quota_without_body(self):
+        from radar.source.openalex import OpenAlexHttpError
+
+        headers = {"Retry-After": "5", "X-RateLimit-Remaining": "0"}
+        got = self._get_json_raising(429, headers, b"")
+        self.assertIsInstance(got, OpenAlexHttpError)
+        self.assertEqual(got.status_code, 429)
+
+    def test_malformed_body_transient_headers_stays_http_error(self):
+        from radar.source.openalex import OpenAlexHttpError
+
+        got = self._get_json_raising(429, {"Retry-After": "2"}, b"{not json###")
+        self.assertIsInstance(got, OpenAlexHttpError)
+        self.assertEqual(got.status_code, 429)
+
+    def test_missing_headers_and_body_stays_http_error(self):
+        from radar.source.openalex import OpenAlexHttpError
+
+        got = self._get_json_raising(429, {}, b"")
+        self.assertIsInstance(got, OpenAlexHttpError)
+        self.assertEqual(got.status_code, 429)
+
+    def test_non_429_status_untouched(self):
+        from radar.source.openalex import OpenAlexHttpError
+
+        got = self._get_json_raising(503, _quota_headers(), _quota_body())
+        self.assertIsInstance(got, OpenAlexHttpError)
+        self.assertEqual(got.status_code, 503)
+
+    def test_quota_fail_fast_no_retry_sleep(self):
+        from unittest.mock import patch
+
+        from radar.source.openalex import OpenAlexQuotaError, RetryingTransport
+
+        calls: list = []
+
+        class QuotaInner:
+            def get_json(self, url, params, headers, timeout):
+                calls.append(1)
+                raise OpenAlexQuotaError("quota exhausted")
+
+        with patch("time.sleep") as asleep:
+            with self.assertRaises(OpenAlexQuotaError):
+                RetryingTransport(QuotaInner()).get_json("u", {}, {}, 1.0)
+        asleep.assert_not_called()
+        self.assertEqual(len(calls), 1)
+
+    def test_transient_429_honors_server_retry_after(self):
+        from unittest.mock import patch
+
+        import httpx
+
+        from radar.source.openalex import HttpxTransport, RetryingTransport
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(429, headers={"Retry-After": "30"},
+                                  content=b"busy", request=request)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch("time.sleep") as asleep:
+            with self.assertRaises(Exception):
+                RetryingTransport(HttpxTransport(client=client),
+                                  max_retries=1).get_json(
+                    "https://api.openalex.org/works", {}, {}, 1.0)
+        asleep.assert_called_once_with(30.0)
+
+    def test_transient_429_still_retried(self):
+        from unittest.mock import patch
+
+        import httpx
+
+        from radar.source.openalex import RetryingTransport
+
+        calls: list = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) == 1:
+                return httpx.Response(429, headers={"Retry-After": "1"},
+                                      content=b"busy", request=request)
+            return httpx.Response(200, content=b'{"results": []}',
+                                  request=request)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        from radar.source.openalex import HttpxTransport
+
+        with patch("time.sleep"):
+            out = RetryingTransport(HttpxTransport(client=client)).get_json(
+                "https://api.openalex.org/works", {}, {}, 1.0)
+        self.assertEqual(out, {"results": []})
+        self.assertEqual(len(calls), 2)
+
+
+class TestHttpxTransportConfig(unittest.TestCase):
+    """Direct-network-call guarantees: timeouts, no proxy env, no redirects."""
+
+    def test_success_returns_parsed_envelope(self):
+        import httpx
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=b'{"results": [], "meta": {}}',
+                                  request=request)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        from radar.source.openalex import HttpxTransport
+
+        out = HttpxTransport(client=client).get_json("https://u", {"a": "b"}, {}, 5.0)
+        self.assertEqual(out, {"results": [], "meta": {}})
+
+    def test_client_ignores_proxy_env_and_redirects(self):
+        from radar.source.openalex import default_client
+
+        client = default_client()
+        try:
+            self.assertFalse(client.trust_env)
+            self.assertFalse(client.follow_redirects)
+        finally:
+            client.close()
+
+    def test_timeout_surfaces_without_request_details(self):
+        import httpx
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectTimeout("slow", request=request)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        from radar.source.openalex import HttpxTransport
+
+        with self.assertRaises(Exception) as ctx:
+            HttpxTransport(client=client).get_json(
+                "https://api.openalex.org/works",
+                {"search": "x", "api_key": "SECRET-KEY-123"}, {}, 5.0)
+        self.assertNotIn("SECRET-KEY-123", str(ctx.exception))
 
 
 if __name__ == "__main__":

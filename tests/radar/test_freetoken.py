@@ -1,7 +1,8 @@
 """Tests for the FreeToken local-network model adapter.
 
-No network, no real LLM: the /models lookup is faked at the urlopen seam,
-and endpoint policy is validated without contacting a real server.
+No network, no real LLM: the /models lookup is faked with an httpx
+MockTransport-backed client, and endpoint policy is validated without
+contacting a real server.
 """
 
 from __future__ import annotations
@@ -11,8 +12,8 @@ import unittest
 from contextlib import contextmanager
 from unittest import mock
 
-from radar import freetoken
-from radar.freetoken import (
+from radar.provider import freetoken
+from radar.provider.freetoken import (
     EXAMPLE_BASE_URL,
     FreeTokenConfig,
     FreeTokenError,
@@ -23,28 +24,31 @@ from radar.freetoken import (
 )
 
 
-class _FakeResponse:
-    def __init__(self, payload: bytes):
-        self._payload = payload
-
-    def read(self, _n: int = -1) -> bytes:
-        return self._payload
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
 @contextmanager
-def _fake_urlopen(payload: bytes | Exception):
-    def _impl(req, timeout=None):
-        if isinstance(payload, Exception):
-            raise payload
-        return _FakeResponse(payload)
+def _fake_models_client(body: bytes | Exception):
+    """Serve a canned /models payload without touching the network."""
+    import httpx
 
-    with mock.patch("urllib.request.urlopen", _impl):
+    class _FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, url, headers=None, timeout=None):
+            import httpx as _real_httpx
+
+            if isinstance(body, Exception):
+                raise body
+            return _real_httpx.Response(
+                200, content=body,
+                request=_real_httpx.Request("GET", "http://127.0.0.1:1919/v1/models"))
+
+    with mock.patch("radar.provider.freetoken._httpx.Client", _FakeClient):
         yield
 
 
@@ -146,25 +150,25 @@ class TestModelResolution(unittest.TestCase):
     def test_env_model_skips_network(self):
         with _EnvCleaner(("FREETOKEN_MODEL",)):
             os.environ["FREETOKEN_MODEL"] = "local-qwen"
-            with mock.patch("urllib.request.urlopen") as fake:
+            with mock.patch("radar.provider.freetoken._httpx.Client") as fake:
                 self.assertEqual(resolve_model(EXAMPLE_BASE_URL), "local-qwen")
                 fake.assert_not_called()
 
     def test_models_endpoint_parsed(self):
         body = b'{"data": [{"id": "model-a"}, {"id": "model-b"}]}'
         with _EnvCleaner(("FREETOKEN_MODEL",)):
-            with _fake_urlopen(body):
+            with _fake_models_client(body):
                 self.assertEqual(resolve_model(EXAMPLE_BASE_URL), "model-a")
 
     def test_empty_models_list_rejected(self):
         with _EnvCleaner(("FREETOKEN_MODEL",)):
-            with _fake_urlopen(b'{"data": []}'):
+            with _fake_models_client(b'{"data": []}'):
                 with self.assertRaises(FreeTokenError):
                     resolve_model(EXAMPLE_BASE_URL)
 
     def test_unreachable_endpoint_actionable(self):
         with _EnvCleaner(("FREETOKEN_MODEL",)):
-            with _fake_urlopen(ConnectionRefusedError("refused")):
+            with _fake_models_client(ConnectionRefusedError("refused")):
                 with self.assertRaises(FreeTokenError) as ctx:
                     list_models(EXAMPLE_BASE_URL)
                 self.assertIn(EXAMPLE_BASE_URL, str(ctx.exception))
