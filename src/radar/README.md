@@ -89,8 +89,12 @@ normalized pool (metadata, abstracts, locations, provenance) plus a UTC
 timestamp, explicit coverage counts (`collected`, `with_abstracts`,
 `missing_abstracts`, `llm_selected`, `llm_analyzed` -- zeros for
 metadata-only runs), and an OpenAlex-ID-keyed delta (`new`/`changed`/
-`unchanged` counts). Reruns with an unchanged pool report zero changes;
-works with missing abstracts are retained and counted, never dropped.
+`unchanged` counts). Reruns with an unchanged pool report zero changes:
+delta identity ignores snapshot timestamp, work ordering, and the derived
+ranking score. Only producer schema v1 snapshots are accepted as the
+previous state; anything else (unknown schema, malformed entries, missing
+or duplicate OpenAlex IDs) is refused with a clear error and the previous
+file is left untouched, never silently healed. Works with missing abstracts are retained and counted, never dropped.
 Overlapping refreshes are refused via a nonblocking lock; collection,
 validation, or persistence failures preserve the last valid snapshot and
 exit nonzero. Runtime `data/radar/` is git-ignored.

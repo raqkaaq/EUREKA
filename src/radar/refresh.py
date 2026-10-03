@@ -20,7 +20,8 @@ Snapshot file layout (``snapshot.json`` inside ``refresh_dir``)::
     }
 
 Delta identity is keyed on stable OpenAlex IDs and is insensitive to
-snapshot timestamp, pool ranking, and work ordering. Overlapping refreshes
+snapshot timestamp, pool ranking, work ordering, and derived ranking
+scores. Overlapping refreshes
 are prevented by a bounded nonblocking lock file (fail-fast, always
 released by its owner, even on error).
 """
@@ -32,7 +33,8 @@ import json as _json
 import os as _os
 from typing import Any
 
-from radar.models import CollectedWork
+from radar.models import MAX_QUERIES, CollectedWork
+from radar.openalex import MAX_TOTAL_WORKS
 
 SCHEMA_VERSION = 1
 SNAPSHOT_FILENAME = "snapshot.json"
@@ -79,10 +81,17 @@ def coverage_of(
 
 
 def _canonical(entry: Any) -> dict[str, Any]:
-    """Order-insensitive canonical form of one persisted work entry."""
+    """Order-insensitive canonical form of one persisted work entry.
+
+    The derived ranking ``score`` is excluded: it is recomputed on every
+    run and is not work identity, so a score-only change must not read
+    as a changed work.
+    """
     if isinstance(entry, dict):
-        return entry
-    return dict(entry)
+        items = entry.items()
+    else:
+        items = dict(entry).items()
+    return {k: v for k, v in items if k != "score"}
 
 
 def compute_delta(
@@ -90,8 +99,8 @@ def compute_delta(
 ) -> dict[str, Any]:
     """Diff two snapshots' work lists by stable OpenAlex ID.
 
-    Order-insensitive; ignores ranking. Returns counts plus the sorted
-    new/changed ID lists.
+    Order-insensitive; ignores ranking and derived scores. Returns counts
+    plus the sorted new/changed ID lists.
     """
     old_by_id = {str(w.get("openalex_id", "")): _canonical(w) for w in old_works if isinstance(w, dict)}
     new_by_id = {str(w.get("openalex_id", "")): _canonical(w) for w in new_works if isinstance(w, dict)}
@@ -136,22 +145,62 @@ def _release_lock(fd: int, lock_path: str) -> None:
         pass
 
 
+def _invalid_previous(path: str, reason: str) -> RefreshError:
+    """Build a concise, redacted error for an unusable previous snapshot."""
+    short = " ".join(reason.strip().split())[:200]
+    return RefreshError(
+        f"previous snapshot {path} is invalid ({short}); "
+        "leaving it untouched, refusing to overwrite"
+    )
+
+
 def _load_previous(path: str) -> list[dict[str, Any]]:
-    """Load the previous snapshot's works; error without touching the file."""
+    """Load and strictly validate the previous snapshot's works.
+
+    Only producer schema v1 is supported: the payload must carry
+    ``schema_version == 1`` and every entry of ``works`` must validate as
+    a :class:`CollectedWork` with a unique OpenAlex ID. Anything else
+    raises without touching the file -- malformed entries are never
+    silently discarded or healed.
+    """
     try:
         with open(path, encoding="utf-8") as fh:
             payload = _json.load(fh)
     except (OSError, ValueError) as exc:
-        raise RefreshError(
-            f"previous snapshot {path} is invalid ({type(exc).__name__}: {exc}); "
-            "leaving it untouched, refusing to overwrite"
-        ) from exc
-    if not isinstance(payload, dict) or not isinstance(payload.get("works"), list):
-        raise RefreshError(
-            f"previous snapshot {path} has an unrecognized shape; "
-            "leaving it untouched, refusing to overwrite"
+        raise _invalid_previous(path, f"{type(exc).__name__}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise _invalid_previous(path, "top-level JSON value is not an object")
+    version = payload.get("schema_version")
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != SCHEMA_VERSION
+    ):
+        raise _invalid_previous(
+            path,
+            f"unsupported schema_version {version!r} "
+            f"(supports v{SCHEMA_VERSION} only)",
         )
-    return [w for w in payload["works"] if isinstance(w, dict)]
+    raw_works = payload.get("works")
+    if not isinstance(raw_works, list):
+        raise _invalid_previous(path, "'works' is not a list")
+    works: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for pos, entry in enumerate(raw_works):
+        if not isinstance(entry, dict):
+            raise _invalid_previous(path, f"works[{pos}] is not an object")
+        try:
+            work = CollectedWork.model_validate(entry)
+        except ValueError as exc:
+            raise _invalid_previous(path, f"works[{pos}] invalid: {exc}") from exc
+        wid = work.openalex_id
+        if not wid.strip():
+            raise _invalid_previous(path, f"works[{pos}] has an empty openalex_id")
+        if wid in seen:
+            raise _invalid_previous(path, f"duplicate openalex_id {wid!r}")
+        seen.add(wid)
+        works.append(work.model_dump())
+    return works
 
 
 def _write_atomic(path: str, payload: dict[str, Any]) -> None:
@@ -185,8 +234,8 @@ def refresh_pool(
     refresh_dir: str,
     *,
     collected_at: str | None = None,
-    max_requests: int = 6,
-    pool_cap: int = 200,
+    max_requests: int = MAX_QUERIES,
+    pool_cap: int = MAX_TOTAL_WORKS,
 ) -> dict[str, Any]:
     """Persist the full pool as one atomic snapshot; return the summary.
 
