@@ -168,6 +168,36 @@ research tools or PDF access; abstracts alone cannot establish quality,
 causality, global novelty, replication or deployment safety. Specialization
 adds inference cost/latency; metadata-only refreshes remain model-free.
 
+## Offline transport acceptance
+
+The full pipeline can be verified without an inference server or OpenAlex
+access. The integration suite in `tests/radar/test_pipeline_chat_protocol.py`
+substitutes only HTTP responses, preserving the real PydanticAI agents,
+Chat Completions provider, native CLEF adapter, prompt documents, routing,
+snapshot/sidecar storage, evidence attachment and Markdown rendering.
+
+```sh
+PYDANTIC_AI_NO_BANNER=1 uv run --locked python -m unittest discover \
+  -s tests/radar -p test_pipeline_chat_protocol.py -v
+```
+
+It exercises fresh collection through all six searches, deduplication and
+full-pool snapshot coverage; a cached 106-paper pool with 102 abstract-bearing
+papers and the maximum 200-paper pool (192 abstracts, eight missing); native
+CLEF preference and complete chat rerouting after native
+failure; three specialists plus synthesis over shared indices; actual wire
+token caps and opt-in thinking settings; validation retries, malformed or
+unstructured answers, cancellation, client cleanup and redacted errors.
+Source/analysis failures preserve previous snapshots and produce no false
+successful report. Metadata-only cached runs perform no inference.
+
+These tests use synthetic papers and predetermined HTTP model responses.
+They neither read `.env` nor open network sockets, and do not establish model
+quality, server compatibility or a successful live research run. As of
+2026-10-03 the operator is retiring FreeToken; live inference checks are stopped
+pending replacement details. Existing provider configuration is retained,
+not silently repointed or migrated to an unchosen service.
+
 ## Source vs provider vs agent
 
 - **Source** (`source/openalex.py`) talks to the outside scholarly world:
