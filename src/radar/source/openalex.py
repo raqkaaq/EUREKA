@@ -31,6 +31,7 @@ from radar.config.runtime import (
     QUOTA_BODY_READ_LIMIT,
     RESPONSE_READ_LIMIT,
 )
+from radar.processing.link_validation import is_openalex_work_link
 from radar.schema.papers import (
     CollectedWork,
     LocationInfo,
@@ -500,7 +501,7 @@ def normalize_work(
     if not isinstance(raw, dict):
         return None
     wid = _safe_str(raw.get("id"), 500)
-    if not wid or "openalex.org" not in wid:
+    if not is_openalex_work_link(wid):
         return None  # essential key missing -> skip, never raise
     title = _safe_str(raw.get("title") or raw.get("display_name"), 2000)
     abstract = reconstruct_abstract(raw.get("abstract_inverted_index"))

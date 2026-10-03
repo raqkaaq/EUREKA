@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator
 
 from radar.config.runtime import MAX_EVIDENCE_PER_OPP, MAX_OPPORTUNITIES
 
@@ -21,7 +21,7 @@ class OpportunityDraft(BaseModel):
     wow: str = Field(default="", max_length=2000)
     investigate: str = Field(default="", max_length=2000)
     reproduce: str = Field(default="", max_length=2000)
-    evidence: list[int] = Field(default_factory=list, max_length=MAX_EVIDENCE_PER_OPP)
+    evidence: list[StrictInt] = Field(default_factory=list, max_length=MAX_EVIDENCE_PER_OPP)
 
 
 class RadarDraft(BaseModel):
