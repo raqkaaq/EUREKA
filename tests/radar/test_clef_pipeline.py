@@ -1,10 +1,6 @@
-"""CLEF mandatory routing integration: config validation, sidecar, coverage,
-and pipeline routing through the typed scorer seam.
-
-Adapter modules (schema/triage, provider/clef, processing/triage) are
-owned by term092: tests touching select_candidates stay red until that
-interface lands; everything else runs offline with fakes (no endpoint,
-no launches, no .env reads).
+"""Mandatory routing integration: preferred CLEF, typed Qwen chat fallback,
+config validation, sidecars, coverage, and failed-both-backend safeguards.
+External HTTP/model boundaries are substituted; no services or .env reads.
 """
 
 from __future__ import annotations
@@ -101,19 +97,23 @@ def _fixed_model() -> FunctionModel:
     return FunctionModel(_impl)
 
 
+def _failed_routing_model() -> FunctionModel:
+    def unavailable(messages, info):
+        raise RuntimeError("simulated provider outage")
+    return FunctionModel(unavailable)
+
+
 class TestClefConfigRequired(unittest.TestCase):
-    def test_missing_endpoint_is_exit4_with_zero_model_calls(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CLEF_BASE_URL", None)
+    def test_both_endpoints_unconfigured_is_exit4_with_zero_model_calls(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
             result = _run_pipeline(PipelineRequest(
                 mode="analyze", max_candidates=2,
                 source_override=DictTransport(_pages(6))))
         self.assertEqual(result.exit_code, 4)
-        self.assertTrue(any("CLEF_BASE_URL" in n for n in result.stderr_notes))
+        self.assertTrue(any("FREETOKEN_BASE_URL" in n for n in result.stderr_notes))
 
     def test_missing_endpoint_checked_even_with_model_override(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CLEF_BASE_URL", None)
+        with mock.patch.dict(os.environ, {}, clear=True):
             result = _run_pipeline(PipelineRequest(
                 mode="analyze", max_candidates=2,
                 source_override=DictTransport(_pages(6)),
@@ -127,7 +127,7 @@ class TestClefConfigRequired(unittest.TestCase):
             clef_base_url=f"http://127.0.0.1:11434{secret_path}",
             source_override=DictTransport(_pages(1)),
             model_override=_fixed_model()))
-        self.assertEqual(result.exit_code, 3)
+        self.assertEqual(result.exit_code, 4)
         joined = " ".join(result.stderr_notes)
         self.assertNotIn("secret-token-abc-xyz", joined)
 
@@ -204,7 +204,8 @@ class TestTriageCoverageFormat(unittest.TestCase):
         summary = _out_triage.summarize_batch(batch)
         self.assertEqual(summary, {
             "considered": 5, "scored": 1, "unknown": 3, "failed": 1,
-            "model_id": "clef-flash", "rubric_version": "rubric-7"})
+            "model_id": "clef-flash", "rubric_version": "rubric-7",
+            "backend": "clef", "probability_kind": "native_noul", "fallback_reason": None})
         line = _out_triage.triage_coverage_line(
             pool_total=9, summary=summary, selected=2, opportunities=1)
         for token in ("pool=9", "considered=5", "scored=1", "unknown=3",
@@ -259,6 +260,7 @@ class TestMandatoryRoutingIntegration(unittest.TestCase):
             result = _run_pipeline(PipelineRequest(
                 mode="analyze", max_candidates=1, from_snapshot=snap,
                 model_override=FunctionModel(_model),
+                triage_model_override=_failed_routing_model(),
                 triage_scorer=_all_failed))
             self.assertEqual(result.exit_code, 3)
             self.assertEqual(seen, [])
@@ -280,6 +282,7 @@ class TestMandatoryRoutingIntegration(unittest.TestCase):
             result = _run_pipeline(PipelineRequest(
                 mode="analyze", max_candidates=1, from_snapshot=snap,
                 model_override=FunctionModel(_model),
+                triage_model_override=_failed_routing_model(),
                 triage_scorer=_failing_scorer))
             self.assertEqual(result.exit_code, 3)
             self.assertEqual(seen, [])

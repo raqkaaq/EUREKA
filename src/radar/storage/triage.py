@@ -1,6 +1,6 @@
 """Triage sidecar: optional atomic JSON artifact beside metadata snapshots.
 
-A sidecar records one CLEF screening batch (model/rubric provenance plus
+A sidecar records one SystemOne screening batch (backend/model/rubric plus
 per-work results) without ever mutating the strict v1 metadata snapshot.
 Writes are atomic (temp file + rename in the same directory); on any
 failure the previous sidecar -- or its absence -- is preserved.
@@ -72,6 +72,9 @@ def write_sidecar(
         "generated_at_utc": generated_at or _utc_now(),
         "model_id": getattr(batch, "model_id", ""),
         "rubric_version": getattr(batch, "rubric_version", ""),
+        "backend": getattr(batch, "backend", "clef"),
+        "probability_kind": getattr(batch, "probability_kind", "native_noul"),
+        "fallback_reason": getattr(batch, "fallback_reason", None),
         "results": [_result_to_json(r) for r in results],
     }
     try:

@@ -7,6 +7,7 @@ only — no network, no real inference.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import unittest
 from unittest import mock
@@ -88,7 +89,7 @@ class TestStructuredOutputWiring(unittest.TestCase):
             )
 
         agent = build_agent(FunctionModel(_impl))
-        result = agent.run_sync("hello")
+        result = asyncio.run(agent.run("hello"))
         self.assertIsInstance(result.output, RadarDraft)
         self.assertEqual(result.output.next_move, "Fetch more recent works.")
         report = attach_evidence(result.output, [_candidate(0)])

@@ -112,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--clef-base-url",
         default=None,
-        help="CLEF/SystemOne base URL for mandatory full-pool screening "
+        help="Preferred CLEF/SystemOne base URL for full-pool screening "
         "(or set CLEF_BASE_URL; user-owned LAN server, never launched).",
     )
     parser.add_argument(
@@ -130,7 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--triage-timeout",
         type=float,
         default=CLEF_DEFAULT_OVERALL_TIMEOUT_S,
-        help="Overall CLEF screening deadline in seconds, (0, 300] (default 60).",
+        help="Overall screening deadline per backend in seconds, (0, 300] "
+        "(default 60). Failed CLEF can use a separate bounded Qwen stage.",
     )
     parser.add_argument(
         "--triage-output",
