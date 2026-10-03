@@ -72,6 +72,7 @@ def write_sidecar(
         "generated_at_utc": generated_at or _utc_now(),
         "model_id": getattr(batch, "model_id", ""),
         "rubric_version": getattr(batch, "rubric_version", ""),
+        "rubric_hash": getattr(batch, "rubric_hash", ""),
         "backend": getattr(batch, "backend", "clef"),
         "probability_kind": getattr(batch, "probability_kind", "native_noul"),
         "fallback_reason": getattr(batch, "fallback_reason", None),

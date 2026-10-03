@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from string import Formatter
 from typing import Annotated, Literal
 
@@ -14,6 +15,7 @@ from radar.config.runtime import (
     MAX_QUERIES,
     MAX_TERM_CHARS,
 )
+from radar.schema.opportunities import SpecialistRole
 
 Text = Annotated[str, Field(strict=True, min_length=1, max_length=8000)]
 Version = Annotated[int, Field(strict=True, ge=1, le=1)]
@@ -59,7 +61,12 @@ class ScreeningQuestions(ConfigurationModel):
 
 class ScreeningConfig(ConfigurationModel):
     version: Version
+    rubric_version: Annotated[str, Field(strict=True, min_length=1, max_length=200)]
     questions: ScreeningQuestions
+
+    @property
+    def fingerprint(self) -> str:
+        return hashlib.sha256(self.model_dump_json().encode("utf-8")).hexdigest()
 
     def render(self, *, keywords: str, domains: str) -> dict:
         values = {"keywords": keywords, "domains": domains}
@@ -82,6 +89,10 @@ class AnalysisPrompt(AgentPrompt):
     candidate_header: Text
     task_template: Text
 
+    @property
+    def max_opportunities(self) -> int:
+        return MAX_ANALYSIS_OPPORTUNITIES
+
     @field_validator("task_template")
     @classmethod
     def _template(cls, value: str) -> str:
@@ -90,12 +101,20 @@ class AnalysisPrompt(AgentPrompt):
     @model_validator(mode="after")
     def _fits_empty_prompt(self) -> AnalysisPrompt:
         task = self.task_template.format(
-            max_opportunities=MAX_ANALYSIS_OPPORTUNITIES,
+            max_opportunities=self.max_opportunities,
             valid_range="none (no candidates)",
         )
         if len(self.instructions) + len(self.candidate_header) + len(task) + 4 > MAX_PROMPT_CHARS:
             raise ValueError("instructions and task exceed the prompt budget")
         return self
+
+
+class SpecialistPrompt(AnalysisPrompt):
+    role: SpecialistRole
+
+    @property
+    def max_opportunities(self) -> int:
+        return 1
 
 
 class SearchDefinition(ConfigurationModel):

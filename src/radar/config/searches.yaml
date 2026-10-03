@@ -1,6 +1,7 @@
 version: 1
-# Ordered baseline definitions, expanded up to the code-owned request cap.
-# Disjunctions preserve broad coverage; intersections are a separate branch.
+# Six complementary bounded requests. Order is priority if a smaller cap is used.
+# Broad discovery is never required to mention a behavioral/economic domain.
+# Relevance ranks text matches, not embeddings; newest-first is a separate slice.
 queries:
   - name: broad_ai_ml
     kind: semantic
@@ -12,8 +13,15 @@ queries:
     kind: semantic
     scope: cross_domain
     terms: "({keywords}) AND ({domains})"
-  - name: individual_ai_ml_topics
+  # Human-impact papers may say generative AI rather than name an ML method.
+  - name: ai_behavior_and_economy
     kind: semantic
-    terms: "{keyword}"
-    repeat: keywords
-    limit: 3
+    scope: cross_domain
+    terms: '("artificial intelligence" OR "generative AI") AND (incentives OR trust OR labor OR productivity OR adoption)'
+  - name: methods_and_evaluation
+    kind: semantic
+    terms: '({keywords}) AND (robustness OR uncertainty OR evaluation OR efficiency)'
+  # Transferable mechanisms/identification methods, not just domain vocabulary.
+  - name: causal_and_strategic_mechanisms
+    kind: semantic
+    terms: '({keywords}) AND (causality OR "mechanism design" OR "decision theory")'

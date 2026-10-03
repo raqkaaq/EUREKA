@@ -12,6 +12,7 @@ from radar.schema.configuration import AgentPrompt, AnalysisPrompt, ScreeningCon
 
 SCREENING = '''
 version: 1
+rubric_version: clef-triage-v2
 questions:
   ai_ml_relevance:
     type: noul
@@ -45,6 +46,7 @@ class TestTypedYaml(unittest.TestCase):
             "!!python/object/apply:os.system ['SECRET-CONFIG-VALUE']",
             SCREENING.replace("version: 1", "version: 2"),
             SCREENING.replace("version: 1", "version: true"),
+            SCREENING.replace("clef-triage-v2", "x" * 201),
             SCREENING + "unknown: SECRET-CONFIG-VALUE\n",
             SCREENING.replace("version: 1", "version: 1\nversion: 1"),
             SCREENING.replace('"Relevant."', 'false'),
@@ -100,7 +102,7 @@ class TestConfiguredSearches(unittest.TestCase):
                          '"machine learning" OR "deep learning" OR "reinforcement learning" '
                          'OR "large language models" OR "diffusion models"')
         intersections = [query for query in plan.queries if " AND " in query.terms]
-        self.assertEqual(len(intersections), 1)
+        self.assertEqual(len(intersections), 4)
         self.assertIn('"behavioral science" OR "behavioral economics" OR "mechanism design"',
                       intersections[0].terms)
         recent = [query for query in plan.queries if query.kind == "recent"]
@@ -134,8 +136,11 @@ queries:
         from radar.config.searches import build_query_plan
 
         plan = build_query_plan(RadarProfile(keywords=["diffusion"], domains=[]))
-        self.assertEqual([query.kind for query in plan.queries], ["semantic", "recent"])
-        self.assertEqual({query.terms for query in plan.queries}, {'"diffusion"'})
+        self.assertEqual([query.kind for query in plan.queries],
+                         ["semantic", "recent", "semantic", "semantic"])
+        self.assertEqual(plan.queries[0].terms, '"diffusion"')
+        self.assertTrue(all("behavioral" not in query.terms and "generative AI" not in query.terms
+                            for query in plan.queries))
 
     def test_request_cap_cannot_be_raised_by_configuration(self):
         from radar.config.interests import RadarProfile

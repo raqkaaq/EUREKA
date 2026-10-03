@@ -13,8 +13,6 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-RUBRIC_VERSION = "clef-triage-v1"
-
 
 def _probability(value: object) -> object:
     if value is None:
@@ -63,6 +61,7 @@ class TriageBatch(BaseModel):
 
     model_id: str = Field(min_length=1, max_length=200)
     rubric_version: str = Field(min_length=1, max_length=200)
+    rubric_hash: str = Field(default="", pattern=r"^(?:[a-f0-9]{64})?$")
     backend: Literal["clef", "qwen"] = "clef"
     probability_kind: Literal["native_noul", "prompted_estimate"] = "native_noul"
     fallback_reason: Literal[

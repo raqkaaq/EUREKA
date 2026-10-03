@@ -135,6 +135,7 @@ def _validate_request(request: PipelineRequest) -> None:
     from radar.prompts.catalog import (
         opportunity_analysis_prompt, paper_triage_prompt, screening_questions,
     )
+    from radar.agent.research_team import validate_research_prompts
 
     try:
         if request.from_snapshot is None:
@@ -143,6 +144,7 @@ def _validate_request(request: PipelineRequest) -> None:
             screening_questions()
             paper_triage_prompt()
             opportunity_analysis_prompt()
+            validate_research_prompts()
     except ValueError as exc:
         raise PipelineUsageError(str(exc)) from exc
 
@@ -385,7 +387,7 @@ def _analyze_pool(
     refresh_collected_at: str | None,
     prefix_notes: tuple[str, ...] = (),
 ) -> PipelineResult:
-    from radar.agent import opportunity_analysis as _agent
+    from radar.agent import research_team as _team
     from radar.output import markdown as _out_md
     from radar.output import triage as _out_triage
     from radar.processing.triage import select_candidates
@@ -414,9 +416,14 @@ def _analyze_pool(
             "with Pydantic-validated SystemOne answer contracts."
         )
     shortlist = select_candidates(pool_full, batch, request.max_candidates)
-    included = _agent.select_for_prompt(shortlist, request.max_candidates)
+    try:
+        included = _team.select_for_prompt(shortlist, request.max_candidates)
+    except ValueError as exc:
+        raise PipelineUsageError(str(exc)) from exc
     if not included:
-        return PipelineResult(0, "No candidates collected; nothing to analyze.",
+        notes.append(_out_triage.triage_coverage_line(
+            pool_total=len(pool_full), summary=summary, selected=0, opportunities=0))
+        return PipelineResult(0, "No candidates fit the research prompt budget; nothing analyzed.",
                               tuple(notes))
     disable_thinking = _freetoken.resolve_disable_thinking(request.disable_thinking)
     session = None
@@ -431,7 +438,7 @@ def _analyze_pool(
             raise PipelineAnalysisError(str(exc)) from exc
         model = None
     try:
-        draft, _prompt = _agent.analyze_candidates(
+        research = _team.research_candidates(
             included,
             model=model,
             max_candidates=request.max_candidates,
@@ -442,6 +449,8 @@ def _analyze_pool(
         )
     except _freetoken.FreeTokenError as exc:
         raise PipelineAnalysisError(str(exc)) from exc
+    draft = research.draft
+    included = list(research.included)
     try:
         report = attach_evidence(draft, included)
         rendered = _out_md.render_markdown(report)
@@ -452,6 +461,8 @@ def _analyze_pool(
     notes.append(_out_triage.triage_coverage_line(
         pool_total=len(pool_full), summary=summary,
         selected=len(included), opportunities=len(draft.opportunities)))
+    notes.append("research: specialists=" + ",".join(
+        report.role for report in research.specialist_reports) + "; synthesis=opportunity_analysis")
     if request.refresh_dir and refresh_collected_at is not None:
         try:
             _snapshots.update_llm_coverage(
