@@ -2,7 +2,7 @@
 
 One-command radar: discover recent AI/ML papers via **OpenAlex** (the sole
 scholarly discovery API; arXiv appears only as an OpenAlex location string),
-screen the full pool with **CLEF/SystemOne** (mandatory LAN routing stage),
+screen the full pool with **SystemOne** (CLEF preferred, native Qwen fallback),
 then analyze the shortlist with a local **FreeToken** model through
 **PydanticAI** (typed outcomes, Chat Completions path).
 
@@ -19,6 +19,7 @@ src/radar/
   config/
     interests.py       interest profile (AI/ML core + behavioral/economic lenses)
     runtime.py         all numeric bounds (service-free)
+    triage_questions.py identical routing questions/criteria for both endpoints
   source/
     openalex.py        HTTPX discovery, query plan/requests, retry/quota,
                        normalization, dedup, provenance
@@ -26,6 +27,8 @@ src/radar/
     freetoken.py       LAN PydanticAI model construction + client lifecycle
     clef.py            LAN CLEF/SystemOne screening client (native HTTPX,
                        batch triage, deadlines, fail-fast)
+    qwen_systemone.py  fallback endpoint/model resolution; reuses the SAME
+                       native SystemOne client, no chat prompt conversion
   agent/
     opportunity_analysis.py  typed Agent[None, RadarDraft], prompt +
                        instructions (no separate prompt file), deadline/usage,
@@ -65,13 +68,18 @@ framework.
   the inference HTTP client lifecycle (upstream internal `httpx2`,
   explicitly opened and deterministically closed per run). No prompts,
   no analysis.
-- **CLEF routing** (`provider/clef.py` + `processing/triage.py`) decides
+- **SystemOne routing** (`provider/clef.py`, `provider/qwen_systemone.py`,
+  `processing/triage.py`) decides
   *what* gets analyzed: the provider screens every collected paper over
   native HTTPX SystemOne calls (typed batch results, deadlines,
   concurrency, fail-fast — deliberately not an OpenAI chat model), and
   the pure shortlist policy ranks scored works with one reserved unknown
   slot (only when unknowns exist and the shortlist holds two or more).
   This is decision routing; the synthesis agent below does the thinking.
+  CLEF is preferred. If absent or unsuccessful, the Qwen endpoint screens
+  the entire original pool with the same native request/response contract,
+  not a mixture of CLEF/Qwen judgments. Only endpoint/model selection differs;
+  no Chat Completions routing agent or prompt translation is introduced.
 - **Agent** (`agent/opportunity_analysis.py`) does the thinking: it builds
   the prompt and instructions, runs the typed PydanticAI agent under a
   hard overall deadline with per-run token/request/usage caps, and
@@ -84,15 +92,15 @@ framework.
 # Collect-only: bounded real OpenAlex candidates as JSON (no LLM).
 uv run --env-file .env python -m radar --collect-only --max-candidates 8
 
-# Full run: collect + CLEF screening + local-model analysis as Markdown
-# (requires CLEF_BASE_URL).
+# Full run: collect + SystemOne screening + local-model analysis as Markdown
+# (requires working CLEF or native Qwen SystemOne service).
 uv run --env-file .env python -m radar --max-candidates 8
 
 # Unattended metadata refresh (full pool snapshot, no LLM).
 uv run --env-file .env python -m radar --collect-only --refresh-dir data/radar
 
-# Cached synthesis: zero OpenAlex calls (CLEF screening still mandatory,
-# needs CLEF endpoint plus FreeToken for analysis).
+# Cached synthesis: zero OpenAlex calls (SystemOne screening still mandatory,
+# needs a working routing endpoint plus FreeToken for synthesis).
 uv run --env-file .env python -m radar --from-snapshot data/radar/snapshot.json --max-candidates 2
 
 # Analysis with CLEF routing (CLEF server user-owned, not running yet).
@@ -105,22 +113,44 @@ uv run --env-file .env python -m radar --help
 uv run --env-file .env python -m radar --keywords "graph neural networks" --lookback-days 30
 ```
 
-## CLEF screening (mandatory routing, server absent)
+## SystemOne screening (mandatory routing; CLEF preferred, Qwen fallback)
 
-Every analysis run CLEF-scores the full pool before shortlist selection
-and FreeToken synthesis; there is no opt-out and no heuristic fallback
-on service failure. Configure `CLEF_BASE_URL` (or `--clef-base-url`;
-no endpoint is ever guessed), optionally `CLEF_MODEL` (default
-`clef-flash`), `--clef-timeout` (per request, default 10 s), and
-`--triage-timeout` (overall, default 60 s). Missing configuration is
-exit 4 with zero model calls; unreachable/malformed/deadline/failed
-screening is exit 3 and stops before synthesis with the last valid
-snapshot preserved. Missing abstracts and oversize texts stay typed
-unknowns with one unknown slot reserved; `--collect-only` never calls
-CLEF or FreeToken. An optional atomic `--triage-output` JSON sidecar
-records model/rubric provenance; strict v1 snapshots are never mutated.
-The CLEF server is not launched by radar and live CLEF checks are
-skipped while it is absent.
+Every analysis run screens the full pool before shortlist selection and
+FreeToken synthesis. CLEF uses `CLEF_BASE_URL` / `--clef-base-url` and
+`CLEF_MODEL` (default `clef-flash`). When CLEF is absent, unavailable,
+malformed, incomplete, or deadline-expired, the full original pool is
+screened at the native Qwen SystemOne endpoint. Explicit unsafe/invalid
+CLEF configuration is refused, not bypassed.
+
+Qwen uses `QWEN_SYSTEMONE_BASE_URL` / `--qwen-systemone-base-url` and
+`QWEN_SYSTEMONE_MODEL` / `--qwen-systemone-model`. If unset, these use the
+configured FreeToken endpoint/model (CLI overrides then `FREETOKEN_*` env);
+no host or model is guessed or discovered. The SAME native HTTPX client
+posts `{model, state, questions}` to `/v1/systemone` and validates the same
+`noul` answers. Both backends use identical questions, criteria, full
+titles/abstracts, limits, cancellation, and cleanup. No chat messages,
+generation controls, tool calls, heuristic substitute, or chat-model
+routing agent are sent. Only synthesis uses the existing PydanticAI agent.
+
+`--clef-timeout` bounds each routing request (default 10 s);
+`--triage-timeout` bounds each backend's whole-pool stage (default 60 s,
+maximum 300 s). A failed CLEF stage can therefore be followed by one
+separately bounded Qwen stage. A missing fallback configuration is exit 4;
+failed/malformed/deadline Qwen screening is exit 3 and blocks synthesis,
+preserving the last valid snapshot. Source/metadata refresh is independent.
+Missing abstracts and oversized texts stay explicit unknowns. Atomic
+`--triage-output` JSON sidecars record backend/model/rubric and fallback
+reason; strict v1 source snapshots are never mutated. `--collect-only`
+and an empty pool call no routing or synthesis model. No servers are launched.
+
+Live compatibility check on 2026-10-03: the currently configured FreeToken
+Qwen server returned HTTP 404 at `/v1/systemone`; its advertised OpenAPI
+had no SystemOne route. It remains usable for synthesis but cannot be
+claimed to provide native fallback routing. A compatible user-owned LAN
+SystemOne service must be supplied before live end-to-end verification.
+The [native API specification](https://docs.ollama.com/api/systemone)
+requires a compatible scoring-capable runner and SystemOne model; a
+Chat Completions endpoint alone does not establish compatibility.
 
 Exit codes: 0 ok, 2 external-service (OpenAlex) failure, 3 analysis/report
 failure (including FreeToken), 4 usage/config error.
@@ -134,8 +164,10 @@ failure (including FreeToken), 4 usage/config error.
 | `FREETOKEN_API_KEY` | Local API key placeholder | `freetoken-local` |
 | `FREETOKEN_DISABLE_THINKING` | Opt-in server-specific thinking-disable key | unset (omitted) |
 | `OPENALEX_API_KEY` | Optional personal OpenAlex budget | unset (shared anonymous pool) |
-| `CLEF_BASE_URL` | User-owned LAN CLEF endpoint (**required** for analysis) | unset (no guess) |
+| `CLEF_BASE_URL` | Preferred user-owned LAN CLEF endpoint | unset (Qwen fallback) |
 | `CLEF_MODEL` | CLEF model id | `clef-flash` |
+| `QWEN_SYSTEMONE_BASE_URL` | Native SystemOne fallback endpoint | configured FreeToken base |
+| `QWEN_SYSTEMONE_MODEL` | Model id served by the native fallback | configured FreeToken model |
 
 Loopback, RFC 1918, IPv6 ULA, and RFC 6598 endpoints are allowed. Public,
 link-local, multicast, reserved, and unspecified destinations are refused;
@@ -197,11 +229,12 @@ model's candidate indices (the model never writes URLs), a global
 Historical pre-CLEF baseline only (not current verification): 125/125
 tests green with a 106-work refresh in 3s, cached 3-paper briefing in
 17s, and gated 8-paper briefing in 19s on heuristic ranking plus Qwen
-synthesis. Current status: 171/171 tests green including a 106-work
-offline acceptance (102 synthetic SystemOne decisions, 4 missing-abstract
-  unknowns, shortlist 8) — synthetic router decisions, not real CLEF model
-  quality. No live CLEF runs exist; the CLEF server is absent and is never
-  launched by radar.
+synthesis. Current status: 189/189 tests green, including 18 native Qwen
+fallback regressions and 106-work offline acceptance (102 synthetic
+SystemOne decisions, 4 missing-abstract unknowns, shortlist 8). These are
+synthetic router decisions, not real CLEF/Qwen SystemOne quality evidence.
+No successful live SystemOne runs exist: CLEF is absent and the configured
+Qwen server returned 404. No model server was launched by radar.
 
 ## Tests
 

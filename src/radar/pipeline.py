@@ -69,15 +69,18 @@ class PipelineRequest:
     disable_thinking: bool = False
     base_url: str | None = None
     model: str | None = None
-    # CLEF routing (mandatory for analysis; collect-only ignores these).
+    # Full-pool routing: CLEF preferred, Qwen fallback; collect-only ignores it.
     clef_base_url: str | None = None
     clef_model: str | None = None
     clef_timeout_s: float = 10.0
     triage_timeout_s: float = 60.0
     triage_output: str | None = None
+    qwen_systemone_base_url: str | None = None
+    qwen_systemone_model: str | None = None
     # Injected doubles (tests only; production leaves all None).
     source_override: Any | None = None
     model_override: Any | None = None
+    qwen_systemone_transport: Any | None = None
     clef_transport: Any | None = None
     triage_scorer: (
         Callable[[Sequence[CollectedWork], "_RadarProfile"], "_TriageBatch"] | None
@@ -241,37 +244,30 @@ def _run_cached(request: PipelineRequest) -> PipelineResult:
     )
 
 
-def _check_batch_shape(batch: Any) -> None:
-    """Validate a screening batch shape before any FreeToken calls.
+def _check_batch_shape(batch: Any, pool: list[CollectedWork]) -> "_TriageBatch":
+    """Validate strict judgments and exact full-pool coverage before selection."""
+    from radar.schema.triage import TriageBatch, TriageResult
 
-    Malformed scorer output becomes a typed analysis error (exit 3), never
-    a raw AttributeError deep in selection or synthesis.
-    """
-    results = getattr(batch, "results", None)
-    if not isinstance(results, list):
+    try:
+        if not isinstance(batch, TriageBatch):
+            batch = TriageBatch(
+                model_id=batch.model_id, rubric_version=batch.rubric_version,
+                results=[TriageResult.model_validate(vars(r)) for r in batch.results])
+        else:
+            batch = TriageBatch.model_validate(batch.model_dump())
+        ids = [r.work_id for r in batch.results]
+        expected = {w.openalex_id for w in pool}
+        if len(ids) != len(pool) or len(expected) != len(pool) or set(ids) != expected:
+            raise ValueError("incomplete or duplicated identities")
+    except Exception:
         raise PipelineAnalysisError(
-            "CLEF screening returned a malformed batch (no results list); "
-            "stopping before FreeToken synthesis with the last valid "
-            "snapshot preserved."
-        )
-    allowed = frozenset(
-        {"scored", "missing_abstract", "failed", "deadline", "oversized"})
-    for pos, result in enumerate(results):
-        work_id = getattr(result, "work_id", None)
-        status = getattr(result, "status", None)
-        if not isinstance(work_id, str) or not work_id:
-            raise PipelineAnalysisError(
-                f"CLEF screening returned a malformed result at index {pos} "
-                "(missing work_id); stopping before FreeToken synthesis."
-            )
-        if status not in allowed:
-            raise PipelineAnalysisError(
-                f"CLEF screening returned unknown status {status!r} for "
-                f"{work_id}; stopping before FreeToken synthesis."
-            )
+            "Routing returned invalid judgments or incomplete identity coverage; "
+            "stopping before synthesis with the last valid snapshot preserved."
+        ) from None
+    return batch
 
 
-def _active_profile(request: PipelineRequest):
+def _active_profile(request: PipelineRequest) -> "_RadarProfile":
     """Discovery profile with the active CLI keyword override applied."""
     from radar.config.interests import RadarProfile
 
@@ -285,14 +281,8 @@ def _active_profile(request: PipelineRequest):
 
 
 def _screen_full_pool(request: PipelineRequest, pool: list[CollectedWork],
-                      profile) -> Any:
-    """CLEF-score the full pool (mandatory routing for analysis).
-
-    Missing endpoint configuration fails fast with usage error and zero
-    model calls; any screening failure stops the run before FreeToken
-    synthesis (analysis error). The injected scorer override bypasses
-    configuration for hermetic tests.
-    """
+                      profile: "_RadarProfile") -> "_TriageBatch":
+    """Prefer CLEF; on absence/runtime failure, Qwen reroutes the entire pool."""
     from radar.config.runtime import (
         validate_clef_overall_timeout,
         validate_clef_request_timeout,
@@ -303,48 +293,59 @@ def _screen_full_pool(request: PipelineRequest, pool: list[CollectedWork],
         triage_timeout = validate_clef_overall_timeout(request.triage_timeout_s)
     except ValueError as exc:
         raise PipelineUsageError(str(exc)) from exc
-    if request.triage_scorer is not None:
-        try:
-            batch = request.triage_scorer(pool, profile)
-        except Exception as exc:
-            raise PipelineAnalysisError(
-                f"CLEF screening failed ({type(exc).__name__}: {exc}); "
-                "stopping before FreeToken synthesis with the last valid "
-                "snapshot preserved."
-            ) from exc
-        _check_batch_shape(batch)
-        return batch
-    if not (request.clef_base_url or _os.environ.get("CLEF_BASE_URL", "").strip()):
-        raise PipelineUsageError(
-            "CLEF screening is the mandatory routing stage but no endpoint "
-            "is configured; set CLEF_BASE_URL or pass --clef-base-url. "
-            "The CLEF server is user-owned and is never launched by radar."
-        )
-    try:
-        from radar.provider.clef import ClefConfig, screen_works
 
-        config = ClefConfig.resolve(
-            base_url=request.clef_base_url,
-            model=request.clef_model,
-            request_timeout_s=clef_timeout,
-            overall_timeout_s=triage_timeout,
-        )
-    except ValueError as exc:
-        raise PipelineUsageError(str(exc)) from exc
-    except Exception as exc:
-        raise PipelineAnalysisError(
-            f"CLEF configuration failed ({type(exc).__name__}: {exc})."
-        ) from exc
+    def fallback(reason: str) -> "_TriageBatch":
+        from radar.provider import qwen_systemone
+
+        try:
+            config = qwen_systemone.resolve_config(
+                base_url=request.qwen_systemone_base_url,
+                model=request.qwen_systemone_model,
+                freetoken_base_url=request.base_url, freetoken_model=request.model,
+                request_timeout_s=clef_timeout, overall_timeout_s=triage_timeout)
+        except ValueError as exc:
+            raise PipelineUsageError(str(exc)) from None
+        try:
+            batch = qwen_systemone.screen_works(
+                pool, profile, config=config, fallback_reason=reason,
+                transport=request.qwen_systemone_transport)
+            return _check_batch_shape(batch, pool)
+        except PipelineAnalysisError:
+            raise
+        except Exception:
+            raise PipelineAnalysisError(
+                "Qwen fallback routing failed; the configured LAN server must "
+                "support POST /v1/systemone. No chat fallback or synthesis was "
+                "attempted; snapshot preserved."
+            ) from None
+
+    if request.triage_scorer is None:
+        if not (request.clef_base_url or _os.environ.get("CLEF_BASE_URL", "").strip()):
+            return fallback("missing_endpoint")
+        from radar.provider.clef import ClefConfig, ClefError, screen_works
+
+        try:
+            config = ClefConfig.resolve(
+                base_url=request.clef_base_url, model=request.clef_model,
+                request_timeout_s=clef_timeout, overall_timeout_s=triage_timeout)
+        except (ValueError, ClefError) as exc:
+            raise PipelineUsageError(str(exc)) from None
+        except Exception:
+            raise PipelineUsageError("CLEF configuration could not be validated.") from None
+
     try:
-        batch = screen_works(pool, profile, config=config,
-                             transport=request.clef_transport)
-    except Exception as exc:
-        raise PipelineAnalysisError(
-            f"CLEF screening failed ({type(exc).__name__}: {exc}); "
-            "stopping before FreeToken synthesis with the last valid "
-            "snapshot preserved."
-        ) from exc
-    _check_batch_shape(batch)
+        if request.triage_scorer is not None:
+            batch = request.triage_scorer(pool, profile)
+        else:
+            batch = screen_works(pool, profile, config=config,
+                                 transport=request.clef_transport)
+        batch = _check_batch_shape(batch, pool)
+    except Exception:
+        return fallback("screening_error")
+    if _has_deadline(batch):
+        return fallback("deadline")
+    if any(r.status == "failed" for r in batch.results):
+        return fallback("screening_failed")
     return batch
 
 
@@ -388,11 +389,12 @@ def _analyze_pool(
             notes.append(f"radar: warning: {exc}")
     if summary["failed"] > 0 or _has_deadline(batch):
         raise PipelineAnalysisError(
-            f"CLEF screening incomplete: {summary['failed']} failed, "
+            f"{summary['backend']} screening incomplete: {summary['failed']} failed, "
             f"{_deadline_count(batch)} deadline "
             f"(model={summary['model_id']} rubric={summary['rubric_version']}); "
             "stopping before FreeToken synthesis with the last valid "
-            "snapshot preserved."
+            "snapshot preserved. Routing requires native POST /v1/systemone; "
+            "a Chat Completions-only server is not compatible."
         )
     shortlist = select_candidates(pool_full, batch, request.max_candidates)
     included = _agent.select_for_prompt(shortlist, request.max_candidates)

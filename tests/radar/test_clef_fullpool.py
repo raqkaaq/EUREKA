@@ -120,7 +120,7 @@ class TestFullPoolOfflineAcceptance(unittest.TestCase):
             # Cached source byte-identical, zero OpenAlex.
             self.assertEqual(Path(snap).read_bytes(), before)
 
-    def test_down_service_stops_with_zero_qwen(self):
+    def test_both_services_down_stop_with_zero_synthesis(self):
         seen = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -137,13 +137,16 @@ class TestFullPoolOfflineAcceptance(unittest.TestCase):
                 mode="analyze", max_candidates=2, from_snapshot=snap,
                 clef_base_url="http://127.0.0.1:9", clef_model=MODEL,
                 clef_transport=httpx.MockTransport(handler),
+                qwen_systemone_base_url="http://127.0.0.1:1919/v1",
+                qwen_systemone_model="test-qwen",
+                qwen_systemone_transport=httpx.MockTransport(handler),
                 model_override=FunctionModel(_model),
                 source_override=_NoOpenAlex()))
             self.assertEqual(result.exit_code, 3)
             self.assertEqual(seen, [])
             self.assertEqual(Path(snap).read_bytes(), before)
 
-    def test_malformed_decisions_stop_with_zero_qwen(self):
+    def test_both_backends_malformed_stop_with_zero_synthesis(self):
         seen = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -162,6 +165,9 @@ class TestFullPoolOfflineAcceptance(unittest.TestCase):
                 mode="analyze", max_candidates=2, from_snapshot=snap,
                 clef_base_url="http://127.0.0.1:9", clef_model=MODEL,
                 clef_transport=httpx.MockTransport(handler),
+                qwen_systemone_base_url="http://127.0.0.1:1919/v1",
+                qwen_systemone_model="test-qwen",
+                qwen_systemone_transport=httpx.MockTransport(handler),
                 model_override=FunctionModel(_model),
                 source_override=_NoOpenAlex()))
             self.assertEqual(result.exit_code, 3)

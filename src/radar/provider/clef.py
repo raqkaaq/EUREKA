@@ -20,6 +20,7 @@ from typing import Any
 import httpx as _httpx
 
 from radar.config.interests import RadarProfile
+from radar.config.triage_questions import build_questions
 from radar.provider.freetoken import FreeTokenError, check_local_network
 from radar.schema.papers import CollectedWork
 from radar.schema.triage import RUBRIC_VERSION, TriageBatch, TriageResult
@@ -167,29 +168,7 @@ def _normalize_base(raw: str) -> str:
 
 
 def _questions(profile: RadarProfile) -> dict[str, Any]:
-    keywords = ", ".join(profile.keywords[:8]) or "machine learning"
-    domains = ", ".join(profile.domains[:4]) or "behavioral science"
-    return {
-        AI_ML_QUESTION: {
-            "type": "noul",
-            "instructions": f"Is this paper relevant to AI/ML ({keywords})?",
-            "criteria": {
-                "true": "The paper is relevant to AI/ML research or methods.",
-                "false": "The paper is not relevant to AI/ML.",
-            },
-        },
-        CROSS_DOMAIN_QUESTION: {
-            "type": "noul",
-            "instructions": (
-                "Does this paper show cross-domain transfer potential between "
-                f"AI/ML and {domains} (either direction)?"
-            ),
-            "criteria": {
-                "true": "The paper connects AI/ML with behavioral or economic ideas.",
-                "false": "No such cross-domain connection.",
-            },
-        },
-    }
+    return build_questions(profile)
 
 
 def _payload_bytes(

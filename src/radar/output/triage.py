@@ -26,6 +26,9 @@ def summarize_batch(batch: Any) -> dict[str, Any]:
         "failed": failed,
         "model_id": getattr(batch, "model_id", ""),
         "rubric_version": getattr(batch, "rubric_version", ""),
+        "backend": getattr(batch, "backend", "clef"),
+        "probability_kind": getattr(batch, "probability_kind", "native_noul"),
+        "fallback_reason": getattr(batch, "fallback_reason", None),
     }
 
 
@@ -44,6 +47,8 @@ def triage_coverage_line(
         f"selected={selected} analyzed={selected} "
         f"opportunities={opportunities} "
         f"model={summary['model_id']} rubric={summary['rubric_version']} "
+        f"backend={summary['backend']} probabilities={summary['probability_kind']} "
+        f"fallback={summary['fallback_reason'] or 'none'} "
         "(bounded discovery sample, not all of OpenAlex)"
     )
 

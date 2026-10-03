@@ -112,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--clef-base-url",
         default=None,
-        help="CLEF/SystemOne base URL for mandatory full-pool screening "
+        help="Preferred CLEF/SystemOne base URL for full-pool screening "
         "(or set CLEF_BASE_URL; user-owned LAN server, never launched).",
     )
     parser.add_argument(
@@ -130,7 +130,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--triage-timeout",
         type=float,
         default=CLEF_DEFAULT_OVERALL_TIMEOUT_S,
-        help="Overall CLEF screening deadline in seconds, (0, 300] (default 60).",
+        help="Overall screening deadline per backend in seconds, (0, 300] "
+        "(default 60). Failed CLEF can use a separate bounded Qwen stage.",
+    )
+    parser.add_argument(
+        "--qwen-systemone-base-url",
+        default=None,
+        help="Qwen fallback native SystemOne endpoint (or QWEN_SYSTEMONE_BASE_URL; "
+        "otherwise the configured FreeToken base URL). Must support /v1/systemone; "
+        "no chat substitution.",
+    )
+    parser.add_argument(
+        "--qwen-systemone-model",
+        default=None,
+        help="Qwen SystemOne served model id (or QWEN_SYSTEMONE_MODEL; "
+        "otherwise the configured FreeToken model id).",
     )
     parser.add_argument(
         "--triage-output",
@@ -163,6 +177,8 @@ def main(argv: list[str] | None = None) -> int:
         clef_timeout_s=args.clef_timeout,
         triage_timeout_s=args.triage_timeout,
         triage_output=args.triage_output,
+        qwen_systemone_base_url=args.qwen_systemone_base_url,
+        qwen_systemone_model=args.qwen_systemone_model,
     )
     result = run(request)
     for note in result.stderr_notes:

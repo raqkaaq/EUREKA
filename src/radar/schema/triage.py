@@ -58,4 +58,9 @@ class TriageBatch(BaseModel):
 
     model_id: str = Field(min_length=1, max_length=200)
     rubric_version: str = Field(min_length=1, max_length=200)
+    backend: Literal["clef", "qwen"] = "clef"
+    probability_kind: Literal["native_noul"] = "native_noul"
+    fallback_reason: Literal[
+        "missing_endpoint", "screening_failed", "deadline", "screening_error"
+    ] | None = None
     results: list[TriageResult] = Field(default_factory=list)
