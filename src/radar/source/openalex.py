@@ -1,13 +1,9 @@
-"""OpenAlex collection seam: query-plan building, request construction,
-abstract reconstruction, normalization, dedup, provenance, pre-scoring.
+"""OpenAlex discovery source: HTTPX requests, query plans, retry/quota policy,
+normalization, dedup, and pre-scoring hooks.
 
-Constraints honored:
-- standard httpx + pydantic only, no LLM calls;
-- strict timeouts; bounded requests/results;
-- optional OPENALEX_API_KEY;
-- injectable HTTP transport for tests (httpx.MockTransport);
-- all remote text treated as untrusted (coerced, truncated, never eval'd);
-- errors never carry request URLs, credentials, headers, or raw bodies.
+Owns all OpenAlex HTTP. No ranking (see :mod:`radar.processing.ranking`),
+no CLI, no output. Errors never carry request URLs, credentials, headers,
+or raw bodies.
 """
 
 from __future__ import annotations
@@ -21,34 +17,36 @@ from typing import Any, Protocol
 
 import httpx as _httpx
 
-from radar.models import (
+from radar.config.interests import RadarProfile
+from radar.config.runtime import (
+    DEFAULT_RETRY_AFTER_S,
+    DEFAULT_TIMEOUT_S,
+    LONG_QUOTA_RESET_S,
+    MAX_429_RETRIES,
+    MAX_ABSTRACT_CHARS,
+    MAX_PER_PAGE,
+    MAX_QUERIES,
+    MAX_RETRY_AFTER_S,
+    MAX_TERM_CHARS,
+    MAX_TIMEOUT_S,
+    MAX_TOTAL_WORKS,
+    QUOTA_BODY_READ_LIMIT,
+    RESPONSE_READ_LIMIT,
+)
+from radar.schema.papers import (
     CollectedWork,
     LocationInfo,
     PlannedQuery,
     QueryPlan,
-    RadarProfile,
 )
 
 BASE_URL = "https://api.openalex.org/works"
-DEFAULT_TIMEOUT_S = 10.0
-MAX_TIMEOUT_S = 30.0
-MAX_TOTAL_WORKS = 200
-MAX_ABSTRACT_CHARS = 20000
-#: Bound on a single response body kept in memory (~2MB cap).
-RESPONSE_READ_LIMIT = 2_000_000
 # Bound the `select` payload; respected by current OpenAlex /works API.
 SELECT_FIELDS = (
     "id,title,abstract_inverted_index,doi,publication_year,"
     "primary_location,best_oa_location,locations,cited_by_count"
 )
 USER_AGENT = "eureka-radar-prototype/0.1 (mailto:prototype@example.com)"
-# Bounded 429 handling: honor Retry-After (capped) with few retries so the
-# one-command run survives transient OpenAlex search-cluster throttling.
-MAX_429_RETRIES = 2
-MAX_RETRY_AFTER_S = 45.0
-# Small bounded backoff when Retry-After is missing or malformed; valid
-# values are still honored (floored at 1s, capped at MAX_RETRY_AFTER_S).
-DEFAULT_RETRY_AFTER_S = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -68,13 +66,18 @@ class OpenAlexHttpError(RuntimeError):
     """Non-quota OpenAlex transport failure (redacted, typed by status).
 
     Carries only the numeric ``status_code`` (None for transport-level
-    failures such as timeouts). Never carries request URLs, query params,
-    credentials, headers, or raw bodies.
+    failures such as timeouts) plus the parsed ``retry_after`` seconds for
+    429s (None when the server sent none). Never carries request URLs,
+    query params, credentials, headers, or raw bodies.
     """
 
-    def __init__(self, status_code: int | None, message: str):
+    def __init__(
+        self, status_code: int | None, message: str,
+        retry_after: float | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.retry_after = retry_after
 
 
 def default_client() -> _httpx.Client:
@@ -121,7 +124,8 @@ class HttpxTransport:
                 if quota is not None:
                     raise quota from None
                 raise OpenAlexHttpError(
-                    status, f"OpenAlex request failed with HTTP {status} (transient)."
+                    status, f"OpenAlex request failed with HTTP {status} (transient).",
+                    retry_after=_retry_after_seconds(exc.response.headers),
                 ) from None
             raise OpenAlexHttpError(
                 status,
@@ -398,7 +402,7 @@ def build_query_plan(profile: RadarProfile, max_queries: int = 4) -> QueryPlan:
     keywords = [k for k in profile.keywords if k]
     if not keywords:
         raise ValueError("profile must contain at least one non-empty keyword")
-    n = max(1, min(int(max_queries), 6))
+    n = max(1, min(int(max_queries), MAX_QUERIES))
     from_date = (
         _dt.date.today() - _dt.timedelta(days=profile.lookback_days)
     ).isoformat()
@@ -452,9 +456,9 @@ def build_request(
     - `per-page` capped at 50; `select` bounds payload; `mailto` polite pool.
     """
     timeout = _check_timeout(timeout)
-    per_page = max(1, min(int(planned.per_page), 50))
+    per_page = max(1, min(int(planned.per_page), MAX_PER_PAGE))
     params: dict[str, str] = {
-        "search": planned.terms.strip()[:300],
+        "search": planned.terms.strip()[:MAX_TERM_CHARS],
         "per-page": str(per_page),
         "select": SELECT_FIELDS,
     }
@@ -581,61 +585,33 @@ def normalize_work(
 
 
 # ---------------------------------------------------------------------------
-# Cheap deterministic pre-scoring
-# ---------------------------------------------------------------------------
-
-
-def cheap_score(work: CollectedWork, keywords: list[str]) -> float:
-    """Deterministic keyword-overlap score in [0, ~1.3]."""
-    hay = f"{work.title}\n{work.abstract}".lower()
-    kws = [k.lower().strip() for k in keywords if isinstance(k, str) and k.strip()]
-    if not kws or not hay.strip():
-        base = 0.0
-    else:
-        hits = sum(1 for k in kws[:20] if k in hay)
-        base = hits / max(1, len(kws[:20]))
-    # Tiny deterministic tie-breakers (no randomness, no network).
-    cite_bonus = min(0.2, (work.cited_by_count or 0) / 5000.0)
-    recency_bonus = 0.0
-    if work.publication_year:
-        try:
-            age = _dt.date.today().year - int(work.publication_year)
-            recency_bonus = max(0.0, min(0.1, 0.1 - 0.01 * max(0, age)))
-        except (ValueError, TypeError):
-            recency_bonus = 0.0
-    return round(base + cite_bonus + recency_bonus, 6)
-
-
-# ---------------------------------------------------------------------------
-# Collection orchestration
+# Collection orchestration (dedup only; scoring/ranking is a pipeline step)
 # ---------------------------------------------------------------------------
 
 
 def collect(
     plan: QueryPlan,
     transport: OpenAlexTransport,
-    keywords_for_scoring: list[str] | None = None,
     api_key: str | None = None,
     mailto: str | None = None,
     timeout: float = DEFAULT_TIMEOUT_S,
     max_total: int = MAX_TOTAL_WORKS,
 ) -> list[CollectedWork]:
-    """Execute the whole bounded plan via transport; dedup; pre-score.
+    """Execute the whole bounded plan via transport and dedup by OpenAlex ID.
 
     ``max_total`` is the hard candidate-pool cap (≤200), not the final
     output bound: every planned query is executed in order until the pool
-    reaches the cap, then the pooled works are ranked by score. Callers
-    apply the user-facing ``--max-candidates`` bound as a final slice of
-    the returned ranked pool so later query branches still contribute when
-    the output bound is small.
+    reaches the cap. Returned works are unscored, in first-seen plan order;
+    callers rank via :mod:`radar.processing.ranking` and apply the
+    user-facing ``--max-candidates`` bound as a final slice so later query
+    branches still contribute when the output bound is small.
     """
     if not plan.queries:
         raise ValueError("query plan must contain at least one query")
     timeout = _check_timeout(timeout)
     max_total = max(1, min(int(max_total), MAX_TOTAL_WORKS))
-    scoring_kws = keywords_for_scoring or []
     by_id: dict[str, CollectedWork] = {}
-    for planned in plan.queries[:6]:
+    for planned in plan.queries[:MAX_QUERIES]:
         url, params, headers, _ = build_request(
             planned, api_key=api_key, mailto=mailto, timeout=timeout
         )
@@ -645,13 +621,12 @@ def collect(
         results = payload.get("results")
         if not isinstance(results, list):
             continue
-        for raw in results[:50]:  # bound per-query results
+        for raw in results[:MAX_PER_PAGE]:  # bound per-query results
             work = normalize_work(raw, planned.terms, planned.kind)
             if work is None:
                 continue
             existing = by_id.get(work.openalex_id)
             if existing is None:
-                work.score = cheap_score(work, scoring_kws)
                 by_id[work.openalex_id] = work
             else:
                 # Dedup: merge provenance deterministically, keep first text.
@@ -661,13 +636,8 @@ def collect(
                 for k in work.query_kinds:
                     if k and k not in existing.query_kinds:
                         existing.query_kinds.append(k)
-                merged = cheap_score(existing, scoring_kws)
-                existing.score = merged
             if len(by_id) >= max_total:
                 break
         if len(by_id) >= max_total:
             break
-    ranked = sorted(
-        by_id.values(), key=lambda w: (-w.score, w.openalex_id)
-    )[:max_total]
-    return ranked
+    return list(by_id.values())[:max_total]

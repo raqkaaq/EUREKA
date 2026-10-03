@@ -12,8 +12,8 @@ import unittest
 from contextlib import contextmanager
 from unittest import mock
 
-from radar import freetoken
-from radar.freetoken import (
+from radar.provider import freetoken
+from radar.provider.freetoken import (
     EXAMPLE_BASE_URL,
     FreeTokenConfig,
     FreeTokenError,
@@ -48,7 +48,7 @@ def _fake_models_client(body: bytes | Exception):
                 200, content=body,
                 request=_real_httpx.Request("GET", "http://127.0.0.1:1919/v1/models"))
 
-    with mock.patch("radar.freetoken._httpx.Client", _FakeClient):
+    with mock.patch("radar.provider.freetoken._httpx.Client", _FakeClient):
         yield
 
 
@@ -150,7 +150,7 @@ class TestModelResolution(unittest.TestCase):
     def test_env_model_skips_network(self):
         with _EnvCleaner(("FREETOKEN_MODEL",)):
             os.environ["FREETOKEN_MODEL"] = "local-qwen"
-            with mock.patch("radar.freetoken._httpx.Client") as fake:
+            with mock.patch("radar.provider.freetoken._httpx.Client") as fake:
                 self.assertEqual(resolve_model(EXAMPLE_BASE_URL), "local-qwen")
                 fake.assert_not_called()
 

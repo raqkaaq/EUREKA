@@ -1,6 +1,6 @@
 """Refresh-dir snapshot mode: full-pool persistence, deltas, locks, failures.
 
-Public seam: ``radar.refresh.refresh_pool`` (+ ``compute_delta``,
+Public seam: ``radar.storage.snapshots`` (``refresh_pool``, ``compute_delta``,
 ``update_llm_coverage``). Real temp filesystem; no network, no LLM.
 """
 
@@ -9,9 +9,9 @@ from __future__ import annotations
 import json
 import unittest
 
-from radar import refresh as _refresh
-from radar.cli import collect_candidates as _collect_candidates  # noqa: F401
-from radar.models import CollectedWork, LocationInfo
+from radar.storage import snapshots as _refresh
+
+from radar.schema.papers import CollectedWork, LocationInfo
 
 
 def _work(
@@ -196,16 +196,20 @@ class TestRefreshFailures(unittest.TestCase):
 
     def test_collection_failure_leaves_snapshot_untouched(self):
         import tempfile
-        from unittest.mock import patch
 
-        from radar import cli as _cli
+        from radar.pipeline import PipelineRequest, run
+
+        class _Down:
+            def get_json(self, url, params, headers, timeout):
+                raise RuntimeError("net down")
 
         with tempfile.TemporaryDirectory() as tmp:
             _refresh.refresh_pool(_pool(2), tmp)
             before = _read_snapshot(tmp)
-            with patch.object(_cli, "collect_pool", side_effect=RuntimeError("net down")):
-                code = _cli.main(["--collect-only", "--refresh-dir", tmp])
-            self.assertNotEqual(code, 0)
+            result = run(PipelineRequest(
+                mode="collect", max_candidates=2, refresh_dir=tmp,
+                source_override=_Down()))
+            self.assertNotEqual(result.exit_code, 0)
             self.assertEqual(_read_snapshot(tmp), before)
 
     def test_update_llm_coverage_patches_counts(self):
@@ -363,8 +367,7 @@ class TestDeltaIgnoresDerivedScore(unittest.TestCase):
     def test_snapshot_bounds_match_collector_constants(self):
         import tempfile
 
-        from radar.models import MAX_QUERIES
-        from radar.openalex import MAX_TOTAL_WORKS
+        from radar.config.runtime import MAX_QUERIES, MAX_TOTAL_WORKS
 
         with tempfile.TemporaryDirectory() as tmp:
             _refresh.refresh_pool(_pool(1), tmp)

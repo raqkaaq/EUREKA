@@ -1,23 +1,30 @@
-"""Runtime reliability slice: deadlines, per-run bounds, opt-in thinking key,
-cached snapshot synthesis. Public seams only; TestModel/FunctionModel doubles."""
+"""Runtime reliability: deadlines, per-run bounds, opt-in thinking key,
+cached snapshot synthesis, prompt-fit coverage. New caller-facing seams;
+TestModel/FunctionModel doubles; stdout captured, never mocked."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import json
 import os
 import tempfile
 import unittest
 from unittest import mock
 
+from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.models.test import TestModel
 
-from radar import analyze as _analyze
-from radar import cli as _cli
-from radar import freetoken as _ft
-from radar import refresh as _refresh
-from radar.models import CollectedWork, LocationInfo, RadarDraft
+from radar.agent import opportunity_analysis as _agent
+from radar.cli import main as _main
+from radar.pipeline import PipelineRequest, run as _run_pipeline
+from radar.processing import ranking as _ranking
+from radar.provider import freetoken as _ft
+from radar.schema.opportunities import RadarDraft
+from radar.schema.papers import CollectedWork
+from radar.storage import snapshots as _refresh
 
 
 def _work(wid: str, title: str = "T", score: float = 0.1,
@@ -34,49 +41,80 @@ def _seed_snapshot(tmp: str, works: list[CollectedWork]) -> str:
     return summary["snapshot"]
 
 
+def _fixed_draft_model() -> FunctionModel:
+    fixed = RadarDraft(opportunities=[], ignore=[], next_move="done")
+
+    def _impl(messages, info):
+        return ModelResponse(parts=[ToolCallPart(
+            tool_name="final_result", args=fixed.model_dump())])
+
+    return FunctionModel(_impl)
+
+
 class TestRunBounds(unittest.TestCase):
     def test_defaults_are_bounded(self):
-        settings, limits, retries = _analyze.run_bounds()
+        settings, limits, retries = _agent.run_bounds()
         self.assertEqual(settings["max_tokens"], 2000)
         self.assertLessEqual(settings["timeout"], 90.0)
         self.assertGreater(settings["timeout"], 0)
         self.assertIn(limits.request_limit, (1, 2))
-        self.assertEqual(retries, 0)
+        self.assertEqual(retries, 1)
         self.assertNotIn("extra_body", settings)
 
     def test_opt_in_thinking_key_only_when_enabled(self):
-        settings, _, _ = _analyze.run_bounds(disable_thinking=True)
+        settings, _, _ = _agent.run_bounds(disable_thinking=True)
         self.assertEqual(
             settings["extra_body"],
             {"chat_template_kwargs": {"enable_thinking": False}})
-        settings2, _, _ = _analyze.run_bounds(disable_thinking=False)
+        settings2, _, _ = _agent.run_bounds(disable_thinking=False)
         self.assertNotIn("extra_body", settings2)
 
     def test_invalid_bounds_rejected(self):
         with self.assertRaises(ValueError):
-            _analyze.run_bounds(max_tokens=0)
+            _agent.run_bounds(max_tokens=0)
         with self.assertRaises(ValueError):
-            _analyze.run_bounds(request_limit=3)
+            _agent.run_bounds(request_limit=3)
         with self.assertRaises(ValueError):
-            _analyze.run_bounds(analysis_timeout_s=0)
+            _agent.run_bounds(analysis_timeout_s=0)
         with self.assertRaises(ValueError):
-            _analyze.run_bounds(analysis_timeout_s=301)
+            _agent.run_bounds(analysis_timeout_s=301)
+
+    def test_single_validation_retry_recovers_malformed_envelope(self):
+        from pydantic_ai.messages import ModelResponse, ToolCallPart
+
+        calls = []
+
+        def _flaky(messages, info):
+            calls.append(1)
+            if len(calls) == 1:
+                args = {"opportunities": None, "ignore": [],
+                        "next_move": "n"}
+            else:
+                args = {"opportunities": [], "ignore": [], "next_move": "n"}
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="final_result", args=args)])
+
+        draft, _ = _agent.analyze_candidates(
+            [_work("https://openalex.org/W1")],
+            model=FunctionModel(_flaky))
+        self.assertEqual(draft.opportunities, [])
+        self.assertEqual(len(calls), 2)
 
 
 class TestDeadline(unittest.TestCase):
     def test_slow_model_hits_overall_deadline(self):
         async def _slow(messages, info):
             await asyncio.sleep(5)
-            return _analyze.RadarDraft(opportunities=[], ignore=[], next_move="x")
+            return RadarDraft(opportunities=[], ignore=[], next_move="x")
 
         with self.assertRaises(_ft.FreeTokenError) as ctx:
-            _analyze.analyze_candidates(
+            _agent.analyze_candidates(
                 [_work("https://openalex.org/W1")],
                 model=FunctionModel(_slow), analysis_timeout_s=0.3)
         self.assertIn("deadline", str(ctx.exception).lower())
 
     def test_fast_model_succeeds_with_test_model(self):
-        draft, prompt = _analyze.analyze_candidates(
+        draft, prompt = _agent.analyze_candidates(
             [_work("https://openalex.org/W1")], model=TestModel())
         self.assertIsInstance(draft, RadarDraft)
         self.assertIn("at most 2 opportunities", prompt)
@@ -96,7 +134,7 @@ class TestDisableThinkingResolution(unittest.TestCase):
             raise RuntimeError("400 Bad Request: unrecognized extra_body key")
 
         with self.assertRaises(_ft.FreeTokenError) as ctx:
-            _analyze.analyze_candidates(
+            _agent.analyze_candidates(
                 [_work("https://openalex.org/W1")],
                 model=FunctionModel(_reject), disable_thinking=True)
         self.assertIn("--disable-thinking", str(ctx.exception))
@@ -111,7 +149,7 @@ class TestCachedSnapshot(unittest.TestCase):
             loaded, meta = _refresh.load_snapshot(path)
             self.assertEqual(len(loaded), 2)
             self.assertTrue(meta["collected_at_utc"])
-            top = _refresh.select_topn(loaded, 1)
+            top = _ranking.select_topn(loaded, 1)
             self.assertEqual(top[0].openalex_id, "https://openalex.org/W1")
 
     def test_load_snapshot_rejects_invalid(self):
@@ -126,25 +164,24 @@ class TestCachedSnapshot(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = _seed_snapshot(tmp, [_work("https://openalex.org/W1"),
                                         _work("https://openalex.org/W2", abstract="")])
-            with mock.patch.object(_cli, "collect_pool",
-                                   side_effect=AssertionError("no network")):
-                with mock.patch("builtins.print") as fake_print:
-                    code = _cli.main(["--collect-only", "--from-snapshot", path,
-                                      "--max-candidates", "1"])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = _main(["--collect-only", "--from-snapshot", path,
+                              "--max-candidates", "1"])
             self.assertEqual(code, 0)
-            shown = json.loads(fake_print.call_args[0][0])
+            shown = json.loads(buf.getvalue())
             self.assertEqual(shown["coverage"]["collected"], 2)
             self.assertEqual(len(shown["works"]), 1)
 
     def test_from_snapshot_plus_refresh_dir_rejected(self):
-        code = _cli.main(["--collect-only", "--from-snapshot", "x.json",
-                          "--refresh-dir", "y"])
-        self.assertEqual(code, 4)
+        self.assertEqual(
+            _main(["--collect-only", "--from-snapshot", "x.json",
+                   "--refresh-dir", "y"]), 4)
 
     def test_missing_snapshot_is_usage_error(self):
-        code = _cli.main(["--collect-only", "--from-snapshot",
-                          "/nonexistent/snap.json"])
-        self.assertEqual(code, 4)
+        self.assertEqual(
+            _main(["--collect-only", "--from-snapshot",
+                   "/nonexistent/snap.json"]), 4)
 
     def test_invalid_snapshot_fails_before_model_and_preserves(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -152,32 +189,37 @@ class TestCachedSnapshot(unittest.TestCase):
             with open(path, "w") as fh:
                 fh.write("{broken")
             before = open(path).read()
-            with mock.patch.object(_cli, "analyze_candidates",
-                                   side_effect=AssertionError("no model")):
-                code = _cli.main(["--from-snapshot", path])
+            code = _main(["--from-snapshot", path])
             self.assertNotEqual(code, 0)
             self.assertEqual(open(path).read(), before)
 
     def test_invalid_analysis_timeout_flag(self):
-        self.assertEqual(_cli.main(["--analysis-timeout", "0"]), 4)
-        self.assertEqual(_cli.main(["--analysis-timeout", "301"]), 4)
+        self.assertEqual(_main(["--analysis-timeout", "0"]), 4)
+        self.assertEqual(_main(["--analysis-timeout", "301"]), 4)
 
     def test_cached_analysis_never_rewrites_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = _seed_snapshot(tmp, [_work("https://openalex.org/W1")])
             before = open(path, "rb").read()
-            draft = RadarDraft(opportunities=[], ignore=[], next_move="done")
-            with mock.patch.object(_cli, "analyze_candidates",
-                                   return_value=(draft, "p")):
-                with mock.patch.object(_cli._freetoken.FreeTokenConfig,
-                                       "resolve", return_value=mock.Mock()):
-                    with mock.patch.object(_cli._freetoken, "build_session",
-                                           return_value=mock.Mock(model=object())):
-                        with mock.patch.object(_cli._freetoken, "close_session"):
-                            with mock.patch("builtins.print"):
-                                code = _cli.main(["--from-snapshot", path])
-            self.assertEqual(code, 0)
+            result = _run_pipeline(PipelineRequest(
+                mode="analyze", max_candidates=1, from_snapshot=path,
+                model_override=_fixed_draft_model()))
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("Next move", result.stdout)
             self.assertEqual(open(path, "rb").read(), before)
+
+    def test_pipeline_reports_full_cache_pool_and_actual_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _seed_snapshot(tmp, [_work(f"https://openalex.org/W{i}")
+                                        for i in range(5)])
+            result = _run_pipeline(PipelineRequest(
+                mode="analyze", max_candidates=2, from_snapshot=path,
+                model_override=_fixed_draft_model()))
+            self.assertEqual(result.exit_code, 0)
+            coverage = " ".join(result.stderr_notes)
+            self.assertIn("pool=5", coverage)
+            self.assertIn("selected=2", coverage)
+            self.assertIn("analyzed=2", coverage)
 
 
 class TestCoverageGuard(unittest.TestCase):
@@ -192,8 +234,6 @@ class TestCoverageGuard(unittest.TestCase):
 
 class TestValidationCategories(unittest.TestCase):
     def test_invalid_model_output_reports_safe_categories(self):
-        from pydantic_ai.messages import ModelResponse, ToolCallPart
-
         def _invalid(messages, info):
             return ModelResponse(parts=[ToolCallPart(
                 tool_name="final_result",
@@ -204,7 +244,7 @@ class TestValidationCategories(unittest.TestCase):
                     "ignore": [], "next_move": "n"})])
 
         with self.assertRaises(_ft.FreeTokenError) as ctx:
-            _analyze.analyze_candidates(
+            _agent.analyze_candidates(
                 [_work("https://openalex.org/W1")],
                 model=FunctionModel(_invalid))
         text = str(ctx.exception)
@@ -212,26 +252,75 @@ class TestValidationCategories(unittest.TestCase):
         self.assertNotIn("MARKER-BAD-VALUE-9z", text)
 
     def test_prompt_states_valid_evidence_range(self):
-        from radar.prompt import build_prompt
-
-        prompt = build_prompt(
+        prompt = _agent.build_prompt(
             [_work(f"https://openalex.org/W{i}") for i in range(3)],
             max_candidates=3)
         self.assertIn("0..2", prompt)
 
     def test_non_string_ignore_items_coerced(self):
-        from pydantic_ai.messages import ModelResponse, ToolCallPart
-
         def _ints_in_ignore(messages, info):
             return ModelResponse(parts=[ToolCallPart(
                 tool_name="final_result",
                 args={"opportunities": [], "ignore": [7, None, "dup"],
                       "next_move": "n"})])
 
-        draft, _ = _analyze.analyze_candidates(
+        draft, _ = _agent.analyze_candidates(
             [_work("https://openalex.org/W1")],
             model=FunctionModel(_ints_in_ignore))
         self.assertEqual(draft.ignore, ["7", "dup"])
+
+
+class TestSessionLifecycle(unittest.TestCase):
+    def _session(self, model):
+        import httpx2
+
+        from radar.provider.freetoken import FreeTokenSession
+
+        return FreeTokenSession(
+            model=model,
+            http_client=httpx2.AsyncClient(timeout=5.0))
+
+    def test_deadline_closes_session_in_loop(self):
+        async def _slow(messages, info):
+            await asyncio.sleep(5)
+            return RadarDraft(opportunities=[], ignore=[], next_move="x")
+
+        session = self._session(FunctionModel(_slow))
+        with self.assertRaises(_ft.FreeTokenError):
+            _agent.analyze_candidates(
+                [_work("https://openalex.org/W1")],
+                analysis_timeout_s=0.3, session=session)
+        self.assertTrue(session.http_client.is_closed)
+
+    def test_early_bounds_error_closes_session(self):
+        session = self._session(TestModel())
+        with self.assertRaises(ValueError):
+            _agent.analyze_candidates(
+                [_work("https://openalex.org/W1")],
+                max_tokens=0, session=session)
+        self.assertTrue(session.http_client.is_closed)
+
+    def test_success_closes_session(self):
+        session = self._session(TestModel())
+        _agent.analyze_candidates(
+            [_work("https://openalex.org/W1")], session=session)
+        self.assertTrue(session.http_client.is_closed)
+
+
+class TestPromptFit(unittest.TestCase):
+    def test_footer_survives_and_only_complete_blocks_count(self):
+        long_abstract = "word " * 4000
+        works = [_work(f"https://openalex.org/W{i}", title=f"Paper {i}",
+                       abstract=long_abstract) for i in range(25)]
+        included = _agent.select_for_prompt(works, 25)
+        self.assertLess(len(included), 25)
+        self.assertGreater(len(included), 0)
+        prompt = _agent.build_prompt(works, 25)
+        self.assertIn("TASK:", prompt)
+        self.assertIn(f"0..{len(included) - 1}", prompt)
+        # Every claimed index resolves against the included list.
+        for i in range(len(included)):
+            self.assertIn(f"[{i}]", prompt)
 
 
 if __name__ == "__main__":

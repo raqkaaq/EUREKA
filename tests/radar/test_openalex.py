@@ -8,12 +8,13 @@ import unittest
 
 from pydantic import ValidationError
 
-from radar.models import PlannedQuery, QueryPlan, RadarProfile
-from radar.openalex import (
+from radar.config.interests import RadarProfile
+from radar.processing.ranking import cheap_score, rank_works
+from radar.schema.papers import PlannedQuery, QueryPlan
+from radar.source.openalex import (
     DictTransport,
     build_query_plan,
     build_request,
-    cheap_score,
     collect,
     normalize_work,
     reconstruct_abstract,
@@ -169,7 +170,7 @@ class TestCollect(unittest.TestCase):
         plan = build_query_plan(RadarProfile(keywords=["diffusion"]))
         terms = [q.terms for q in plan.queries]
         pages = {t: {"results": [_work()]} for t in terms}
-        works = collect(plan, DictTransport(pages), ["diffusion"])
+        works = rank_works(collect(plan, DictTransport(pages)), ["diffusion"])
         self.assertEqual(len(works), 1)
         self.assertGreaterEqual(works[0].score, 0.0)
 
@@ -184,7 +185,7 @@ class TestCollect(unittest.TestCase):
             "alpha": {"results": [_work()]},
             "beta": {"results": [_work()]},
         }
-        works = collect(plan, DictTransport(pages), ["diffusion"])
+        works = rank_works(collect(plan, DictTransport(pages)), ["diffusion"])
         self.assertEqual(len(works), 1)
         self.assertEqual(
             sorted(works[0].matched_queries), ["alpha", "beta"]
@@ -204,7 +205,7 @@ class TestCollect(unittest.TestCase):
                 ]
             }
         }
-        works = collect(plan, DictTransport(pages), ["diffusion"])
+        works = rank_works(collect(plan, DictTransport(pages)), ["diffusion"])
         self.assertEqual(len(works), 1)
 
     def test_prescore_deterministic(self):
@@ -279,7 +280,8 @@ class TestLookbackAndBounds(unittest.TestCase):
             "beta": {"results": [hit]},
         }
         transport = DictTransport(pages)
-        pool = collect(plan, transport, [scoring_kw], max_total=200)
+        pool = rank_works(
+            collect(plan, transport, max_total=200), [scoring_kw])
         # Whole bounded plan executed despite the small output bound.
         self.assertEqual(len(transport.calls), len(plan.queries))
         self.assertEqual(len(pool), 4)
@@ -295,7 +297,7 @@ def _mock_transport(status: int, headers: dict | None = None,
     """HttpxTransport backed by an httpx.MockTransport (no network)."""
     import httpx
 
-    from radar.openalex import HttpxTransport
+    from radar.source.openalex import HttpxTransport
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(status, headers=headers or {}, content=body,
@@ -344,7 +346,7 @@ class TestDailyQuota(unittest.TestCase):
     def test_confirmed_quota_raises_typed_error(self):
         import httpx
 
-        from radar.openalex import OpenAlexQuotaError
+        from radar.source.openalex import OpenAlexQuotaError
 
         got = self._get_json_raising(429, _quota_headers(), _quota_body())
         self.assertIsInstance(got, OpenAlexQuotaError)
@@ -359,20 +361,20 @@ class TestDailyQuota(unittest.TestCase):
         self.assertNotIn("Insufficient budget. This request", text)
 
     def test_headers_alone_confirm_quota(self):
-        from radar.openalex import OpenAlexQuotaError
+        from radar.source.openalex import OpenAlexQuotaError
 
         got = self._get_json_raising(429, _quota_headers(), b"")
         self.assertIsInstance(got, OpenAlexQuotaError)
 
     def test_transient_429_stays_http_error(self):
-        from radar.openalex import OpenAlexHttpError
+        from radar.source.openalex import OpenAlexHttpError
 
         got = self._get_json_raising(429, {"Retry-After": "2"}, b"busy, try again")
         self.assertIsInstance(got, OpenAlexHttpError)
         self.assertEqual(got.status_code, 429)
 
     def test_zero_remaining_short_retry_not_quota_without_body(self):
-        from radar.openalex import OpenAlexHttpError
+        from radar.source.openalex import OpenAlexHttpError
 
         headers = {"Retry-After": "5", "X-RateLimit-Remaining": "0"}
         got = self._get_json_raising(429, headers, b"")
@@ -380,21 +382,21 @@ class TestDailyQuota(unittest.TestCase):
         self.assertEqual(got.status_code, 429)
 
     def test_malformed_body_transient_headers_stays_http_error(self):
-        from radar.openalex import OpenAlexHttpError
+        from radar.source.openalex import OpenAlexHttpError
 
         got = self._get_json_raising(429, {"Retry-After": "2"}, b"{not json###")
         self.assertIsInstance(got, OpenAlexHttpError)
         self.assertEqual(got.status_code, 429)
 
     def test_missing_headers_and_body_stays_http_error(self):
-        from radar.openalex import OpenAlexHttpError
+        from radar.source.openalex import OpenAlexHttpError
 
         got = self._get_json_raising(429, {}, b"")
         self.assertIsInstance(got, OpenAlexHttpError)
         self.assertEqual(got.status_code, 429)
 
     def test_non_429_status_untouched(self):
-        from radar.openalex import OpenAlexHttpError
+        from radar.source.openalex import OpenAlexHttpError
 
         got = self._get_json_raising(503, _quota_headers(), _quota_body())
         self.assertIsInstance(got, OpenAlexHttpError)
@@ -403,7 +405,7 @@ class TestDailyQuota(unittest.TestCase):
     def test_quota_fail_fast_no_retry_sleep(self):
         from unittest.mock import patch
 
-        from radar.openalex import OpenAlexQuotaError, RetryingTransport
+        from radar.source.openalex import OpenAlexQuotaError, RetryingTransport
 
         calls: list = []
 
@@ -418,12 +420,31 @@ class TestDailyQuota(unittest.TestCase):
         asleep.assert_not_called()
         self.assertEqual(len(calls), 1)
 
+    def test_transient_429_honors_server_retry_after(self):
+        from unittest.mock import patch
+
+        import httpx
+
+        from radar.source.openalex import HttpxTransport, RetryingTransport
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(429, headers={"Retry-After": "30"},
+                                  content=b"busy", request=request)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        with patch("time.sleep") as asleep:
+            with self.assertRaises(Exception):
+                RetryingTransport(HttpxTransport(client=client),
+                                  max_retries=1).get_json(
+                    "https://api.openalex.org/works", {}, {}, 1.0)
+        asleep.assert_called_once_with(30.0)
+
     def test_transient_429_still_retried(self):
         from unittest.mock import patch
 
         import httpx
 
-        from radar.openalex import RetryingTransport
+        from radar.source.openalex import RetryingTransport
 
         calls: list = []
 
@@ -436,7 +457,7 @@ class TestDailyQuota(unittest.TestCase):
                                   request=request)
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        from radar.openalex import HttpxTransport, RetryingTransport
+        from radar.source.openalex import HttpxTransport
 
         with patch("time.sleep"):
             out = RetryingTransport(HttpxTransport(client=client)).get_json(
@@ -456,13 +477,13 @@ class TestHttpxTransportConfig(unittest.TestCase):
                                   request=request)
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        from radar.openalex import HttpxTransport
+        from radar.source.openalex import HttpxTransport
 
         out = HttpxTransport(client=client).get_json("https://u", {"a": "b"}, {}, 5.0)
         self.assertEqual(out, {"results": [], "meta": {}})
 
     def test_client_ignores_proxy_env_and_redirects(self):
-        from radar.openalex import default_client
+        from radar.source.openalex import default_client
 
         client = default_client()
         try:
@@ -478,7 +499,7 @@ class TestHttpxTransportConfig(unittest.TestCase):
             raise httpx.ConnectTimeout("slow", request=request)
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        from radar.openalex import HttpxTransport
+        from radar.source.openalex import HttpxTransport
 
         with self.assertRaises(Exception) as ctx:
             HttpxTransport(client=client).get_json(

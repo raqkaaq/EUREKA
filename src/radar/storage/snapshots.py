@@ -33,8 +33,8 @@ import json as _json
 import os as _os
 from typing import Any
 
-from radar.models import MAX_QUERIES, CollectedWork
-from radar.openalex import MAX_TOTAL_WORKS
+from radar.config.runtime import MAX_QUERIES, MAX_TOTAL_WORKS
+from radar.schema.papers import CollectedWork
 
 SCHEMA_VERSION = 1
 SNAPSHOT_FILENAME = "snapshot.json"
@@ -201,12 +201,6 @@ def _load_previous(path: str) -> list[dict[str, Any]]:
         seen.add(wid)
         works.append(work.model_dump())
     return works
-
-
-def select_topn(works: list[CollectedWork], n: int) -> list[CollectedWork]:
-    """Rank cached works reproducibly (score desc, OpenAlex ID asc); slice topN."""
-    ranked = sorted(works, key=lambda w: (-w.score, w.openalex_id))
-    return ranked[: max(0, int(n))]
 
 
 def load_snapshot(path: str) -> tuple[list[CollectedWork], dict[str, Any]]:

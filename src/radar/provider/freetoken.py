@@ -1,21 +1,9 @@
-"""Private-network FreeToken model adapter (PydanticAI only).
+"""Private-network FreeToken provider: LAN-only model configuration,
+PydanticAI model construction, and deterministic client lifetime.
 
-- Configure the endpoint with ``FREETOKEN_BASE_URL`` or ``--base-url``;
-  there is no assumed host because FreeToken may live elsewhere on the LAN.
-- Model resolution: ``FREETOKEN_MODEL`` env var, else the local
-  ``GET {base}/models`` endpoint (OpenAI-compatible ``{"data": [...]}``).
-- Inference goes exclusively through PydanticAI
-  (``OpenAIChatModel`` + ``Agent``); this module never imports the OpenAI
-  SDK directly and performs no HTTP calls except the ``/models`` lookup.
-- Public, link-local, multicast, reserved, and unspecified destinations are
-  rejected. Loopback, RFC 1918, IPv6 ULA, and RFC 6598 addresses are allowed.
-
-Official API reference (verified 2026-09-30):
-https://ai.pydantic.dev/models/openai/ (``OpenAIChatModel`` for Chat
-Completions endpoints) and
-https://ai.pydantic.dev/models/compatible-apis/#other-endpoints
-(``OpenAIProvider(base_url=..., api_key=...)`` for custom OpenAI-compatible
-endpoints). Package: ``pydantic-ai-slim[openai]``.
+Owns no prompts, no analysis bounds (see :mod:`radar.config.runtime`),
+no inference HTTP (PydanticAI owns that); this module owns the
+underlying client lifetime.
 """
 
 from __future__ import annotations
@@ -37,16 +25,6 @@ if TYPE_CHECKING:
 EXAMPLE_BASE_URL = "http://192.168.1.20:1919/v1"
 MODELS_TIMEOUT_S = 5.0
 MODEL_TIMEOUT_S = 60.0
-MODEL_MAX_RETRIES = 1  # PydanticAI output-validation retries (bounded)
-# Live-reliability analysis bounds (proven 2026-10-03 on LAN FreeToken):
-# full RadarDraft completes fast only with a compact prompt, capped output,
-# few requests, no validation retries, and a hard overall deadline.
-ANALYSIS_TIMEOUT_S = 90.0
-ANALYSIS_MAX_TIMEOUT_S = 300.0
-ANALYSIS_MAX_TOKENS = 2000
-ANALYSIS_REQUEST_TIMEOUT_S = 60.0
-ANALYSIS_REQUEST_LIMIT = 2
-ANALYSIS_RETRIES = 0
 DISABLE_THINKING_ENV_VAR = "FREETOKEN_DISABLE_THINKING"
 
 
@@ -304,15 +282,6 @@ def build_session(config: FreeTokenConfig) -> FreeTokenSession:
         model=OpenAIChatModel(config.model, provider=provider),  # type: ignore[arg-type]
         http_client=client,
     )
-
-
-def build_model(config: FreeTokenConfig) -> "_Model":
-    """Build the model, discarding ownership (tests and short-lived callers).
-
-    Prefer :func:`build_session` + :func:`close_session` in production paths
-    so the HTTP client lifetime is explicit.
-    """
-    return build_session(config).model
 
 
 def close_session(session: FreeTokenSession) -> None:
