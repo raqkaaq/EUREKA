@@ -9,11 +9,11 @@ credentials, prompts, or raw bodies.
 
 from __future__ import annotations
 
-import concurrent.futures as _futures
+import asyncio as _asyncio
 import json as _json
 import math as _math
 import os as _os
-import time as _time
+import urllib.parse as _urlparse
 from dataclasses import dataclass
 from typing import Any
 
@@ -95,16 +95,18 @@ class ClefConfig:
         if not raw:
             raise ClefError(
                 "CLEF base URL is not configured; set CLEF_BASE_URL or pass "
-                "--clef-base-url with a loopback/private-LAN /v1/systemone "
-                "endpoint. No endpoint is ever guessed."
+                "--clef-base-url with a loopback/private-LAN endpoint base "
+                "(empty path or /v1; the /systemone path is appended "
+                "automatically). No endpoint is ever guessed."
             )
+        base = _normalize_base(raw)
         try:
-            base = check_local_network(raw)
-        except FreeTokenError as exc:
+            check_local_network(base)
+        except FreeTokenError:
             raise ClefError(
                 "CLEF base URL must be a loopback or private-LAN http(s) URL "
                 "without credentials."
-            ) from exc
+            ) from None
         name = ((model or _os.environ.get(CLEF_MODEL_ENV, "")) or "").strip()
         return cls(
             base_url=base,
@@ -113,6 +115,55 @@ class ClefConfig:
             overall_timeout_s=_finite_number(overall_timeout_s, "overall_timeout_s", 0, 300),
             concurrency=_checked_concurrency(concurrency),
         )
+
+
+def _normalize_base(raw: str) -> str:
+    """Normalize an explicit endpoint to a ``/v1``-rooted base URL.
+
+    A bare private host base gains ``/v1``; an explicit ``/v1/systemone``
+    URL is trimmed back to ``/v1`` (the transport appends ``/systemone``);
+    a ``/v1`` root -- including a reverse-proxy prefix ending in ``/v1`` --
+    is retained. Credentials, query strings, fragments, non-http(s)
+    schemes, and other paths are rejected with redacted errors that never
+    echo secrets. No host is ever guessed.
+    """
+    try:
+        parts = _urlparse.urlsplit(raw)
+    except ValueError as exc:
+        raise ClefError("CLEF base URL is not a valid URL.") from exc
+    if parts.username is not None or parts.password is not None:
+        raise ClefError(
+            "CLEF base URL must not contain credentials; configure a plain "
+            "loopback/private-LAN endpoint."
+        )
+    if parts.query or parts.fragment:
+        raise ClefError(
+            "CLEF base URL must be a plain endpoint without query or fragment."
+        )
+    if parts.scheme not in ("http", "https"):
+        raise ClefError("CLEF base URL must use http(s).")
+    host = parts.hostname or ""
+    if not host:
+        raise ClefError("CLEF base URL must contain a host.")
+    try:
+        port = parts.port
+    except ValueError as exc:
+        raise ClefError("CLEF base URL has an invalid port.") from exc
+    path = (parts.path or "").rstrip("/")
+    if path in ("", "/"):
+        path = "/v1"
+    elif path.endswith("/v1/systemone"):
+        path = path[: -len("/systemone")]
+    elif not (path == "/v1" or path.endswith("/v1")):
+        raise ClefError(
+            f"CLEF base URL path {path!r} is unsupported; use an empty path, "
+            "a /v1 root (reverse-proxy prefixes ending in /v1 are kept), "
+            "or a /v1/systemone URL."
+        )
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
+    return f"{parts.scheme}://{netloc}{path}"
 
 
 def _questions(profile: RadarProfile) -> dict[str, Any]:
@@ -187,8 +238,8 @@ def _validate_answer(
         return TriageResult(work_id=work_id, status="failed")
 
 
-def _post_one(
-    client: _httpx.Client,
+async def _post_one_async(
+    client: _httpx.AsyncClient,
     url: str,
     body: bytes,
     timeout_s: float,
@@ -197,7 +248,7 @@ def _post_one(
 ) -> TriageResult:
     """POST one screening call; service problems raise _ServiceDown."""
     try:
-        response = client.post(
+        response = await client.post(
             url,
             content=body,
             headers={"Content-Type": "application/json"},
@@ -205,6 +256,8 @@ def _post_one(
         )
     except (_httpx.TimeoutException, _httpx.TransportError) as exc:
         raise _ServiceDown(type(exc).__name__) from None
+    except _asyncio.CancelledError:
+        raise
     except Exception as exc:
         raise _ServiceDown(type(exc).__name__) from None
     if response.status_code != 200:
@@ -248,19 +301,11 @@ def screen_works(
         else:
             pending.append((work, body))
     if pending:
-        if transport is not None:
-            client = _httpx.Client(
-                transport=transport, trust_env=False, follow_redirects=False
+        results.update(
+            _asyncio.run(
+                _screen_pool_async(pending, profile, config, transport)
             )
-        else:
-            client = _httpx.Client(trust_env=False, follow_redirects=False)
-        try:
-            _run_pool(client, pending, profile, config, results)
-        finally:
-            try:
-                client.close()
-            except Exception:
-                pass
+        )
     return TriageBatch(
         model_id=config.model,
         rubric_version=RUBRIC_VERSION,
@@ -268,118 +313,149 @@ def screen_works(
     )
 
 
-def _run_pool(
-    client: _httpx.Client,
+async def _screen_pool_async(
     pending: list[tuple[CollectedWork, bytes]],
     profile: RadarProfile,
     config: ClefConfig,
+    transport: _httpx.BaseTransport | None,
+) -> dict[str, TriageResult]:
+    """Run all calls with bounded concurrency under a hard overall deadline.
+
+    The first call runs alone as a service probe, so a dead endpoint aborts
+    after exactly one call. Cancellation is cooperative through httpx: when
+    the overall deadline fires, in-flight calls are cancelled, no work is
+    left running, and the owned client closes deterministically.
+    """
+    if transport is not None:
+        client = _httpx.AsyncClient(
+            transport=transport, trust_env=False, follow_redirects=False
+        )
+    else:
+        client = _httpx.AsyncClient(trust_env=False, follow_redirects=False)
+    results: dict[str, TriageResult] = {}
+    url = f"{config.base_url.rstrip('/')}/systemone"
+    try:
+        async with client:
+            start = _asyncio.get_running_loop().time()
+            budget = float(config.overall_timeout_s)
+            try:
+                async with _asyncio.timeout(budget):
+                    first, rest = pending[0], pending[1:]
+                    try:
+                        outcome = await _post_one_async(
+                            client, url, first[1],
+                            float(config.request_timeout_s),
+                            first[0].openalex_id, config.model,
+                        )
+                    except _ServiceDown:
+                        _mark_all(results, pending, "failed")
+                    except Exception:
+                        _mark_all(results, pending, "failed")
+                    else:
+                        if _asyncio.get_running_loop().time() - start > budget:
+                            _mark_all(results, pending, "deadline")
+                        else:
+                            results[first[0].openalex_id] = outcome
+                            if rest:
+                                await _fanout_async(client, url, rest, config, results)
+            except (TimeoutError, _asyncio.CancelledError):
+                for work, _body in pending:
+                    if work.openalex_id not in results:
+                        results[work.openalex_id] = TriageResult(
+                            work_id=work.openalex_id, status="deadline"
+                        )
+    finally:
+        try:
+            if not client.is_closed:
+                await client.aclose()
+        except Exception:
+            pass
+    return results
+
+
+def _mark_all(
+    results: dict[str, TriageResult],
+    pending: list[tuple[CollectedWork, bytes]],
+    status: str,
+) -> None:
+    for work, _body in pending:
+        results[work.openalex_id] = TriageResult(
+            work_id=work.openalex_id, status=status  # type: ignore[arg-type]
+        )
+
+
+async def _fanout_async(
+    client: _httpx.AsyncClient,
+    url: str,
+    rest: list[tuple[CollectedWork, bytes]],
+    config: ClefConfig,
     results: dict[str, TriageResult],
 ) -> None:
-    """Execute calls with bounded concurrency, fail-fast, overall deadline.
+    """Fan out remaining calls; first service failure aborts the rest.
 
-    The first call runs synchronously as a service probe: when the
-    endpoint is down the pool aborts after exactly one call instead of
-    repeating the failure across every work. Remaining calls fan out over
-    a bounded thread pool.
+    Uncompleted works are left unmarked here: the caller assigns failed
+    after an abort and deadline after the overall timeout fires.
     """
-    url = f"{config.base_url.rstrip('/')}/systemone"
-    deadline = _time.monotonic() + float(config.overall_timeout_s)
-    first, rest = pending[0], pending[1:]
-    try:
-        outcome = _post_one(
-            client, url, first[1], float(config.request_timeout_s),
-            first[0].openalex_id, config.model,
-        )
-    except _ServiceDown:
-        results[first[0].openalex_id] = TriageResult(
-            work_id=first[0].openalex_id, status="failed"
-        )
-        for work, _body in rest:
-            results[work.openalex_id] = TriageResult(
-                work_id=work.openalex_id, status="failed"
-            )
-        return
-    except Exception:
-        results[first[0].openalex_id] = TriageResult(
-            work_id=first[0].openalex_id, status="failed"
-        )
-        for work, _body in rest:
-            results[work.openalex_id] = TriageResult(
-                work_id=work.openalex_id, status="failed"
-            )
-        return
-    if _time.monotonic() > deadline:
-        results[first[0].openalex_id] = TriageResult(
-            work_id=first[0].openalex_id, status="deadline"
-        )
-        for work, _body in rest:
-            results[work.openalex_id] = TriageResult(
-                work_id=work.openalex_id, status="deadline"
-            )
-        return
-    results[first[0].openalex_id] = outcome
-    if not rest:
-        return
-    with _futures.ThreadPoolExecutor(max_workers=config.concurrency) as pool:
-        future_of = {
-            pool.submit(
-                _post_one, client, url, body,
-                float(config.request_timeout_s),
+    sem = _asyncio.Semaphore(config.concurrency)
+
+    async def _one(work: CollectedWork, body: bytes) -> TriageResult:
+        async with sem:
+            return await _post_one_async(
+                client, url, body, float(config.request_timeout_s),
                 work.openalex_id, config.model,
-            ): work
-            for work, body in rest
-        }
-        queue = list(future_of.items())
-        aborted = False
-        for index, (future, work) in enumerate(queue):
-            if aborted:
-                results[work.openalex_id] = TriageResult(
-                    work_id=work.openalex_id, status="failed"
-                )
-                try:
-                    future.cancel()
-                except Exception:
-                    pass
-                continue
-            remaining = deadline - _time.monotonic()
-            if remaining <= 0:
-                _mark_rest_deadline(queue[index:], results)
-                break
+            )
+
+    tasks = {
+        _asyncio.ensure_future(_one(work, body)): work for work, body in rest
+    }
+    start = _asyncio.get_running_loop().time()
+    budget = float(config.overall_timeout_s)
+    try:
+        for index, (task, work) in enumerate(list(tasks.items())):
             try:
-                outcome = future.result(timeout=remaining)
-            except _futures.TimeoutError:
-                _mark_rest_deadline(queue[index:], results)
-                break
+                outcome = await task
             except _ServiceDown:
-                results[work.openalex_id] = TriageResult(
-                    work_id=work.openalex_id, status="failed"
-                )
-                aborted = True
-                continue
+                _abort_rest(tasks, results, work.openalex_id)
+                return
+            except _asyncio.CancelledError:
+                raise
             except Exception:
-                results[work.openalex_id] = TriageResult(
-                    work_id=work.openalex_id, status="failed"
-                )
-                aborted = True
-                continue
-            if _time.monotonic() > deadline:
+                _abort_rest(tasks, results, work.openalex_id)
+                return
+            if _asyncio.get_running_loop().time() - start > budget:
                 results[work.openalex_id] = TriageResult(
                     work_id=work.openalex_id, status="deadline"
                 )
-                _mark_rest_deadline(queue[index + 1 :], results)
+                _mark_pending_deadline(list(tasks.items())[index + 1 :], results)
+                for later in list(tasks)[index + 1 :]:
+                    if not later.done():
+                        later.cancel()
                 break
             results[work.openalex_id] = outcome
+    finally:
+        # Settle everything: no task left running or unretrieved.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await _asyncio.gather(*tasks, return_exceptions=True)
 
 
-def _mark_rest_deadline(
+def _mark_pending_deadline(
     rest: list, results: dict[str, TriageResult]
 ) -> None:
-    for future, work in rest:
-        try:
-            future.cancel()
-        except Exception:
-            pass
+    for _task, work in rest:
         if work.openalex_id not in results:
             results[work.openalex_id] = TriageResult(
-                work_id=work.openalex_id, status="deadline"
+                work_id=work.openalex_id, status="deadline"  # type: ignore[arg-type]
+            )
+
+
+def _abort_rest(
+    tasks: dict, results: dict[str, TriageResult], failed_id: str
+) -> None:
+    """Mark one work failed and every unattempted work failed (fail fast)."""
+    for _task, work in tasks.items():
+        if work.openalex_id not in results:
+            results[work.openalex_id] = TriageResult(
+                work_id=work.openalex_id, status="failed"  # type: ignore[arg-type]
             )

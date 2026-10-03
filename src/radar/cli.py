@@ -136,8 +136,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--triage-output",
         default=None,
         metavar="PATH",
-        help="Write an atomic triage sidecar JSON beside the run; strict "
-        "v1 metadata snapshots are never mutated.",
+        help="Write an atomic triage.json sidecar inside DIRECTORY PATH; "
+        "strict v1 metadata snapshots are never mutated.",
     )
     return parser
 

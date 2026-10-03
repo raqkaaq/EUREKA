@@ -194,30 +194,33 @@ class TestCachedSnapshot(unittest.TestCase):
                    "/nonexistent/snap.json"]), 4)
 
     def test_invalid_snapshot_fails_before_model_and_preserves(self):
+        from pathlib import Path
+
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "snapshot.json")
-            with open(path, "w") as fh:
-                fh.write("{broken")
-            before = open(path).read()
-            code = _main(["--from-snapshot", path])
+            path = Path(tmp) / "snapshot.json"
+            path.write_text("{broken", encoding="utf-8")
+            before = path.read_text(encoding="utf-8")
+            code = _main(["--from-snapshot", str(path)])
             self.assertNotEqual(code, 0)
-            self.assertEqual(open(path).read(), before)
+            self.assertEqual(path.read_text(encoding="utf-8"), before)
 
     def test_invalid_analysis_timeout_flag(self):
         self.assertEqual(_main(["--analysis-timeout", "0"]), 4)
         self.assertEqual(_main(["--analysis-timeout", "301"]), 4)
 
     def test_cached_analysis_never_rewrites_snapshot(self):
+        from pathlib import Path
+
         with tempfile.TemporaryDirectory() as tmp:
             path = _seed_snapshot(tmp, [_work("https://openalex.org/W1")])
-            before = open(path, "rb").read()
+            before = Path(path).read_bytes()
             result = _run_pipeline(PipelineRequest(
                 mode="analyze", max_candidates=1, from_snapshot=path,
                 model_override=_fixed_draft_model(),
                 triage_scorer=lambda pool, profile: _scored_batch(pool)))
             self.assertEqual(result.exit_code, 0)
             self.assertIn("Next move", result.stdout)
-            self.assertEqual(open(path, "rb").read(), before)
+            self.assertEqual(Path(path).read_bytes(), before)
 
     def test_pipeline_reports_full_cache_pool_and_actual_selection(self):
         with tempfile.TemporaryDirectory() as tmp:

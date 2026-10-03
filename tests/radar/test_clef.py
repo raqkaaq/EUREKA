@@ -134,6 +134,53 @@ class TestClefConfig(unittest.TestCase):
                 with self.assertRaises(ClefError, msg=str(kwargs)):
                     ClefConfig.resolve(**kwargs)
 
+    def test_missing_config_names_base_not_endpoint(self):
+        from radar.provider.clef import ClefConfig, ClefError
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ClefError) as ctx:
+                ClefConfig.resolve()
+        text = str(ctx.exception)
+        self.assertIn("CLEF_BASE_URL", text)
+        self.assertNotIn("/v1/systemone", text)
+
+    def test_base_url_normalization(self):
+        from radar.provider.clef import ClefConfig
+
+        cases = {
+            "http://127.0.0.1:11434": "http://127.0.0.1:11434/v1",
+            "http://127.0.0.1:11434/": "http://127.0.0.1:11434/v1",
+            "http://127.0.0.1:11434/v1": "http://127.0.0.1:11434/v1",
+            "http://127.0.0.1:11434/v1/systemone":
+                "http://127.0.0.1:11434/v1",
+            "http://127.0.0.1:11434/prefix/v1":
+                "http://127.0.0.1:11434/prefix/v1",
+            "http://127.0.0.1:11434/prefix/v1/systemone":
+                "http://127.0.0.1:11434/prefix/v1",
+        }
+        for raw, expected in cases.items():
+            with self._env(raw):
+                cfg = ClefConfig.resolve()
+            self.assertEqual(cfg.base_url, expected, msg=raw)
+
+    def test_bad_base_shapes_rejected_without_leak(self):
+        from radar.provider.clef import ClefConfig, ClefError
+
+        bad = [
+            "http://user:s3cret@127.0.0.1:11434/v1",
+            "http://127.0.0.1:11434/v1?api_key=S3CRET",
+            "http://127.0.0.1:11434/v1#frag",
+            "http://127.0.0.1:11434/api/v2",
+            "http://127.0.0.1:11434/systemone",
+        ]
+        for raw in bad:
+            with self._env(raw):
+                with self.assertRaises(ClefError, msg=raw) as ctx:
+                    ClefConfig.resolve()
+            text = str(ctx.exception)
+            self.assertNotIn("s3cret", text.lower())
+            self.assertNotIn("S3CRET", text)
+
 
 class TestScreenWorks(unittest.TestCase):
     def _screen(self, works, handler, **cfg_kwargs):
@@ -282,6 +329,90 @@ class TestScreenWorks(unittest.TestCase):
         self.assertEqual(len(statuses), 3)
         self.assertIn("deadline", statuses)
         self.assertNotIn("scored", statuses)
+
+    def test_wire_url_exact_no_doubled_path(self):
+        for raw, expected_path in (
+            ("http://127.0.0.1:11434", "/v1/systemone"),
+            ("http://127.0.0.1:11434/v1", "/v1/systemone"),
+            ("http://127.0.0.1:11434/v1/systemone", "/v1/systemone"),
+            ("http://127.0.0.1:11434/prefix/v1", "/prefix/v1/systemone"),
+        ):
+            paths: list = []
+
+            async def handler(request, _paths=paths):
+                _paths.append(request.url.path)
+                return httpx.Response(200, json=_answers(0.5, 0.5))
+
+            from radar.provider.clef import ClefConfig, screen_works
+
+            with mock.patch.dict(os.environ, {"CLEF_BASE_URL": raw},
+                                 clear=False):
+                config = ClefConfig.resolve()
+            screen_works([_work("W1")], _profile(), config=config,
+                         transport=httpx.MockTransport(handler))
+            self.assertEqual(paths, [expected_path], msg=raw)
+
+    def test_overall_deadline_bounds_wallclock_and_closes(self):
+        import asyncio
+        import time
+
+        closed = 0
+
+        class RecordingTransport(httpx.MockTransport):
+            async def aclose(self):
+                nonlocal closed
+                closed += 1
+                await super().aclose()
+
+        async def handler(request):
+            await asyncio.sleep(0.5)
+            return httpx.Response(200, json=_answers(0.5, 0.5))
+
+        from radar.provider.clef import ClefConfig, screen_works
+
+        with mock.patch.dict(
+            os.environ, {"CLEF_BASE_URL": "http://127.0.0.1:11434/v1"},
+            clear=False,
+        ):
+            config = ClefConfig.resolve(overall_timeout_s=0.05,
+                                        request_timeout_s=10)
+        works = [_work(f"W{i}") for i in range(3)]
+        transport = RecordingTransport(handler)
+        start = time.monotonic()
+        batch = screen_works(works, _profile(), config=config,
+                             transport=transport)
+        elapsed = time.monotonic() - start
+        # All accounted, none scored; wall clock bounded by the overall
+        # deadline plus slack -- far below one request timeout (old join
+        # could overrun by a full request_timeout).
+        self.assertEqual([r.status for r in batch.results],
+                         ["deadline"] * 3)
+        self.assertLess(elapsed, 2.0)
+        self.assertEqual(closed, 1)
+
+    def test_client_closed_on_service_failure(self):
+        closed = 0
+
+        class RecordingTransport(httpx.MockTransport):
+            async def aclose(self):
+                nonlocal closed
+                closed += 1
+                await super().aclose()
+
+        async def handler(request):
+            return httpx.Response(500, text="boom")
+
+        from radar.provider.clef import ClefConfig, screen_works
+
+        with mock.patch.dict(
+            os.environ, {"CLEF_BASE_URL": "http://127.0.0.1:11434/v1"},
+            clear=False,
+        ):
+            config = ClefConfig.resolve()
+        batch = screen_works([_work("W1")], _profile(), config=config,
+                             transport=RecordingTransport(handler))
+        self.assertEqual(batch.results[0].status, "failed")
+        self.assertEqual(closed, 1)
 
 
 if __name__ == "__main__":

@@ -75,9 +75,10 @@ class PipelineRequest:
     clef_timeout_s: float = 10.0
     triage_timeout_s: float = 60.0
     triage_output: str | None = None
-    # Injected doubles (tests only; production leaves both None).
+    # Injected doubles (tests only; production leaves all None).
     source_override: Any | None = None
     model_override: Any | None = None
+    clef_transport: Any | None = None
     triage_scorer: (
         Callable[[Sequence[CollectedWork], "_RadarProfile"], "_TriageBatch"] | None
     ) = None
@@ -142,12 +143,7 @@ def _collect_live(request: PipelineRequest) -> list[CollectedWork]:
         collect,
     )
 
-    profile = default_profile(lookback_days=request.lookback_days)
-    override = clean_keyword_override(
-        list(request.keywords) if request.keywords else None
-    )
-    if override is not None:
-        profile = profile.model_copy(update={"keywords": override})
+    profile = _active_profile(request)
     plan = build_query_plan(profile, max_queries=MAX_QUERIES)
     if request.source_override is not None:
         return collect(
@@ -245,6 +241,36 @@ def _run_cached(request: PipelineRequest) -> PipelineResult:
     )
 
 
+def _check_batch_shape(batch: Any) -> None:
+    """Validate a screening batch shape before any FreeToken calls.
+
+    Malformed scorer output becomes a typed analysis error (exit 3), never
+    a raw AttributeError deep in selection or synthesis.
+    """
+    results = getattr(batch, "results", None)
+    if not isinstance(results, list):
+        raise PipelineAnalysisError(
+            "CLEF screening returned a malformed batch (no results list); "
+            "stopping before FreeToken synthesis with the last valid "
+            "snapshot preserved."
+        )
+    allowed = frozenset(
+        {"scored", "missing_abstract", "failed", "deadline", "oversized"})
+    for pos, result in enumerate(results):
+        work_id = getattr(result, "work_id", None)
+        status = getattr(result, "status", None)
+        if not isinstance(work_id, str) or not work_id:
+            raise PipelineAnalysisError(
+                f"CLEF screening returned a malformed result at index {pos} "
+                "(missing work_id); stopping before FreeToken synthesis."
+            )
+        if status not in allowed:
+            raise PipelineAnalysisError(
+                f"CLEF screening returned unknown status {status!r} for "
+                f"{work_id}; stopping before FreeToken synthesis."
+            )
+
+
 def _active_profile(request: PipelineRequest):
     """Discovery profile with the active CLI keyword override applied."""
     from radar.config.interests import RadarProfile
@@ -279,13 +305,15 @@ def _screen_full_pool(request: PipelineRequest, pool: list[CollectedWork],
         raise PipelineUsageError(str(exc)) from exc
     if request.triage_scorer is not None:
         try:
-            return request.triage_scorer(pool, profile)
+            batch = request.triage_scorer(pool, profile)
         except Exception as exc:
             raise PipelineAnalysisError(
                 f"CLEF screening failed ({type(exc).__name__}: {exc}); "
                 "stopping before FreeToken synthesis with the last valid "
                 "snapshot preserved."
             ) from exc
+        _check_batch_shape(batch)
+        return batch
     if not (request.clef_base_url or _os.environ.get("CLEF_BASE_URL", "").strip()):
         raise PipelineUsageError(
             "CLEF screening is the mandatory routing stage but no endpoint "
@@ -308,13 +336,16 @@ def _screen_full_pool(request: PipelineRequest, pool: list[CollectedWork],
             f"CLEF configuration failed ({type(exc).__name__}: {exc})."
         ) from exc
     try:
-        return screen_works(pool, profile, config=config)
+        batch = screen_works(pool, profile, config=config,
+                             transport=request.clef_transport)
     except Exception as exc:
         raise PipelineAnalysisError(
             f"CLEF screening failed ({type(exc).__name__}: {exc}); "
             "stopping before FreeToken synthesis with the last valid "
             "snapshot preserved."
         ) from exc
+    _check_batch_shape(batch)
+    return batch
 
 
 def _has_deadline(batch: Any) -> bool:
