@@ -214,6 +214,57 @@ research tools or PDF access; abstracts alone cannot establish quality,
 causality, global novelty, replication or deployment safety. Specialization
 adds inference cost/latency; metadata-only refreshes remain model-free.
 
+### Learning dossier (CORE slice)
+
+Final synthesis may return one primary learning dossier for the single most
+study-worthy paper (`schema/learning.py`: `LearningDossierDraft` with
+`paper_index`, `core_problem`, `reported_contribution`, `reasoning`,
+`significance` as interpretation, bounded `assumptions_limits`,
+zero to three `connections` each prefixed `Hypothesis:`, at most two typed `study_tasks`
+with `objective`/`success_criterion`/`missing_evidence`, and at most three
+`open_questions`; compact caps ~300-500 chars, `extra="forbid"`). Only the
+final synthesis uses `LearningRadarDraft` (a `RadarDraft` subclass holding at
+most one dossier); specialists still return plain `RadarDraft` exactly as
+before, and legacy opportunity-only drafts validate with an empty dossier
+list. Old stored reports read back with default empty `learning_dossiers`.
+
+All research-team stages (three specialists plus synthesis) see the same
+intact full normalized abstracts via opt-in `complete_abstracts=True` on the
+shared prompt builder (default `False` preserves truncated excerpts for old
+callers). Blocks are never tail-truncated: an oversized leading source
+honestly yields zero analyzed coverage. The synthesis prompt
+uses code-owned source-coverage labels and still treats complete abstracts as
+abstract-level evidence only: no fabricated theorems,
+proofs, equations, or full-text results. A grounded dossier is preferred over
+an invented opportunity; opportunities may be zero.
+
+Code attaches the dossier source deterministically (`EvidenceLink` plus
+code-owned `evidence_level="abstract"`, never model-written). Out-of-range or
+duplicate primary indices fail the synthesis validator for a bounded retry and
+are never silently dropped; `attach_evidence` raises on an invalid dossier
+source instead of filtering it, and rejects sources without a supplied abstract.
+SQLite `save_report` requires the source to belong to this run's pool, fall within
+its analyzed index range, and have a nonblank abstract in the immutable pool record.
+Falkor preflights dossier sources before graph deletion
+and projects grounded `LearningDossier` nodes
+(`origin="model_interpretation"`, `evidence_level="abstract"`) with
+`HAS_LEARNING_DOSSIER` (run -> dossier) and `ABOUT_PAPER` (dossier ->
+existing paper) edges only; no invented scientific ontology. Markdown leads with
+one grounded dossier section (hypotheses labeled, interpretation marked,
+abstract-level source linked); opportunity-only reports render unchanged.
+
+### Reopening saved reports (offline)
+
+`radar --reports` lists the latest 20 saved report IDs; `radar --report latest`
+or `radar --report RUN_ID` reopens one. Use `--storage-dir` for another existing
+library. These operations use a separate read-only SQLite connection: no
+discovery, model calls, graph process, schema changes, new run records or output
+files. Missing/corrupt/unsupported databases are preserved and fail safely.
+Old opportunity-only reports are marked as such rather than rewritten into
+unverified learning dossiers. These commands browse reports, not a full paper
+catalogue or web dashboard. Current dossiers remain abstract-based study seeds,
+not full-text lessons or evidence that the proposed tasks have been completed.
+
 ### Evidence boundary
 
 Model citation indices must be actual integers: booleans, numeric strings

@@ -185,9 +185,23 @@ class SQLiteStore:
         expected = {r[0] for r in self._db.execute("SELECT work_id FROM pool_papers WHERE run_id=?", (run_id,))}
         if any(link.openalex_id not in expected for opportunity in report.opportunities for link in opportunity.evidence_links):
             raise StorageError("Report evidence must belong to this run's stored pool.")
+        if any(resolved.source.openalex_id not in expected for resolved in report.learning_dossiers):
+            raise StorageError("Learning dossier source must belong to this run's stored pool.")
         row = self._db.execute("SELECT metadata FROM pools WHERE run_id=?", (run_id,)).fetchone()
         if row is None or not 0 <= selected <= len(expected):
             raise StorageError("Invalid stored report coverage.")
+        for resolved in report.learning_dossiers:
+            if not 0 <= resolved.source.index < selected:
+                raise StorageError("Learning dossier source must be in the analyzed index range.")
+            source = self._db.execute(
+                "SELECT payload FROM pool_papers WHERE run_id=? AND work_id=?",
+                (run_id, resolved.source.openalex_id),
+            ).fetchone()
+            try:
+                if source is None or not CollectedWork.model_validate_json(source[0]).abstract.strip():
+                    raise ValueError("Missing abstract")
+            except ValueError as exc:
+                raise StorageError("Learning dossier requires a valid abstract in this run's pool.") from exc
         metadata = json.loads(row[0])
         metadata['coverage'].update(llm_selected=selected, llm_analyzed=selected)
         with self._db:

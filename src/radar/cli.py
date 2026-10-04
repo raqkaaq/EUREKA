@@ -88,6 +88,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--rebuild-graph", action="store_true",
         help="Rebuild the Falkor graph from SQLite without discovery or model calls.",
     )
+    parser.add_argument("--reports", action="store_true",
+                        help="List the 20 most recent saved reports, read-only and without model calls.")
+    parser.add_argument("--report", metavar="RUN_ID", default=None,
+                        help="Reopen a saved report by run ID, or latest; no source/model/graph calls.")
     parser.add_argument(
         "--refresh-dir",
         default=None,
@@ -160,6 +164,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Parse args, run the pipeline, print its result, return its exit code."""
     args = build_parser().parse_args(argv)
+    if (args.reports or args.report is not None) and args.collect_only:
+        print("radar: error: Report browsing cannot be combined with --collect-only.", file=sys.stderr)
+        return 4
     directories = [path for path in (args.storage_dir, args.refresh_dir, args.triage_output) if path is not None]
     if len(set(directories)) > 1:
         print("radar: error: Choose a single database storage directory.", file=sys.stderr)
@@ -192,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
         storage_dir=storage_dir,
         from_database=args.from_db,
         rebuild_graph=args.rebuild_graph,
+        list_reports=args.reports,
+        report_id=args.report,
     )
     result = run(request)
     for note in result.stderr_notes:

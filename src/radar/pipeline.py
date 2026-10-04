@@ -81,6 +81,8 @@ class PipelineRequest:
     storage_dir: str | None = None
     from_database: bool = False
     rebuild_graph: bool = False
+    list_reports: bool = False
+    report_id: str | None = None
     # Injected doubles (tests only; production leaves all None).
     source_override: Any | None = None
     model_override: Any | None = None
@@ -113,6 +115,8 @@ def run(request: PipelineRequest) -> PipelineResult:
 
 
 def _execute(request: PipelineRequest) -> PipelineResult:
+    if request.list_reports or request.report_id is not None:
+        return _run_library(request)
     _validate_request(request)
     if request.storage_dir is not None:
         return _run_database(request)
@@ -124,6 +128,42 @@ def _execute(request: PipelineRequest) -> PipelineResult:
             )
         return _run_cached(request)
     return _run_live(request)
+
+
+def _run_library(request: PipelineRequest) -> PipelineResult:
+    """Browse saved scientific output without policy/model preflight or writers."""
+    from radar.output.markdown import render_markdown
+    from radar.storage.library import ReportLibrary
+    from radar.storage.sqlite import StorageError
+
+    if not request.storage_dir or not request.storage_dir.strip():
+        raise PipelineUsageError("Report browsing requires a storage directory.")
+    if request.list_reports and request.report_id is not None:
+        raise PipelineUsageError("Choose --reports or --report, not both.")
+    if request.from_database or request.rebuild_graph or request.from_snapshot is not None or request.refresh_dir or request.triage_output:
+        raise PipelineUsageError("Report browsing cannot be combined with collection/import/analysis/rebuild modes.")
+    if request.report_id is not None and (not request.report_id.strip() or len(request.report_id) > 128):
+        raise PipelineUsageError("Choose a valid report ID or latest.")
+    try:
+        with ReportLibrary(request.storage_dir) as library:
+            if request.list_reports:
+                lines = ["# Saved radar reports", ""]
+                for saved in library.recent():
+                    dossiers = len(getattr(saved.report, "learning_dossiers", []))
+                    label = f"{dossiers} learning dossier(s)" if dossiers else "legacy/opportunity-only report"
+                    status = "finished" if saved.exit_code == 0 else "run unfinished or failed; saved report retained"
+                    lines.append(f"- `{saved.run_id}` — {saved.started_at}; {label}; {status}")
+                if len(lines) == 2:
+                    lines.append("No reports saved yet.")
+                lines.extend(["", "Open one with `radar --report RUN_ID` (or `--report latest`)."])
+                return PipelineResult(0, "\n".join(lines))
+            saved = library.get(request.report_id or "latest")
+            header = f"Saved report `{saved.run_id}` — {saved.started_at}\n\n"
+            if saved.exit_code != 0:
+                header += "Note: the enclosing run did not finish successfully; this is its retained report.\n\n"
+            return PipelineResult(0, header + render_markdown(saved.report))
+    except StorageError as exc:
+        raise PipelineStorageError(str(exc)) from exc
 
 
 def _validate_request(request: PipelineRequest) -> None:
