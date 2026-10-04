@@ -9,13 +9,14 @@ pipeline result, and exit codes. All behavior lives behind the
 - ``uv run python -m radar`` collects, analyzes via the private-network Strata
   endpoint (PydanticAI only), and prints a Markdown report.
 
-Exit codes: 0 ok, 2 external-service (OpenAlex) failure, 3 analysis/report
-failure (including Strata), 4 usage/config error.
+Exit codes: 0 ok, 2 external-service (OpenAlex) failure, 3 analysis/report/storage
+failure (including Strata/Falkor), 4 usage/config error.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from radar.config.runtime import (
@@ -76,11 +77,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Strata model id override (default: STRATA_MODEL env or local /models).",
     )
     parser.add_argument(
+        "--storage-dir", default=None, metavar="PATH",
+        help="SQLite and local Falkor storage directory (default: RADAR_STORAGE_DIR or data/radar).",
+    )
+    parser.add_argument(
+        "--from-db", action="store_true",
+        help="Analyze/inspect the latest SQLite paper pool with zero OpenAlex calls.",
+    )
+    parser.add_argument(
+        "--rebuild-graph", action="store_true",
+        help="Rebuild the Falkor graph from SQLite without discovery or model calls.",
+    )
+    parser.add_argument(
         "--refresh-dir",
         default=None,
-        help="Persist the FULL normalized pool as one atomic metadata-only "
-        "snapshot (snapshot.json) in PATH, independent of Strata. "
-        "Combine with --collect-only for unattended refresh (no LLM).",
+        help="Deprecated alias for --storage-dir; persist the full pool in databases, not JSON.",
     )
     parser.add_argument(
         "--from-snapshot",
@@ -137,8 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--triage-output",
         default=None,
         metavar="PATH",
-        help="Write an atomic triage.json sidecar inside DIRECTORY PATH; "
-        "strict v1 metadata snapshots are never mutated.",
+        help="Deprecated storage-directory alias; screening is saved in SQLite, never a JSON sidecar.",
     )
     return parser
 
@@ -146,13 +156,24 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Parse args, run the pipeline, print its result, return its exit code."""
     args = build_parser().parse_args(argv)
+    directories = [path for path in (args.storage_dir, args.refresh_dir, args.triage_output) if path is not None]
+    if len(set(directories)) > 1:
+        print("radar: error: Choose a single database storage directory.", file=sys.stderr)
+        return 4
+    if args.from_snapshot is not None and args.refresh_dir is not None:
+        print("radar: error: --from-snapshot cannot be combined with --refresh-dir; use --storage-dir for import.",
+              file=sys.stderr)
+        return 4
+    storage_dir = directories[0] if directories else os.environ.get("RADAR_STORAGE_DIR", "data/radar")
+    if not storage_dir.strip():
+        print("radar: error: Storage directory must not be empty.", file=sys.stderr)
+        return 4
     request = PipelineRequest(
         mode="collect" if args.collect_only else "analyze",
         max_candidates=args.max_candidates,
         lookback_days=args.lookback_days,
         timeout_s=args.timeout,
         keywords=tuple(args.keywords) if args.keywords else None,
-        refresh_dir=args.refresh_dir,
         from_snapshot=args.from_snapshot,
         analysis_timeout_s=args.analysis_timeout,
         max_tokens=args.max_tokens,
@@ -163,7 +184,9 @@ def main(argv: list[str] | None = None) -> int:
         clef_model=args.clef_model,
         clef_timeout_s=args.clef_timeout,
         triage_timeout_s=args.triage_timeout,
-        triage_output=args.triage_output,
+        storage_dir=storage_dir,
+        from_database=args.from_db,
+        rebuild_graph=args.rebuild_graph,
     )
     result = run(request)
     for note in result.stderr_notes:

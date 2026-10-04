@@ -177,6 +177,7 @@ class TestCachedSnapshot(unittest.TestCase):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 code = _main(["--collect-only", "--from-snapshot", path,
+                              "--storage-dir", os.path.join(tmp, "databases"),
                               "--max-candidates", "1"])
             self.assertEqual(code, 0)
             shown = json.loads(buf.getvalue())
