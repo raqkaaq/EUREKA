@@ -55,9 +55,12 @@ src/radar/
     link_validation.py pure publisher-link / OpenAlex identity validation
     triage.py          CLEF shortlist policy (scored rank + unknown slot)
   storage/
-    snapshots.py       full-pool snapshots, deltas, coverage, strict v1
-                       validation, atomic writes, locking
-    triage.py          atomic triage sidecar (never mutates snapshots)
+    sqlite.py          authoritative pools, screening, reports and run history;
+                       package-owned schema and directory writer lock
+    graph_projection.py rebuild coordination and persisted graph readiness
+    falkor.py          owned local engine lifecycle, graph mapping/read queries
+    snapshots.py       strict legacy v1 import and programmatic compatibility
+    triage.py          legacy programmatic sidecar compatibility (not CLI output)
   output/
     markdown.py        Markdown report rendering only
     json.py            JSON output shaping only (collect-only envelopes)
@@ -105,7 +108,7 @@ algorithm or inline instruction fallback.
   the same rendered dictionaries and unchanged Pydantic answer schema.
   `rubric_version: clef-triage-v2` identifies the expanded guidance; both
   backends record its canonical configuration SHA-256 as `rubric_hash` in
-  triage sidecars. `version: 1` is separately the configuration schema version.
+  stored screening records. `version: 1` is separately the configuration schema version.
 - `prompts/paper_triage.yaml`: Qwen screening-agent instructions.
 - `prompts/opportunity_analysis.yaml`: synthesis-agent instructions,
   `candidate_header`, and `task_template`. Task placeholders are
@@ -262,28 +265,69 @@ rules, not arbitrary dynamic imports or transitive runtime reachability.
 
 ```sh
 # Collect-only: bounded real OpenAlex candidates as JSON (no LLM).
-uv run --env-file .env python -m radar --collect-only --max-candidates 8
+uv run --env-file .env python -B -m radar --collect-only --max-candidates 8
 
 # Full run: collect + SystemOne screening + local-model analysis as Markdown
 # (requires working CLEF or the configured Strata Qwen chat service).
-uv run --env-file .env python -m radar --max-candidates 8
+uv run --env-file .env python -B -m radar --max-candidates 8
 
-# Unattended metadata refresh (full pool snapshot, no LLM).
-uv run --env-file .env python -m radar --collect-only --refresh-dir data/radar
+# Unattended metadata refresh (full pool in SQLite and Falkor, no LLM).
+uv run --env-file .env python -B -m radar --collect-only --storage-dir data/radar
 
 # Cached synthesis: zero OpenAlex calls (SystemOne screening still mandatory,
 # needs a working routing endpoint plus Strata for synthesis).
-uv run --env-file .env python -m radar --from-snapshot data/radar/snapshot.json --max-candidates 2
+uv run --env-file .env python -B -m radar --from-db --max-candidates 2
 
-# Analysis with CLEF routing (CLEF server user-owned, not running yet).
-# Set CLEF_BASE_URL to your LAN CLEF server; no endpoint is ever guessed.
-uv run --env-file .env python -m radar --max-candidates 8 \
-  --triage-output data/radar/triage
+# Import a legacy snapshot read-only (no discovery or inference).
+uv run --env-file .env python -B -m radar --collect-only \
+  --from-snapshot data/radar/snapshot.json --storage-dir data/radar
+
+# Repair the graph from authoritative SQLite (no discovery or inference).
+uv run --env-file .env python -B -m radar --rebuild-graph --storage-dir data/radar
 
 # Options.
-uv run --env-file .env python -m radar --help
-uv run --env-file .env python -m radar --keywords "graph neural networks" --lookback-days 30
+uv run --env-file .env python -B -m radar --help
+uv run --env-file .env python -B -m radar --keywords "graph neural networks" --lookback-days 30
 ```
+
+## Self-contained database storage
+
+Every normal CLI run stores the entire bounded discovery pool, not just the
+displayed shortlist, in `radar.sqlite3`. Screening records include the typed
+results and backend/model/rubric provenance. Valid final reports and their
+evidence links are stored there too; unsuccessful runs retain their available
+pool/screening records and a failure category, not raw model error bodies.
+Immutable pool rows preserve each run even when a paper's latest metadata changes.
+Use Python's `-B` flag as shown above (or `PYTHONDONTWRITEBYTECODE=1`) to
+prevent the interpreter from creating its own bytecode cache files.
+
+SQLite is authoritative. Falkor is a rebuildable projection in `graph.rdb`:
+`Paper` nodes, report `Run` nodes, hypothesis `Opportunity` nodes, and
+`HAS_OPPORTUNITY`/`SUPPORTED_BY` links grounded in existing report evidence.
+These are not paper-to-paper citation relationships or independently verified
+discoveries. No additional scientific source or inference is used to build it.
+Graph failure leaves SQLite intact and readiness explicitly pending; rerun
+`--rebuild-graph`. Readiness is published only after graph persistence succeeds.
+
+The storage directory defaults to `RADAR_STORAGE_DIR` or `data/radar` relative
+to the current directory; pass an absolute `--storage-dir` when invoking Radar
+elsewhere. It cannot be under `/tmp`. A directory lock permits one writer at a
+time without a lockfile. SQLite may create database-managed journal files during
+transactions. Existing legacy snapshots are never overwritten or removed.
+
+Falkor's bundled Linux engine starts on an authenticated, ephemeral loopback
+port for the storage operation and is stopped afterward. Startup arguments and
+schema live in `src/radar`; Radar creates no disk config, PID, socket, log,
+report, sidecar, extracted-text or diagnostic files. Database-managed storage
+and any future downloaded PDFs are the only permitted application outputs.
+Falkor's Python dependency is pinned; its native engine must be supported by
+the host. It does not start or alter your Strata/CLEF inference services.
+
+`--refresh-dir` and `--triage-output` are deprecated aliases for the database
+directory, not JSON writers. Conflicting directory aliases are rejected.
+The programmatic `PipelineRequest` legacy snapshot APIs remain compatible;
+the CLI always opts into database storage. Collection JSON and analysis Markdown
+are printed to stdout, not saved as extra files.
 
 ## Screening (mandatory routing; CLEF preferred, Qwen chat fallback)
 
@@ -315,9 +359,9 @@ maximum 300 s). A failed CLEF stage can therefore be followed by one
 separately bounded Qwen stage. A missing fallback configuration is exit 4;
 failed/malformed/deadline Qwen screening is exit 3 and blocks synthesis,
 preserving the last valid snapshot. Source/metadata refresh is independent.
-Missing abstracts and oversized texts stay explicit unknowns. Atomic
-`--triage-output` JSON sidecars record backend/model/rubric and fallback
-reason; strict v1 source snapshots are never mutated. `--collect-only`
+Missing abstracts and oversized texts stay explicit unknowns. SQLite
+screening records retain backend/model/rubric and fallback reason;
+strict v1 source snapshots are never mutated. `--collect-only`
 and an empty pool call no routing or synthesis model. No servers are launched.
 
 Earlier probing of FreeToken `/v1/systemone` was based on an incorrect
@@ -325,7 +369,7 @@ transport interpretation. Strata also exposes chat; the same
 screening input and Pydantic answer contract are carried over that endpoint.
 
 Exit codes: 0 ok, 2 external-service (OpenAlex) failure, 3 analysis/report
-failure (including Strata), 4 usage/config error.
+or storage failure (including Strata/Falkor), 4 usage/config error.
 
 ## Configuration (env)
 
@@ -338,6 +382,7 @@ failure (including Strata), 4 usage/config error.
 | `OPENALEX_API_KEY` | Optional personal OpenAlex budget | unset (shared anonymous pool) |
 | `CLEF_BASE_URL` | Preferred user-owned LAN CLEF endpoint | unset (Qwen fallback) |
 | `CLEF_MODEL` | CLEF model id | `clef-flash` |
+| `RADAR_STORAGE_DIR` | SQLite/Falkor database directory | `data/radar` |
 
 Loopback, RFC 1918, IPv6 ULA, and RFC 6598 endpoints are allowed. Public,
 link-local, multicast, reserved, and unspecified destinations are refused;

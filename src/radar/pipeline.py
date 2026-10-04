@@ -9,6 +9,7 @@ errors map to CLI exit codes). No printing, no argparse, no prompts.
 from __future__ import annotations
 
 import os as _os
+import sqlite3 as _sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
     from pydantic_ai.models import Model as _Model
     from radar.config.interests import RadarProfile as _RadarProfile
     from radar.schema.triage import TriageBatch as _TriageBatch
+    from radar.storage.sqlite import SQLiteStore as _SQLiteStore
 
 
 class PipelineUsageError(ValueError):
@@ -75,6 +77,9 @@ class PipelineRequest:
     clef_timeout_s: float = 10.0
     triage_timeout_s: float = 60.0
     triage_output: str | None = None
+    storage_dir: str | None = None
+    from_database: bool = False
+    rebuild_graph: bool = False
     # Injected doubles (tests only; production leaves all None).
     source_override: Any | None = None
     model_override: Any | None = None
@@ -108,6 +113,8 @@ def run(request: PipelineRequest) -> PipelineResult:
 
 def _execute(request: PipelineRequest) -> PipelineResult:
     _validate_request(request)
+    if request.storage_dir is not None:
+        return _run_database(request)
     if request.from_snapshot is not None:
         if request.refresh_dir is not None:
             raise PipelineUsageError(
@@ -119,6 +126,14 @@ def _execute(request: PipelineRequest) -> PipelineResult:
 
 
 def _validate_request(request: PipelineRequest) -> None:
+    if (request.from_database or request.rebuild_graph) and not request.storage_dir:
+        raise PipelineUsageError("Database modes require a storage directory.")
+    if request.from_snapshot is not None and (request.from_database or request.rebuild_graph):
+        raise PipelineUsageError("Choose only one cached/import/rebuild source.")
+    if request.from_database and request.rebuild_graph:
+        raise PipelineUsageError("--from-db cannot be combined with --rebuild-graph.")
+    if request.storage_dir is not None and (request.refresh_dir or request.triage_output):
+        raise PipelineUsageError("Database persistence cannot also write legacy JSON sidecars.")
     if not (1 <= request.max_candidates <= MAX_MAX_CANDIDATES):
         raise PipelineUsageError(
             f"--max-candidates must be within 1..{MAX_MAX_CANDIDATES}"
@@ -138,15 +153,74 @@ def _validate_request(request: PipelineRequest) -> None:
     from radar.agent.research_team import validate_research_prompts
 
     try:
-        if request.from_snapshot is None:
+        if request.from_snapshot is None and not (request.from_database or request.rebuild_graph):
             search_config()
-        if request.mode == "analyze":
+        if request.mode == "analyze" and not request.rebuild_graph:
             screening_questions()
             paper_triage_prompt()
             opportunity_analysis_prompt()
             validate_research_prompts()
     except ValueError as exc:
         raise PipelineUsageError(str(exc)) from exc
+
+
+def _run_database(request: PipelineRequest) -> PipelineResult:
+    """All normal CLI storage, with legacy JSON permitted only as read-only input."""
+    from radar.output import json as _out_json
+    from radar.output import markdown as _out_md
+    from radar.storage.graph_projection import rebuild_graph
+    from radar.storage.sqlite import SQLiteStore, StorageError
+    from radar.storage.snapshots import RefreshError, load_snapshot
+
+    # Reject bad imports before opening/initializing any database or calling a model.
+    imported = None
+    if request.from_snapshot is not None:
+        if not _os.path.isfile(request.from_snapshot):
+            raise PipelineUsageError(f"snapshot not found: {request.from_snapshot}")
+        try:
+            imported = load_snapshot(request.from_snapshot)
+        except RefreshError as exc:
+            raise PipelineStorageError("Invalid legacy snapshot; no database or model was touched.") from exc
+    try:
+        with SQLiteStore(str(request.storage_dir)) as store:
+            source = "legacy_snapshot" if imported is not None else "SQLite" if (request.from_database or request.rebuild_graph) else "OpenAlex"
+            run_id = store.begin_run("rebuild" if request.rebuild_graph else request.mode, source)
+            try:
+                if request.rebuild_graph:
+                    rebuild_graph(store)
+                    store.finish_run(run_id, 0)
+                    return PipelineResult(0, _out_json.refresh_envelope({
+                        "database": str(store.path), "run_id": run_id, "graph": store.graph_state()}))
+                notes: tuple[str, ...] = ()
+                collected_at = None
+                if imported is not None or request.from_database:
+                    pool, metadata = imported if imported is not None else store.latest_pool()
+                    collected_at = str(metadata['collected_at_utc'])
+                    notes = (_out_md.staleness_note(collected_at),)
+                else:
+                    pool = _ranking.rank_works(_wrap_collection(request), _keywords(request))
+                summary = store.save_pool(run_id, pool, collected_at=collected_at)
+                if request.mode == "collect":
+                    selected = _ranking.select_topn(pool, request.max_candidates)
+                    result = PipelineResult(0, "", notes)
+                else:
+                    result = _analyze_pool(request, pool_full=pool, refresh_collected_at=None,
+                                           prefix_notes=notes, storage=store, stored_run=run_id)
+                rebuild_graph(store)
+                store.finish_run(run_id, result.exit_code)
+                if request.mode == "collect":
+                    summary.update(selected=len(selected), works=[_out_json.work_to_json(w) for w in selected],
+                                   graph=store.graph_state())
+                    return PipelineResult(0, _out_json.refresh_envelope(summary), result.stderr_notes)
+                return PipelineResult(result.exit_code, result.stdout, result.stderr_notes + (
+                    f"storage: SQLite run={run_id}; Falkor projection ready",))
+            except (PipelineUsageError, PipelineSourceError, PipelineAnalysisError, StorageError, _sqlite3.Error) as exc:
+                code = 4 if isinstance(exc, PipelineUsageError) else 2 if isinstance(exc, PipelineSourceError) else 3
+                store.finish_run(run_id, code, type(exc).__name__)
+                raise
+    except (StorageError, _sqlite3.Error) as exc:
+        message = str(exc) if isinstance(exc, StorageError) else f"Database operation failed ({type(exc).__name__})."
+        raise PipelineStorageError(message) from exc
 
 
 def _keywords(request: PipelineRequest) -> list[str]:
@@ -386,6 +460,8 @@ def _analyze_pool(
     pool_full: list[CollectedWork],
     refresh_collected_at: str | None,
     prefix_notes: tuple[str, ...] = (),
+    storage: "_SQLiteStore | None" = None,
+    stored_run: str | None = None,
 ) -> PipelineResult:
     from radar.agent import research_team as _team
     from radar.output import markdown as _out_md
@@ -400,6 +476,8 @@ def _analyze_pool(
                               tuple(notes))
     profile = _active_profile(request)
     batch = _screen_full_pool(request, pool_full, profile)
+    if storage is not None and stored_run is not None:
+        storage.save_triage(stored_run, batch)
     summary = _out_triage.summarize_batch(batch)
     if request.triage_output:
         try:
@@ -458,6 +536,8 @@ def _analyze_pool(
         raise PipelineAnalysisError(
             f"Report generation failed ({type(exc).__name__}: {exc})."
         ) from exc
+    if storage is not None and stored_run is not None:
+        storage.save_report(stored_run, report, len(included))
     notes.append(_out_triage.triage_coverage_line(
         pool_total=len(pool_full), summary=summary,
         selected=len(included), opportunities=len(draft.opportunities)))
