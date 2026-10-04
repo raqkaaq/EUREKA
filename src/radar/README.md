@@ -217,6 +217,14 @@ quality, server compatibility or a successful live research run. As of
 pending replacement details. Existing provider configuration is retained,
 not silently repointed or migrated to an unchosen service.
 
+`tests/radar/test_architecture.py` resolves the actual imported radar package
+and scans nested application modules, refusing empty scans. It checks static
+imports (including relative and root-package imports) using Python's AST,
+so docstrings/comments mentioning another component are not dependency edges.
+Its leaf-import subprocess uses that package's parent on `PYTHONPATH` and
+blocks HTTP/LLM dependencies. These guards check the stated direct-import
+rules, not arbitrary dynamic imports or transitive runtime reachability.
+
 ## Source vs provider vs agent
 
 - **Source** (`source/openalex.py`) talks to the outside scholarly world:
