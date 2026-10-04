@@ -31,7 +31,18 @@ def _profile() -> RadarProfile:
     )
 
 
-def _answers(relevance: object, cross: object, model: str = "clef-flash") -> dict:
+def _answers(importance: object, cross: object, model: str = "clef-flash") -> dict:
+    return {
+        "model": model,
+        "answers": {
+            "research_importance": {"type": "noul", "noul": importance},
+            "cross_domain_potential": {"type": "noul", "noul": cross},
+        },
+        "usage": {"input_tokens": 100, "output_tokens": 2},
+    }
+
+
+def _legacy_answers(relevance: object, cross: object, model: str = "clef-flash") -> dict:
     return {
         "model": model,
         "answers": {
@@ -43,6 +54,26 @@ def _answers(relevance: object, cross: object, model: str = "clef-flash") -> dic
 
 
 class TestTriageSchema(unittest.TestCase):
+    def test_batches_cannot_mix_or_mislabel_score_families(self):
+        from pydantic import ValidationError
+        from radar.schema.triage import TriageBatch, TriageResult
+
+        legacy = TriageResult(work_id="W1", status="scored",
+                              ai_ml_relevance=0.8, cross_domain_potential=0.9)
+        importance = TriageResult(work_id="W2", status="scored",
+                                  research_importance=0.6, cross_domain_potential=0.1)
+        for rubric, rows in (
+            ("clef-triage-v2", [legacy, importance]),
+            ("clef-triage-v2", [importance]),
+            ("custom-legacy", [legacy, importance]),
+            ("custom-legacy", [importance]),
+            ("clef-importance-v2", [importance]),
+            ("clef-importance-v2", [TriageResult(work_id="W1", status="missing_abstract")]),
+        ):
+            with self.subTest(rubric=rubric, count=len(rows)):
+                with self.assertRaises(ValidationError):
+                    TriageBatch(model_id="test", rubric_version=rubric, results=rows)
+
     def test_valid_result_and_batch(self):
         from radar.schema.triage import TriageBatch, TriageResult
 
@@ -223,7 +254,7 @@ class TestScreenWorks(unittest.TestCase):
             self.assertNotIn("chat/completions", lowered)
             self.assertNotIn("tools", lowered)
             self.assertEqual(set(body["questions"]),
-                             {"ai_ml_relevance", "cross_domain_potential"})
+                             {"research_importance", "cross_domain_potential"})
             self.assertEqual(body["model"], "clef-flash")
             return httpx.Response(200, json=_answers(0.8, 0.3))
 
@@ -231,9 +262,10 @@ class TestScreenWorks(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         (res,) = batch.results
         self.assertEqual(res.status, "scored")
-        self.assertEqual(res.ai_ml_relevance, 0.8)
+        self.assertEqual(res.research_importance, 0.8)
+        self.assertIsNone(res.ai_ml_relevance)
         self.assertEqual(batch.model_id, "clef-flash")
-        self.assertEqual(batch.rubric_version, "clef-triage-v2")
+        self.assertEqual(batch.rubric_version, "clef-importance-v1")
         self.assertEqual(len(batch.rubric_hash), 64)
 
     def test_missing_abstract_makes_no_call(self):
@@ -270,13 +302,50 @@ class TestScreenWorks(unittest.TestCase):
             return httpx.Response(
                 200,
                 content=b'{"model":"clef-flash","answers":'
-                b'{"ai_ml_relevance":{"type":"noul","noul":NaN},'
+                b'{"research_importance":{"type":"noul","noul":NaN},'
                 b'"cross_domain_potential":{"type":"noul","noul":0.5}}}',
                 headers={"Content-Type": "application/json"},
             )
 
         batch, _ = self._screen([_work("W1")], handler)
         self.assertEqual(batch.results[0].status, "failed")
+
+    def test_old_only_wire_answers_fail_as_importance(self):
+        # Current wire model allows only the new answer name: legacy
+        # ai_ml_relevance payloads must not validate as importance.
+        def handler(request):
+            return httpx.Response(200, json=_legacy_answers(0.8, 0.3))
+
+        batch, _ = self._screen([_work("W1")], handler)
+        self.assertEqual(batch.results[0].status, "failed")
+
+    def test_importance_batch_rejects_legacy_primary_results(self):
+        from pydantic import ValidationError
+
+        from radar.schema.triage import TriageBatch, TriageResult
+
+        with self.assertRaises(ValidationError):
+            TriageBatch(
+                model_id="clef-flash", rubric_version="clef-importance-v1",
+                results=[TriageResult(
+                    work_id="W1", status="scored",
+                    ai_ml_relevance=0.9, cross_domain_potential=0.2)],
+            )
+
+    def test_scored_rejects_mixed_primary_and_bad_probabilities(self):
+        from pydantic import ValidationError
+
+        from radar.schema.triage import TriageResult
+
+        with self.assertRaises(ValidationError):
+            TriageResult(work_id="W1", status="scored",
+                         ai_ml_relevance=0.5, research_importance=0.5,
+                         cross_domain_potential=0.5)
+        for bad in (True, "0.9", float("nan"), float("inf"), 1.5, -0.1):
+            with self.assertRaises(ValidationError, msg=f"{bad!r}"):
+                TriageResult(work_id="W1", status="scored",
+                             research_importance=bad,
+                             cross_domain_potential=0.5)
 
     def test_missing_question_and_model_mismatch_fail(self):
         def handler_missing(request):

@@ -120,14 +120,30 @@ algorithm or inline instruction fallback.
   `keyword` because those templates never performed embedding search.
 - `config/qwen_screening.yaml`: immutable typed fallback batch/concurrency
   and timeout settings. It changes transport scheduling, not System1 questions.
-- `prompts/screening_questions.yaml`: the fixed two named questions, their
-  `type: noul`, instruction templates and criteria. `{keywords}`/`{domains}`
-  use the existing screening profile formatting. Quote the YAML keys
-  `"true"`/`"false"` so they remain strings. Native CLEF and Qwen chat share
-  the same rendered dictionaries and unchanged Pydantic answer schema.
-  `rubric_version: clef-triage-v2` identifies the expanded guidance; both
-  backends record its canonical configuration SHA-256 as `rubric_hash` in
-  stored screening records. `version: 1` is separately the configuration schema version.
+- `prompts/screening_questions.yaml`: the fixed two named questions
+  (`research_importance`, `cross_domain_potential`), their `type: noul`,
+  instruction templates and criteria. `{keywords}`/`{domains}` use the
+  existing screening profile formatting. Quote the YAML keys `"true"`/`"false"`
+  so they remain strings. Native CLEF and Qwen chat share the same rendered
+  dictionaries and the same Pydantic `SystemOneAnswers` schema. Primary
+  `research_importance` asks whether the abstract/metadata supports
+  consequentially important, scientifically substantive evidence or advanced
+  postgraduate learning payoff within broad AI/ML plus
+  behavioral/economic/method transfer (foundational, negative/replication,
+  mechanistic, boundary-condition, identification/incentive findings), not term
+  relevance, popularity, hype, or citation counts; it distinguishes reported
+  evidence from proposed transfer, treats missing detail as uncertainty rather
+  than proof of low importance, and infers no global novelty or full-text validation.
+  Secondary `cross_domain_potential` requires a grounded bridge with
+  consequential payoff, not verbal analogy. Prompt guidance discourages score
+  saturation; Qwen probabilities remain uncalibrated prompted estimates, not
+  verified importance measurements. `rubric_version:
+  clef-importance-v1` identifies the importance guidance; both backends record
+  its canonical configuration SHA-256 as `rubric_hash` in stored screening
+  records. `version: 1` is separately the configuration schema version.
+  Historical `clef-triage-v1/v2` batches with legacy `ai_ml_relevance` remain
+  readable in SQLite/JSON history with their old max-probability plus one
+  reserved unknown-slot semantics; no migration or rewrite is performed.
 - `prompts/paper_triage.yaml`: Qwen screening-agent instructions.
 - `prompts/opportunity_analysis.yaml`: synthesis-agent instructions,
   `candidate_header`, and `task_template`. Task placeholders are
@@ -271,8 +287,13 @@ rules, not arbitrary dynamic imports or transitive runtime reachability.
   *what* gets analyzed: the provider screens every collected paper over
   native HTTPX CLEF/SystemOne calls or PydanticAI Qwen chat calls (typed
   results, deadlines, bounded concurrency), and
-  the pure shortlist policy ranks scored works with one reserved unknown
-  slot (only when unknowns exist and the shortlist holds two or more).
+  the pure shortlist policy for current `clef-importance-v1` ranks by primary
+  `research_importance` DESC, then `cross_domain_potential` DESC, then stable
+  work ID, requiring `research_importance >= 0.5` with no unknown reservation
+  or backfill (unknowns stay recorded and unassessed for later investigation;
+  no scores means no investigation calls and an honest note). Historical and
+  legacy batches keep the old maximum-probability rank with one reserved
+  unknown slot (only when unknowns exist and the shortlist holds two or more).
   This is decision routing; the synthesis agent below does the thinking.
   CLEF is preferred. If absent or unsuccessful, the Qwen endpoint screens
   the entire original pool through the existing Strata chat endpoint.

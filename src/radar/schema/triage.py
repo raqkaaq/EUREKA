@@ -2,8 +2,12 @@
 
 CLEF/SystemOne per-paper screening outcomes. Probabilities are strict
 0..1 floats: bools, strings, NaN/infinities, and out-of-range values are
-rejected. A ``scored`` result carries both probabilities; every other
-status carries none, so unknown works stay explicitly unknown.
+rejected. A ``scored`` result carries exactly one primary family
+(legacy ``ai_ml_relevance`` or current ``research_importance``) plus
+``cross_domain_potential``; every other status carries none, so unknown
+works stay explicitly unknown. Legacy ``ai_ml_relevance`` stays readable
+for old database results; current ``clef-importance-v1`` batches must not
+carry it.
 """
 
 from __future__ import annotations
@@ -13,6 +17,8 @@ from enum import Enum
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+IMPORTANCE_RUBRIC_VERSION = "clef-importance-v1"
 
 
 def _probability(value: object) -> object:
@@ -49,11 +55,13 @@ class TriageResult(BaseModel):
     work_id: str = Field(min_length=1, max_length=500)
     status: TriageStatus
     ai_ml_relevance: float | None = None
+    research_importance: float | None = None
     cross_domain_potential: float | None = None
     failure_kind: ScreeningFailureKind | None = None
 
     @field_validator(
-        "ai_ml_relevance", "cross_domain_potential", mode="before"
+        "ai_ml_relevance", "research_importance", "cross_domain_potential",
+        mode="before",
     )
     @classmethod
     def _strict_probability(cls, value: object) -> object:
@@ -61,11 +69,24 @@ class TriageResult(BaseModel):
 
     @model_validator(mode="after")
     def _status_probability_agreement(self) -> "TriageResult":
-        probs = (self.ai_ml_relevance, self.cross_domain_potential)
+        legacy = self.ai_ml_relevance is not None
+        current = self.research_importance is not None
         if self.status == "scored":
-            if any(p is None for p in probs):
+            if (int(legacy) + int(current)) != 1:
+                raise ValueError(
+                    "scored results require exactly one primary family "
+                    "(ai_ml_relevance xor research_importance)"
+                )
+            if self.cross_domain_potential is None:
                 raise ValueError("scored results require both probabilities")
-        elif any(p is not None for p in probs):
+        elif any(
+            p is not None
+            for p in (
+                self.ai_ml_relevance,
+                self.research_importance,
+                self.cross_domain_potential,
+            )
+        ):
             raise ValueError(f"{self.status} results must not carry probabilities")
         if self.status in ("scored", "missing_abstract", "oversized"):
             if self.failure_kind is not None:
@@ -119,6 +140,21 @@ class TriageBatch(BaseModel):
     ] | None = None
     results: list[TriageResult] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _rubric_primary_agreement(self) -> "TriageBatch":
+        if self.rubric_version.startswith("clef-importance-") and self.rubric_version != IMPORTANCE_RUBRIC_VERSION:
+            raise ValueError("unsupported importance rubric")
+        families = {
+            "importance" if result.research_importance is not None else "relevance"
+            for result in self.results if result.status == "scored"
+        }
+        if len(families) > 1:
+            raise ValueError("screening batches cannot mix score families")
+        expected = "importance" if self.rubric_version == IMPORTANCE_RUBRIC_VERSION else "relevance"
+        if families and families != {expected}:
+            raise ValueError("screening score family does not match the rubric")
+        return self
+
 
 class NoulAnswer(BaseModel):
     """Shared strict yes/no probability answer, regardless of transport."""
@@ -133,7 +169,11 @@ class NoulAnswer(BaseModel):
 
 
 class SystemOneAnswers(BaseModel):
-    ai_ml_relevance: NoulAnswer
+    """Current importance answers only; old names are rejected, not aliased."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    research_importance: NoulAnswer
     cross_domain_potential: NoulAnswer
 
 
@@ -146,7 +186,7 @@ class SystemOneResponse(BaseModel):
     def to_result(self, work_id: str) -> TriageResult:
         return TriageResult(
             work_id=work_id, status="scored",
-            ai_ml_relevance=self.answers.ai_ml_relevance.noul,
+            research_importance=self.answers.research_importance.noul,
             cross_domain_potential=self.answers.cross_domain_potential.noul)
 
 

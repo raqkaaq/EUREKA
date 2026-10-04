@@ -109,6 +109,31 @@ def _failed_routing_model() -> FunctionModel:
 
 
 class TestClefConfigRequired(unittest.TestCase):
+    def test_no_qualifying_importance_skips_investigation_with_honest_reason(self):
+        from radar.schema.triage import TriageBatch, TriageResult
+
+        calls = []
+
+        def score(pool, profile):
+            return TriageBatch(model_id="test", rubric_version="clef-importance-v1",
+                               results=[TriageResult(work_id=w.openalex_id, status="scored",
+                                                     research_importance=0.49,
+                                                     cross_domain_potential=0.99) for w in pool])
+
+        def forbidden(messages, info):
+            calls.append(True)
+            raise AssertionError("No investigation should run below the importance threshold")
+
+        result = _run_pipeline(PipelineRequest(
+            mode="analyze", max_candidates=2,
+            source_override=DictTransport(_pages(2)), triage_scorer=score,
+            model_override=FunctionModel(forbidden)))
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(calls, [])
+        self.assertIn("importance threshold", result.stdout)
+        self.assertNotIn("prompt budget", result.stdout)
+        self.assertIn("selected=0", " ".join(result.stderr_notes))
+
     def test_both_endpoints_unconfigured_is_exit4_with_zero_model_calls(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             result = _run_pipeline(PipelineRequest(

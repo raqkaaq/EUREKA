@@ -36,7 +36,8 @@ MAX_PAYLOAD_BYTES = 64 * 1024
 #: Concurrency ceiling: bounded thread pool, never more.
 MAX_CONCURRENCY = 8
 
-AI_ML_QUESTION = "ai_ml_relevance"
+AI_ML_QUESTION = "research_importance"
+RESEARCH_IMPORTANCE_QUESTION = "research_importance"
 CROSS_DOMAIN_QUESTION = "cross_domain_potential"
 
 
