@@ -20,8 +20,10 @@ src/radar/
   config/
     interests.py       interest profile (AI/ML core + behavioral/economic lenses)
     runtime.py         all numeric bounds (service-free)
-    searches.yaml      editable baseline search definitions
+    searches.yaml      research questions and historical/frontier/challenge retrieval
     searches.py        profile/template expansion, bounded query plan
+    qwen_screening.yaml  small-batch fallback concurrency and deadline policy
+    triage.py          packaged, typed Qwen screening policy loader
     yaml.py            safe YAML parsing and typed package-resource loading
     triage_questions.py identical routing questions/criteria for both endpoints
   prompts/
@@ -80,27 +82,44 @@ framework.
 
 ## Editable searches, questions and prompts
 
-YAML is the source of truth for baseline search policy, shared screening
+YAML is the source of truth for research-driven search policy, shared screening
 questions, and the agents' instructions. Python owns expansion, transport,
 output schemas and hard safety limits; there is no second hardcoded search
 algorithm or inline instruction fallback.
 
-- `config/searches.yaml`: ordered definitions with `name`, `kind`
-  (`semantic` = keyword relevance ranking, not embedding search; `recent` =
-  newest first), `terms`, optional `scope`, `repeat`, `limit` and `per_page`.
-  Defaults separately cover broad AI/ML, newest AI/ML, behavioral/economic
-  intersections, generative-AI human/economic effects, methods/evaluation and
-  causal/strategic mechanisms. Every request shares the active
-  lookback filter. The planner lives in `config/searches.py`, replacing the
-  old planner in the OpenAlex adapter.
-- Search `{keywords}` and `{domains}` expand to OR-separated quoted profile
-  phrases. `{keyword}` is available only with `repeat: keywords`; `limit`
-  bounds that expansion. `scope: cross_domain` skips a definition when the
-  profile has no domains. Profile terms are quoted/escaped as literal phrases.
-  Identical requests are deduplicated (relevance/recent remain distinct), and
-  expansion stops at the code-owned six-request cap. Overlong rendered queries
-  are rejected, not silently truncated; split the configured query or shorten
-  the profile instead. CLI `--keywords` and `--lookback-days` still apply.
+- `config/searches.yaml` v2: a learning agenda, with a stable question ID,
+  explanatory research question, scope and three retrieval roles per question.
+  **Foundation** retrieves historical context; **frontier** retrieves recent
+  work; **counterevidence** seeks failure modes and competing explanations.
+  A role records retrieval intent, not a verified characterization of a paper.
+  Default questions cover generalization, uncertainty/causal identification,
+  strategic objectives/incentives, and measurement/human-AI effects.
+  Search defines the pool; System1 decides what merits investigation; Qwen
+  investigates the selected evidence cohort and composes the synthesis.
+- `semantic` sends natural-language questions through OpenAlex's documented
+  `search.semantic`; `keyword` sends Boolean expressions through `search`;
+  `recent` is newest-first keyword retrieval. Semantic searches are limited
+  to 2000 characters and paced at one request/second. Keyword expressions
+  retain the 300-character bound. Limits are checked, never silently truncated.
+  Only frontier branches use `--lookback-days`; historical branches have no
+  freshness filter. The live semantic API rejects day-level filters: use its
+  supported publication-year range, then enforce the exact lower date locally.
+  Semantic frontier rows with unknown/invalid dates cannot establish freshness
+  and are skipped; historical branches can still discover those works. This
+  may underfill a frontier page; no unseen pages are implied. Results retain `(question_id, role)` provenance through
+  deduplication and SQLite persistence. No new paper source is introduced.
+- `{keywords}` and `{domains}` are plain comma-separated phrases in semantic
+  questions and escaped/quoted OR expressions in keyword queries. An empty
+  domain profile skips only cross-domain questions. The planner interleaves
+  questions by role, capped at 12 requests. Defaults request 15 rows per
+  branch (at most 180 before dedup), below the global 200-work cap so later
+  branches cannot be crowded out by earlier ones. Custom larger pages can
+  reach that global cap early. CLI `--keywords` overrides profile terms.
+- Legacy v1 flat `queries` remain readable with their original six-request
+  cap and shared date window; their former `semantic` label is normalized to
+  `keyword` because those templates never performed embedding search.
+- `config/qwen_screening.yaml`: immutable typed fallback batch/concurrency
+  and timeout settings. It changes transport scheduling, not System1 questions.
 - `prompts/screening_questions.yaml`: the fixed two named questions, their
   `type: noul`, instruction templates and criteria. `{keywords}`/`{domains}`
   use the existing screening profile formatting. Quote the YAML keys
@@ -117,7 +136,7 @@ algorithm or inline instruction fallback.
   interface, separate from untrusted user/paper data. Combined instructions
   and user messages retain the existing prompt budget and complete-block policy.
 
-Documents require `version: 1` (configuration schema version), are safely
+Documents require `version: 1` (search agendas use `version: 2`), are safely
 parsed and validated into immutable Pydantic models, and are loaded from
 package resources rather than the working directory. Both root packages
 and the YAML resources are included in built distributions. Unknown/duplicate
@@ -204,7 +223,7 @@ PYDANTIC_AI_NO_BANNER=1 uv run --locked python -m unittest discover \
   -s tests/radar -p test_pipeline_chat_protocol.py -v
 ```
 
-It exercises fresh collection through all six searches, deduplication and
+It exercises fresh collection through the bounded search agenda, deduplication and
 full-pool snapshot coverage; a cached 106-paper pool with 102 abstract-bearing
 papers and the maximum 200-paper pool (192 abstracts, eight missing); native
 CLEF preference and complete chat rerouting after native
@@ -350,19 +369,30 @@ Strata to expose `/v1/systemone`. PydanticAI controls Qwen routing and
 synthesis. Native screening and chat protocol paths are unchanged; synthesis follows
 the specialist workflow described above.
 
-`--clef-timeout` bounds CLEF requests (default 10 s). Qwen chat requests
-are bounded by 60 s (or the smaller remaining overall budget), with at
-most two concurrent batches, 24 complete inputs per batch, 64 KiB input,
-4096 output tokens, and two agent requests per batch including validation retry.
-`--triage-timeout` bounds each backend's whole-pool stage (default 60 s,
-maximum 300 s). A failed CLEF stage can therefore be followed by one
-separately bounded Qwen stage. A missing fallback configuration is exit 4;
+`--clef-timeout` bounds CLEF requests (default 10 s). `--triage-timeout`
+bounds only CLEF's whole-pool stage (default 60 s, maximum 300 s).
+The Qwen fallback has its own `--qwen-triage-timeout` (maximum 3600 s),
+defaulting to packaged policy: 1800 s overall, 90 s per batch, two complete
+papers per batch and one active batch. These are provisional settings, not
+live-validated throughput claims. The hard bounds remain 24 papers, two
+active batches, 64 KiB input and 4096 output tokens. Each batch permits at
+most two agent requests including validation retry, within its own deadline;
+SDK network retries are disabled. A failed batch no longer cancels unrelated
+batches: successful judgments survive in the final persisted batch. Safe
+typed failure categories distinguish connection/read/request timeouts,
+invalid responses, service errors and exhausted stage budgets; raw upstream
+bodies and error messages are never stored. A missing fallback configuration is exit 4;
 failed/malformed/deadline Qwen screening is exit 3 and blocks synthesis,
-preserving the last valid snapshot. Source/metadata refresh is independent.
+preserving the stored paper pool. Source/metadata refresh is independent.
 Missing abstracts and oversized texts stay explicit unknowns. SQLite
 screening records retain backend/model/rubric and fallback reason;
 strict v1 source snapshots are never mutated. `--collect-only`
 and an empty pool call no routing or synthesis model. No servers are launched.
+
+Model discovery uses asynchronous HTTPX inside the Qwen stage deadline and
+closes its lookup client even on cancellation. OS hostname DNS resolution
+can still delay CLI loop shutdown after a timeout; use the configured LAN IP
+when a strict short screening deadline matters.
 
 Earlier probing of FreeToken `/v1/systemone` was based on an incorrect
 transport interpretation. Strata also exposes chat; the same

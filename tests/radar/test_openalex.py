@@ -62,8 +62,8 @@ class TestQueryPlan(unittest.TestCase):
         self.assertGreaterEqual(len(plan.queries), 2)
         kinds = {q.kind for q in plan.queries}
         self.assertIn("semantic", kinds)
-        self.assertIn("recent", kinds)
-        recent = [q for q in plan.queries if q.kind == "recent"][0]
+        self.assertIn("keyword", kinds)
+        recent = [q for q in plan.queries if q.role == "frontier"][0]
         self.assertIsNotNone(recent.from_date)
 
     def test_invalid_empty_profile_rejected(self):
@@ -229,15 +229,14 @@ class TestLookbackAndBounds(unittest.TestCase):
         expected = (_dt.date.today() - _dt.timedelta(days=90)).isoformat()
         self.assertGreaterEqual(len(plan.queries), 2)
         for q in plan.queries:
-            self.assertEqual(q.from_date, expected)
+            self.assertEqual(q.from_date, expected if q.role == "frontier" else None)
         for q in plan.queries:
             _, params, _, _ = build_request(q)
-            self.assertIn(f"from_publication_date:{expected}", params["filter"])
-            if q.kind == "semantic":
-                # Relevance ranking preserved: no `sort` on semantic queries.
-                self.assertNotIn("sort", params)
+            if q.role == "frontier":
+                self.assertEqual(params["filter"], f"publication_year:{expected[:4]}-")
             else:
-                self.assertEqual(params["sort"], "publication_date:desc")
+                self.assertNotIn("filter", params)
+            self.assertNotIn("sort", params)
 
     def test_later_query_branches_contribute_with_small_output_max(self):
         # First branch: low-scoring filler; last branch: keyword hit that
@@ -248,10 +247,10 @@ class TestLookbackAndBounds(unittest.TestCase):
         plan = QueryPlan(
             queries=[
                 PlannedQuery(
-                    kind="semantic", terms="alpha", from_date="2026-06-22"
+                    kind="keyword", terms="alpha", from_date="2026-06-22"
                 ),
                 PlannedQuery(
-                    kind="semantic", terms="beta", from_date="2026-06-22"
+                    kind="keyword", terms="beta", from_date="2026-06-22"
                 ),
                 PlannedQuery(
                     kind="recent", terms="beta", from_date="2026-06-22"

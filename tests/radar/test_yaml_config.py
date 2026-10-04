@@ -97,17 +97,14 @@ class TestConfiguredSearches(unittest.TestCase):
         from radar.config.searches import build_query_plan
 
         plan = build_query_plan(default_profile())
-        self.assertLessEqual(len(plan.queries), 6)
-        self.assertEqual(plan.queries[0].terms,
-                         '"machine learning" OR "deep learning" OR "reinforcement learning" '
-                         'OR "large language models" OR "diffusion models"')
+        self.assertEqual(len(plan.queries), 12)
+        self.assertIn("machine learning", plan.queries[0].terms)
         intersections = [query for query in plan.queries if " AND " in query.terms]
-        self.assertEqual(len(intersections), 4)
-        self.assertIn('"behavioral science" OR "behavioral economics" OR "mechanism design"',
-                      intersections[0].terms)
-        recent = [query for query in plan.queries if query.kind == "recent"]
-        self.assertEqual(len(recent), 1)
-        self.assertNotIn("behavioral", recent[0].terms)
+        self.assertEqual(len(intersections), 8)
+        self.assertTrue(any("behavioral economics" in q.terms for q in plan.queries))
+        frontier = [query for query in plan.queries if query.role == "frontier"]
+        self.assertEqual(len(frontier), 4)
+        self.assertNotIn("behavioral", frontier[0].terms)
 
     def test_config_changes_actual_queries_and_preserves_profile_dates_and_caps(self):
         from radar.config.interests import RadarProfile
@@ -137,8 +134,8 @@ queries:
 
         plan = build_query_plan(RadarProfile(keywords=["diffusion"], domains=[]))
         self.assertEqual([query.kind for query in plan.queries],
-                         ["semantic", "recent", "semantic", "semantic"])
-        self.assertEqual(plan.queries[0].terms, '"diffusion"')
+                         ["semantic", "semantic", "keyword", "keyword", "keyword", "keyword"])
+        self.assertIn("diffusion", plan.queries[0].terms)
         self.assertTrue(all("behavioral" not in query.terms and "generative AI" not in query.terms
                             for query in plan.queries))
 

@@ -141,8 +141,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--triage-timeout",
         type=float,
         default=CLEF_DEFAULT_OVERALL_TIMEOUT_S,
-        help="Overall screening deadline per backend in seconds, (0, 300] "
-        "(default 60). Failed CLEF can use a separate bounded Qwen stage.",
+        help="Overall CLEF screening deadline in seconds, (0, 300] (default 60).",
+    )
+    parser.add_argument(
+        "--qwen-triage-timeout", type=float, default=None,
+        help="Separate Qwen System1 fallback deadline, (0, 3600] seconds "
+        "(default: packaged qwen_screening.yaml, 1800).",
     )
     parser.add_argument(
         "--triage-output",
@@ -184,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
         clef_model=args.clef_model,
         clef_timeout_s=args.clef_timeout,
         triage_timeout_s=args.triage_timeout,
+        qwen_triage_timeout_s=args.qwen_triage_timeout,
         storage_dir=storage_dir,
         from_database=args.from_db,
         rebuild_graph=args.rebuild_graph,

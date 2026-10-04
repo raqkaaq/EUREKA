@@ -1,0 +1,5 @@
+version: 1
+batch_size: 2
+concurrency: 1
+request_timeout_s: 90
+overall_timeout_s: 1800

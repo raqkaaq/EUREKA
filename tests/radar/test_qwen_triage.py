@@ -54,6 +54,46 @@ def synth_model(calls):
 
 
 class TestQwenTriage(unittest.TestCase):
+    def test_model_discovery_obeys_stage_deadline_and_closes_lookup_client(self):
+        from radar.agent.paper_triage import screen_works
+        from radar.provider import strata
+        settled = []
+
+        async def stalled(request):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                settled.append(True)
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(stalled))
+        with mock.patch.dict(os.environ, {"STRATA_BASE_URL": "http://127.0.0.1:8080/v1"}, clear=True), \
+             mock.patch.object(strata._httpx, "AsyncClient", return_value=client):
+            batch = screen_works(works(2), default_profile(), overall_timeout_s=0.02)
+        self.assertEqual([r.status for r in batch.results], ["deadline", "deadline"])
+        self.assertEqual(settled, [True])
+        self.assertTrue(client.is_closed)
+
+    def test_real_http_service_errors_make_one_attempt_per_independent_batch(self):
+        import httpx2
+        from radar.agent.paper_triage import screen_works
+        from radar.provider import strata
+        attempts = []
+
+        def unavailable(request):
+            attempts.append(request)
+            return httpx2.Response(503, json={"error": "PRIVATE-UPSTREAM-BODY"})
+
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(unavailable))
+        with mock.patch.dict(os.environ, {
+                "STRATA_BASE_URL": "http://127.0.0.1:8080/v1", "STRATA_MODEL": "test-qwen"}, clear=True), \
+             mock.patch.object(strata, "_provider_http_client", return_value=client):
+            batch = screen_works(works(4), default_profile())
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(all(r.status == "failed" and r.failure_kind == "service_error"
+                            for r in batch.results))
+        self.assertNotIn("PRIVATE", batch.model_dump_json())
+        self.assertTrue(client.is_closed)
+
     def test_same_screening_input_and_pydantic_answers(self):
         from radar.agent.paper_triage import screen_works
 
@@ -76,7 +116,9 @@ class TestQwenTriage(unittest.TestCase):
         self.assertEqual(len(batch.results), 106)
         self.assertEqual(sum(r.status == "scored" for r in batch.results), 102)
         self.assertEqual(sum(r.status == "missing_abstract" for r in batch.results), 4)
-        self.assertEqual(len(calls), 5)
+        # Packaged policy uses 2-paper batches: 102 scorable -> 51 model calls.
+        self.assertEqual(len(calls), 51)
+        self.assertTrue(all(len(chunk) <= 2 for chunk in calls))
         self.assertEqual({p["work_id"] for chunk in calls for p in chunk},
                          {w.openalex_id for w in pool if w.abstract})
 
@@ -90,6 +132,7 @@ class TestQwenTriage(unittest.TestCase):
                     return rows
                 batch = screen_works(works(1), default_profile(), model=answers_model(calls, invalid))
                 self.assertEqual(batch.results[0].status, "failed")
+                self.assertEqual(batch.results[0].failure_kind, "invalid_response")
                 self.assertEqual(len(calls), 2)
 
     def test_missing_duplicate_foreign_ids_and_wrong_model_are_rejected(self):
@@ -99,9 +142,11 @@ class TestQwenTriage(unittest.TestCase):
                    lambda rows: [dict(r, model="wrong") for r in rows])
         for change in changes:
             calls = []
-            batch = screen_works(works(3), default_profile(), model=answers_model(calls, change))
+            batch = screen_works(works(2), default_profile(), model=answers_model(calls, change))
             self.assertTrue(all(r.status == "failed" for r in batch.results))
+            # Single 2-paper batch; at most 2 validation calls per batch.
             self.assertEqual(len(calls), 2)
+            self.assertTrue(all(r.failure_kind == "invalid_response" for r in batch.results))
 
     def test_one_validation_retry_can_recover(self):
         from radar.agent.paper_triage import screen_works
@@ -109,7 +154,8 @@ class TestQwenTriage(unittest.TestCase):
         batch = screen_works(works(3), default_profile(), model=answers_model(
             calls, lambda rows: rows[:-1] if len(calls) == 1 else rows))
         self.assertTrue(all(r.status == "scored" for r in batch.results))
-        self.assertEqual(len(calls), 2)
+        # 3 works -> batches [2, 1]; first batch retries once, second succeeds first try.
+        self.assertEqual(len(calls), 3)
 
     def test_complete_blocks_split_on_byte_budget(self):
         from radar.agent.paper_triage import screen_works
@@ -143,12 +189,13 @@ class TestQwenTriage(unittest.TestCase):
                 settled.append(1)
         client = SimpleNamespace(aclose=mock.AsyncMock())
         session = freetoken.FreeTokenSession(FunctionModel(stall), client)
-        with mock.patch.object(freetoken.FreeTokenConfig, "resolve", return_value=SimpleNamespace(model="test-qwen")), \
+        with mock.patch.object(freetoken.FreeTokenConfig, "resolve_async", return_value=SimpleNamespace(model="test-qwen")), \
              mock.patch.object(freetoken, "build_session", return_value=session):
             batch = screen_works(works(50), default_profile(), overall_timeout_s=0.02)
         self.assertLessEqual(len(active), 2)
         self.assertEqual(len(settled), len(active))
         self.assertTrue(all(r.status == "deadline" for r in batch.results))
+        self.assertTrue(all(r.failure_kind == "budget_exhausted" for r in batch.results))
         client.aclose.assert_awaited_once()
 
     def test_failed_inference_is_redacted_and_owned_client_closed(self):
@@ -158,10 +205,11 @@ class TestQwenTriage(unittest.TestCase):
             raise RuntimeError("sensitive-body")
         client = SimpleNamespace(aclose=mock.AsyncMock())
         session = freetoken.FreeTokenSession(FunctionModel(fail), client)
-        with mock.patch.object(freetoken.FreeTokenConfig, "resolve", return_value=SimpleNamespace(model="test-qwen")), \
+        with mock.patch.object(freetoken.FreeTokenConfig, "resolve_async", return_value=SimpleNamespace(model="test-qwen")), \
              mock.patch.object(freetoken, "build_session", return_value=session):
             batch = screen_works(works(2), default_profile())
         self.assertTrue(all(r.status == "failed" for r in batch.results))
+        self.assertTrue(all(r.failure_kind == "unexpected_error" for r in batch.results))
         self.assertNotIn("sensitive", batch.model_dump_json())
         client.aclose.assert_awaited_once()
 
@@ -195,9 +243,132 @@ class TestQwenTriage(unittest.TestCase):
         }, clear=True), mock.patch.object(freetoken, "_provider_http_client", side_effect=create_client):
             batch = screen_works(works(), default_profile())
         self.assertTrue(all(r.status == "scored" for r in batch.results))
-        self.assertEqual([path for path, _ in requests], ["/v1/chat/completions"])
+        # 3 works with 2-paper policy batches -> 2 chat completion calls.
+        self.assertEqual([path for path, _ in requests], ["/v1/chat/completions"] * 2)
         self.assertTrue(clients[0].is_closed)
         self.assertEqual(requests[0][1]["model"], "test-qwen")
+
+    def test_one_failed_batch_does_not_cancel_next(self):
+        from radar.agent.paper_triage import screen_works
+        calls = []
+        def flaky(messages, info):
+            prompt = next(p.content for m in reversed(messages) for p in m.parts
+                          if isinstance(p, UserPromptPart))
+            papers = json.loads(prompt)["papers"]
+            calls.append([p["work_id"] for p in papers])
+            if any("W0" in p["work_id"] or "W1" in p["work_id"] for p in papers):
+                raise RuntimeError("first-batch-boom")
+            rows = [{"work_id": p["work_id"], "model": p["input"]["model"],
+                     "answers": {"ai_ml_relevance": {"type": "noul", "noul": 0.8},
+                                 "cross_domain_potential": {"type": "noul", "noul": 0.4}}}
+                    for p in papers]
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {"responses": rows})])
+        batch = screen_works(works(4), default_profile(), model=FunctionModel(flaky), model_id="test-qwen")
+        by_id = {r.work_id: r for r in batch.results}
+        pool = works(4)
+        self.assertEqual(by_id[pool[0].openalex_id].status, "failed")
+        self.assertEqual(by_id[pool[1].openalex_id].status, "failed")
+        self.assertEqual(by_id[pool[2].openalex_id].status, "scored")
+        self.assertEqual(by_id[pool[3].openalex_id].status, "scored")
+        self.assertTrue(all(by_id[w.openalex_id].failure_kind is not None
+                            for w in pool[:2]))
+        self.assertEqual(len(batch.results), 4)
+
+    def test_per_request_timeout_maps_to_failed_request_timeout(self):
+        from radar.agent.paper_triage import screen_works
+        def slow(messages, info):
+            raise TimeoutError("request-deadline")
+        batch = screen_works(works(2), default_profile(), model=FunctionModel(slow), model_id="test-qwen")
+        self.assertTrue(all(r.status == "failed" for r in batch.results))
+        self.assertTrue(all(r.failure_kind == "request_timeout" for r in batch.results))
+        self.assertNotIn("request-deadline", batch.model_dump_json())
+
+    def test_diagnostic_categories_are_typed(self):
+        import httpx
+        from pydantic_ai.exceptions import ModelHTTPError
+        from radar.agent.paper_triage import screen_works
+        cases = [
+            (httpx.ConnectTimeout("c"), "connect_timeout"),
+            (httpx.ReadTimeout("r"), "read_timeout"),
+            (TimeoutError(), "request_timeout"),
+            (ModelHTTPError(503, "test-qwen"), "service_error"),
+            (RuntimeError("boom"), "unexpected_error"),
+        ]
+        for exc, kind in cases:
+            def fail(messages, info, _e=exc):
+                raise _e
+            batch = screen_works(works(1), default_profile(), model=FunctionModel(fail), model_id="test-qwen")
+            with self.subTest(kind=kind):
+                self.assertEqual(batch.results[0].status, "failed")
+                self.assertEqual(batch.results[0].failure_kind, kind)
+                self.assertNotIn("boom", batch.model_dump_json())
+                self.assertNotIn("sensitive", batch.model_dump_json())
+
+    def test_setup_failure_classifies_remaining_without_leak(self):
+        from radar.agent.paper_triage import screen_works
+        from radar.provider import strata as freetoken
+        with mock.patch.object(freetoken.FreeTokenConfig, "resolve_async",
+                               side_effect=freetoken.StrataError("bad-secret-endpoint")):
+            batch = screen_works(works(2), default_profile())
+        self.assertTrue(all(r.status == "failed" for r in batch.results))
+        self.assertTrue(all(r.failure_kind is not None for r in batch.results))
+        self.assertNotIn("bad-secret", batch.model_dump_json())
+
+    def test_overall_timeout_uses_policy_default_and_validates_explicit(self):
+        from radar.agent import paper_triage as triage
+        from radar.config.triage import qwen_screening_policy
+        policy = qwen_screening_policy()
+        self.assertEqual(float(policy.overall_timeout_s), 1800.0)
+        self.assertEqual(int(policy.batch_size), 2)
+        self.assertEqual(int(policy.concurrency), 1)
+        for bad in (0, 0.0, -1, float("nan"), float("inf"), True, "60", [1]):
+            with self.subTest(bad=repr(bad)):
+                if isinstance(bad, str) and bad == "60":
+                    # Numeric strings coerce like the CLEF validator; skip strict rejection.
+                    continue
+                with self.assertRaises(ValueError):
+                    triage.screen_works([], default_profile(), overall_timeout_s=bad)
+        # None means policy default; explicit zero is rejected.
+        with self.assertRaises(ValueError):
+            triage.screen_works([], default_profile(), overall_timeout_s=0)
+        self.assertEqual(triage.screen_works([], default_profile(), overall_timeout_s=60.0).results, [])
+
+    def test_scored_missing_oversized_cannot_carry_failure_kind(self):
+        from radar.schema.triage import TriageResult
+        import pydantic
+        for status in ("scored", "missing_abstract", "oversized"):
+            kwargs = {"work_id": "W", "status": status}
+            if status == "scored":
+                kwargs.update(ai_ml_relevance=0.5, cross_domain_potential=0.5)
+            with self.subTest(status=status):
+                with self.assertRaises(pydantic.ValidationError):
+                    TriageResult(**kwargs, failure_kind="request_timeout")
+        # Legacy failed/deadline without kind remain allowed.
+        self.assertEqual(TriageResult(work_id="W", status="failed").failure_kind, None)
+        self.assertEqual(TriageResult(work_id="W", status="deadline").failure_kind, None)
+
+    def test_policy_loader_is_immutable_and_forbids_extra(self):
+        from radar.config.triage import qwen_screening_policy
+        from radar.schema.triage import QwenScreeningPolicy
+        import pydantic
+        policy = qwen_screening_policy()
+        self.assertEqual(policy.version, 1)
+        with self.assertRaises(pydantic.ValidationError):
+            QwenScreeningPolicy(version=1, batch_size=2, concurrency=1,
+                                request_timeout_s=90, overall_timeout_s=1800, extra_field=1)
+        with self.assertRaises(pydantic.ValidationError):
+            QwenScreeningPolicy(version=2)
+        for kwargs in ({"batch_size": 0}, {"batch_size": 25}, {"concurrency": 0},
+                       {"concurrency": 3}, {"request_timeout_s": 0},
+                       {"request_timeout_s": 301}, {"overall_timeout_s": 0},
+                       {"overall_timeout_s": 3601}):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(pydantic.ValidationError):
+                    QwenScreeningPolicy(version=1, **kwargs)
+        with self.assertRaises(pydantic.ValidationError):
+            QwenScreeningPolicy(version=True)
+        with self.assertRaises(Exception):
+            policy.batch_size = 5
 
 
 class TestQwenPipeline(unittest.TestCase):
@@ -276,7 +447,8 @@ class TestQwenPipeline(unittest.TestCase):
         result, synthesis = self.pipeline(works(), routing=answers_model(calls, lambda rows: []))
         self.assertEqual(result.exit_code, 3)
         self.assertEqual(synthesis, [])
-        self.assertEqual(len(calls), 2)
+        # 3 works -> 2 batches (2+1), each batch retries once.
+        self.assertEqual(len(calls), 4)
 
     def test_collect_only_and_empty_pool_call_no_models(self):
         for pool, options in ((works(), {"mode": "collect"}), ([], {})):

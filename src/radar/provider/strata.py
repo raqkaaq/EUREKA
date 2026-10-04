@@ -103,13 +103,8 @@ def _resolved_addresses(host: str) -> set[str]:
     return {str(answer[4][0]).split("%", 1)[0] for answer in answers if answer[4]}
 
 
-def check_local_network(base_url: str) -> str:
-    """Validate that *base_url* targets loopback or a private LAN.
-
-    Returns the normalized URL. Raises :class:`StrataError` for empty,
-    unparseable, non-http(s), or non-local destinations. Hostnames are resolved
-    and accepted only when every returned address is in an allowed network.
-    """
+def _checked_host(base_url: str) -> str:
+    """Validate URL syntax without DNS or other I/O."""
     raw = (base_url or "").strip()
     if not raw:
         raise StrataError(
@@ -134,6 +129,22 @@ def check_local_network(base_url: str) -> str:
         _ = parts.port
     except ValueError as exc:
         raise StrataError(f"Strata base URL has an invalid port ({raw!r}).") from exc
+    return host
+
+
+def _checked_addresses(raw: str, addresses: set[str]) -> str:
+    if not addresses or any(not _is_allowed_address(address) for address in addresses):
+        raise StrataError(
+            f"Refusing non-local Strata base URL {raw!r}: the host must resolve "
+            "only to loopback, RFC 1918, IPv6 ULA, or RFC 6598 addresses."
+        )
+    return raw.rstrip("/")
+
+
+def check_local_network(base_url: str) -> str:
+    """Accept private LAN URLs only when every resolved address is allowed."""
+    raw = (base_url or "").strip()
+    host = _checked_host(raw)
     if host in _LOCALHOST_NAMES:
         addresses = {"127.0.0.1"}
     else:
@@ -143,12 +154,7 @@ def check_local_network(base_url: str) -> str:
             addresses = _resolved_addresses(host)
         else:
             addresses = {host.split("%", 1)[0]}
-    if not addresses or any(not _is_allowed_address(address) for address in addresses):
-        raise StrataError(
-            f"Refusing non-local Strata base URL {raw!r}: the host must resolve "
-            "only to loopback, RFC 1918, IPv6 ULA, or RFC 6598 addresses."
-        )
-    return raw.rstrip("/")
+    return _checked_addresses(raw, addresses)
 
 
 def resolve_base_url(explicit: str | None = None) -> str:
@@ -202,6 +208,10 @@ def list_models(base_url: str, timeout: float = MODELS_TIMEOUT_S,
             "Is the user-owned Strata server running at that LAN endpoint? "
             "this tool never starts it for you."
         ) from None
+    return _model_ids(payload)
+
+
+def _model_ids(payload: object) -> list[str]:
     ids: list[str] = []
     data = payload.get("data") if isinstance(payload, dict) else None
     if isinstance(data, list):
@@ -238,6 +248,52 @@ class StrataConfig:
     model: str
     api_key: str = "strata-local"
     timeout_s: float = MODEL_TIMEOUT_S
+
+    @classmethod
+    async def resolve_async(
+        cls, base_url: str | None = None, model: str | None = None,
+        api_key: str | None = None, timeout_s: float = MODEL_TIMEOUT_S,
+    ) -> "StrataConfig":
+        """Asynchronous screening setup with a cancellable /models lookup.
+
+        The caller owns the enclosing stage deadline. OS hostname resolution
+        uses the event loop resolver; its executor may still delay loop shutdown
+        after cancellation. A configured LAN IP bypasses that limitation.
+        """
+        if not (0 < timeout_s <= 300):
+            raise StrataError("model timeout must be within (0, 300]s")
+        raw = (base_url or _setting("BASE_URL")).strip()
+        host = _checked_host(raw)
+        if host in _LOCALHOST_NAMES:
+            addresses = {"127.0.0.1"}
+        else:
+            try:
+                _ipaddress.ip_address(host.split("%", 1)[0])
+                addresses = {host.split("%", 1)[0]}
+            except ValueError:
+                try:
+                    answers = await _asyncio.get_running_loop().getaddrinfo(
+                        host, None, type=_socket.SOCK_STREAM)
+                except OSError as exc:
+                    raise StrataError("Cannot resolve the configured Strata LAN host.") from exc
+                addresses = {str(a[4][0]).split("%", 1)[0] for a in answers if a[4]}
+        base = _checked_addresses(raw, addresses)
+        key = (api_key or _setting("API_KEY") or "strata-local").strip()
+        name = (model or "").strip() or model_from_env()
+        if not name:
+            try:
+                async with _httpx.AsyncClient(trust_env=False, follow_redirects=False) as client:
+                    response = await client.get(
+                        _models_url(base), headers={"Authorization": f"Bearer {key}"},
+                        timeout=min(timeout_s, MODELS_TIMEOUT_S))
+                    response.raise_for_status()
+                    ids = _model_ids(response.json())
+            except (_httpx.HTTPError, ValueError) as exc:
+                raise StrataError("Strata model discovery failed; check the user-owned LAN server.") from exc
+            if not ids:
+                raise StrataError("Strata listed no models; configure STRATA_MODEL.")
+            name = ids[0]
+        return cls(base_url=base, model=name, api_key=key, timeout_s=float(timeout_s))
 
     @classmethod
     def resolve(
@@ -295,6 +351,9 @@ def build_session(config: StrataConfig) -> StrataSession:
     provider = OpenAIProvider(
         base_url=config.base_url, api_key=config.api_key, http_client=client
     )
+    # Stage owners budget requests/retries. The SDK's default two network
+    # retries otherwise turn a 60-second request into roughly three minutes.
+    provider.client.max_retries = 0
     return StrataSession(
         model=OpenAIChatModel(config.model, provider=provider),  # type: ignore[arg-type]
         http_client=client,

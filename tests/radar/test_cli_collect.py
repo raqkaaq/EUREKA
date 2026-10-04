@@ -4,6 +4,7 @@ applies only to the final ranked slice. Fake source, no network."""
 from __future__ import annotations
 
 import json
+import datetime as dt
 import unittest
 
 from radar.pipeline import PipelineRequest, run
@@ -16,6 +17,7 @@ def _raw(wid: str, title: str, year: int = 2026) -> dict:
         "abstract_inverted_index": {"x": [0]},
         "doi": "",
         "publication_year": year,
+        "publication_date": dt.date.today().isoformat(),
         "cited_by_count": 0,
     }
 
@@ -43,15 +45,10 @@ class TestPipelineCollectionBounds(unittest.TestCase):
         result = run(PipelineRequest(
             mode="collect", max_candidates=1, source_override=fake))
         self.assertEqual(result.exit_code, 0)
-        # Whole bounded plan (five themes + recent query) executes despite
-        # an output max of 1.
-        self.assertEqual(len(fake.calls), 6)
-        # Every discovery request carries the lookback date filter.
-        for params in fake.calls:
-            self.assertIn("from_publication_date:", params.get("filter", ""))
-        # Sort only on the recent query (relevance preserved for semantic).
-        sorts = [p.get("sort") for p in fake.calls]
-        self.assertEqual(sorts.count("publication_date:desc"), 1)
+        self.assertEqual(len(fake.calls), 12)
+        self.assertEqual(sum("filter" in p for p in fake.calls), 4)
+        self.assertEqual(sum("search.semantic" in p for p in fake.calls), 4)
+        self.assertTrue(all("sort" not in p for p in fake.calls))
         # Output bound respected.
         shown = json.loads(result.stdout)
         self.assertEqual(len(shown), 1)

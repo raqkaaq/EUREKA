@@ -18,12 +18,14 @@ def work_to_json(work: CollectedWork) -> dict[str, Any]:
         "title": work.title,
         "abstract": work.abstract[:2000],
         "publication_year": work.publication_year,
+        "publication_date": work.publication_date,
         "doi": work.doi,
         "primary_url": work.primary_url,
         "cited_by_count": work.cited_by_count,
         "score": work.score,
         "matched_queries": work.matched_queries,
         "query_kinds": work.query_kinds,
+        "discovery_matches": [match.model_dump() for match in work.discovery_matches],
     }
 
 

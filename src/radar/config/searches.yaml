@@ -1,27 +1,81 @@
-version: 1
-# Six complementary bounded requests. Order is priority if a smaller cap is used.
-# Broad discovery is never required to mention a behavioral/economic domain.
-# Relevance ranks text matches, not embeddings; newest-first is a separate slice.
-queries:
-  - name: broad_ai_ml
-    kind: semantic
-    terms: "{keywords}"
-  - name: newest_ai_ml
-    kind: recent
-    terms: "{keywords}"
-  - name: behavioral_economic_transfer
-    kind: semantic
+version: 2
+# Retrieval intent is not evidence: System1 still screens every collected paper.
+# Four questions x three roles x 15 results = <=180 rows before deduplication.
+# Only frontier searches use the profile lookback. Historical branches are
+# relevance-ranked, not citation-ranked: popularity is not methodological rigor.
+learning_questions:
+  - id: learning_and_generalization
+    question: >-
+      Which mechanisms explain generalization and emergent capabilities,
+      and which apparent advances are artifacts of data, scale or evaluation?
+    searches:
+      - role: foundation
+        kind: keyword
+        terms: '({keywords}) AND ("inductive bias" OR "statistical learning theory" OR "representation learning")'
+      - role: frontier
+        kind: semantic
+        terms: >-
+          For {keywords}, what mechanisms explain generalization, transfer and
+          emergent capabilities? Seek theoretical predictions linked to controlled
+          experiments, comparisons separating architecture, data and compute,
+          and evidence about when scaling fails rather than benchmark gains alone.
+      - role: counterevidence
+        kind: keyword
+        terms: '({keywords}) AND ("data contamination" OR "shortcut learning" OR "spurious correlations" OR "failed replication")'
+  - id: uncertainty_and_identification
+    question: >-
+      When can AI systems support reliable inference under limited data,
+      distribution shift and unobserved confounding?
+    searches:
+      - role: foundation
+        kind: keyword
+        terms: '({keywords}) AND ("causal inference" OR "off-policy evaluation" OR "uncertainty quantification")'
+      - role: frontier
+        kind: semantic
+        terms: >-
+          For {keywords}, investigate reliable prediction and efficient learning
+          with limited observations, distribution shift or hidden confounding.
+          Seek identifiability conditions, calibration guarantees, off-policy
+          evaluation, sample efficiency and falsifiable tests of causal assumptions.
+      - role: counterevidence
+        kind: keyword
+        terms: '({keywords}) AND ("non-identifiability" OR "miscalibration" OR "distribution shift" OR "causal misspecification")'
+  - id: objectives_and_incentives
     scope: cross_domain
-    terms: "({keywords}) AND ({domains})"
-  # Human-impact papers may say generative AI rather than name an ML method.
-  - name: ai_behavior_and_economy
-    kind: semantic
+    question: >-
+      How do optimization targets and strategic incentives shape AI behavior,
+      and when do economic mechanisms transfer to alignment or evaluation?
+    searches:
+      - role: foundation
+        kind: keyword
+        terms: '("artificial intelligence" OR {keywords}) AND ("principal agent" OR "mechanism design" OR "reward shaping")'
+      - role: frontier
+        kind: semantic
+        terms: >-
+          Connect {keywords} to {domains}: how do proxy objectives, incentives,
+          strategic adaptation and information asymmetry affect learning agents
+          and human-AI systems? Seek formal mechanisms and empirical identification
+          of reward gaming, alignment tradeoffs or incentive-compatible evaluation.
+      - role: counterevidence
+        kind: keyword
+        terms: '("artificial intelligence" OR {keywords}) AND ("reward hacking" OR "Goodhart" OR "specification gaming" OR "strategic manipulation")'
+  - id: measurement_and_human_ai
     scope: cross_domain
-    terms: '("artificial intelligence" OR "generative AI") AND (incentives OR trust OR labor OR productivity OR adoption)'
-  - name: methods_and_evaluation
-    kind: semantic
-    terms: '({keywords}) AND (robustness OR uncertainty OR evaluation OR efficiency)'
-  # Transferable mechanisms/identification methods, not just domain vocabulary.
-  - name: causal_and_strategic_mechanisms
-    kind: semantic
-    terms: '({keywords}) AND (causality OR "mechanism design" OR "decision theory")'
+    question: >-
+      What do AI evaluations measure, and which causal mechanisms explain
+      changes in human learning, decisions and economic productivity?
+    searches:
+      - role: foundation
+        kind: keyword
+        terms: '("artificial intelligence" OR "machine learning") AND (psychometrics OR "construct validity" OR "automation bias" OR "technology adoption")'
+      - role: frontier
+        kind: semantic
+        terms: >-
+          Connect {keywords} with {domains}. Investigate construct validity and
+          psychometric measurement of AI capabilities, and causal evidence on
+          human-AI learning, reliance, decision quality, productivity and labor
+          effects. Seek experimental designs, heterogeneous effects and mechanisms
+          distinguishing task performance from durable learning or economic benefit.
+      - role: counterevidence
+        kind: keyword
+        terms: '("artificial intelligence" OR "generative AI") AND ("skill degradation" OR "automation bias" OR "productivity paradox" OR "measurement bias")'
