@@ -27,7 +27,12 @@ from radar.prompts.catalog import (
 )
 from radar.provider.strata import StrataError
 from radar.schema.configuration import AnalysisPrompt
-from radar.schema.opportunities import RadarDraft, SpecialistContribution, SpecialistRole
+from radar.schema.opportunities import (
+    LearningRadarDraft,
+    RadarDraft,
+    SpecialistContribution,
+    SpecialistRole,
+)
 from radar.schema.papers import CollectedWork
 
 if TYPE_CHECKING:
@@ -55,14 +60,20 @@ def validate_research_prompts() -> None:
 
 
 def select_for_prompt(candidates: list[CollectedWork], max_candidates: int = DEFAULT_MAX_CANDIDATES) -> list[CollectedWork]:
-    """Common complete-paper cohort fitting every role and reserved synthesis context."""
+    """Common complete-paper cohort fitting every role and reserved synthesis context.
+
+    All stages see intact full normalized abstracts (never truncated tails);
+    the common leading cohort is the smallest fit across specialists and
+    synthesis, so an oversized leading source honestly yields zero coverage.
+    """
     validate_research_prompts()
     bounded = bound_candidates(candidates, max_candidates)
     counts = [len(synthesis.select_for_prompt(
         bounded, max_candidates, prompt_spec=opportunity_analysis_prompt(),
-        reserved_context_chars=SPECIALIST_CONTEXT_CHARS))]
+        reserved_context_chars=SPECIALIST_CONTEXT_CHARS, complete_abstracts=True))]
     counts.extend(len(synthesis.select_for_prompt(
-        bounded, max_candidates, prompt_spec=specialist_prompt(role)))
+        bounded, max_candidates, prompt_spec=specialist_prompt(role),
+        complete_abstracts=True))
         for role in SPECIALIST_ROLES)
     return bounded[:min(counts)]
 
@@ -70,7 +81,8 @@ def select_for_prompt(candidates: list[CollectedWork], max_candidates: int = DEF
 def _agent(model: Model, spec: AnalysisPrompt, *, specialist: bool):
     from pydantic_ai import Agent, ModelRetry, RunContext
 
-    agent = Agent(model, output_type=RadarDraft, deps_type=int,
+    output_type = RadarDraft if specialist else LearningRadarDraft
+    agent = Agent(model, output_type=output_type, deps_type=int,
                   instructions=spec.instructions, retries=ANALYSIS_RETRIES)
 
     @agent.output_validator
@@ -81,6 +93,14 @@ def _agent(model: Model, spec: AnalysisPrompt, *, specialist: bool):
         if any(index < 0 or index >= ctx.deps
                for opportunity in draft.opportunities for index in opportunity.evidence):
             raise ModelRetry("Use only candidate indices in the supplied valid range.")
+        if not specialist and isinstance(draft, LearningRadarDraft):
+            # Learning source is never silently dropped: out-of-range or
+            # duplicate primary indices fail the run for a bounded retry.
+            indices = [dossier.paper_index for dossier in draft.learning_dossiers]
+            if any(index < 0 or index >= ctx.deps for index in indices):
+                raise ModelRetry("Use only candidate indices in the supplied valid range.")
+            if len(set(indices)) != len(indices):
+                raise ModelRetry("Duplicate primary dossier indices are not allowed.")
         if specialist:
             size = len(draft.model_dump_json())
             if size > SPECIALIST_MAX_REPORT_CHARS:
@@ -135,7 +155,8 @@ async def research_candidates_async(
             async def contribute(role: SpecialistRole) -> SpecialistContribution:
                 async with semaphore:
                     spec = specialist_prompt(role)
-                    prompt = synthesis.build_prompt(included, len(included), prompt_spec=spec)
+                    prompt = synthesis.build_prompt(included, len(included), prompt_spec=spec,
+                                                    complete_abstracts=True)
                     specialist_settings = dict(settings)
                     specialist_settings["max_tokens"] = min(max_tokens, SPECIALIST_MAX_TOKENS)
                     result = await _agent(active_model, spec, specialist=True).run(
@@ -146,7 +167,8 @@ async def research_candidates_async(
             async with asyncio.TaskGroup() as group:
                 tasks = [group.create_task(contribute(role)) for role in SPECIALIST_ROLES]
             reports = tuple(task.result() for task in tasks)
-            prompt = synthesis.build_prompt(included, len(included), context=_reports_context(reports))
+            prompt = synthesis.build_prompt(included, len(included), context=_reports_context(reports),
+                                            complete_abstracts=True)
             result = await _agent(active_model, opportunity_analysis_prompt(), specialist=False).run(
                 prompt, deps=len(included), model_settings=settings,
                 usage_limits=UsageLimits(request_limit=ANALYSIS_REQUEST_LIMIT), retries=retries)

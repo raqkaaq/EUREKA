@@ -46,8 +46,12 @@ if TYPE_CHECKING:
     from pydantic_ai.usage import UsageLimits as _UsageLimits
 
 
+def _normalize(text: str) -> str:
+    return " ".join((text or "").split())
+
+
 def _truncate(text: str, limit: int) -> str:
-    text = " ".join((text or "").split())
+    text = _normalize(text)
     if len(text) > limit:
         return text[:limit].rstrip() + "…"
     return text
@@ -57,13 +61,22 @@ def _header(spec: AnalysisPrompt) -> str:
     return spec.candidate_header
 
 
-def _candidate_block(index: int, work: CollectedWork) -> str:
+def _candidate_block(index: int, work: CollectedWork, *, complete_abstracts: bool = False) -> str:
     title = _truncate(work.title or "(untitled)", MAX_TITLE_IN_PROMPT)
-    abstract = _truncate(work.abstract or "(no abstract)", MAX_ABSTRACT_IN_PROMPT)
+    if complete_abstracts:
+        # Intact full normalized abstract: never truncate tails. Oversized
+        # leading sources simply yield zero honest coverage in selection.
+        abstract = _normalize(work.abstract) or "(no abstract)"
+    else:
+        abstract = _truncate(work.abstract or "(no abstract)", MAX_ABSTRACT_IN_PROMPT)
+    coverage = "complete abstract" if complete_abstracts else "abstract excerpt"
+    if not work.abstract.strip():
+        coverage = "no abstract available"
     year = work.publication_year or "n/a"
     return (
         f"[{index}] {title} ({year}, cited_by={work.cited_by_count})\n"
         f"--- begin untrusted candidate {index} data ---\n"
+        f"    Source coverage: {coverage}\n"
         f"    {abstract}\n"
         f"--- end untrusted candidate {index} data ---"
     )
@@ -84,13 +97,16 @@ def select_for_prompt(
     *,
     prompt_spec: AnalysisPrompt | None = None,
     reserved_context_chars: int = 0,
+    complete_abstracts: bool = False,
 ) -> list[CollectedWork]:
     """Budget-aware complete-block selection for the prompt.
 
     Takes the ranked topN slice, then keeps the longest leading run of
     whole candidate blocks that fits in ``MAX_PROMPT_CHARS`` with the
     header and the full task footer always reserved. Every returned paper
-    is present verbatim in the submitted input.
+    is present verbatim in the submitted input. With ``complete_abstracts``
+    the intact full normalized abstract sizes the block; tails are never
+    truncated, so an oversized leading source yields zero honest coverage.
     """
     bounded = bound_candidates(candidates, max_candidates)
     spec = prompt_spec if prompt_spec is not None else opportunity_analysis_prompt()
@@ -104,7 +120,7 @@ def select_for_prompt(
     used = len(spec.instructions) + len(header) + len(footer) + reserved_context_chars + 6
     included: list[CollectedWork] = []
     for index, work in enumerate(bounded):
-        block = _candidate_block(index, work)
+        block = _candidate_block(index, work, complete_abstracts=complete_abstracts)
         if used + len(block) + 1 > MAX_PROMPT_CHARS:
             break
         included.append(work)
@@ -118,13 +134,16 @@ def build_prompt(
     *,
     prompt_spec: AnalysisPrompt | None = None,
     context: str = "",
+    complete_abstracts: bool = False,
 ) -> str:
     """Build the bounded analysis prompt (complete blocks + intact footer)."""
     spec = prompt_spec if prompt_spec is not None else opportunity_analysis_prompt()
     included = select_for_prompt(candidates, max_candidates, prompt_spec=spec,
-                                 reserved_context_chars=len(context))
+                                 reserved_context_chars=len(context),
+                                 complete_abstracts=complete_abstracts)
     parts = [_header(spec)]
-    parts.extend(_candidate_block(i, work) for i, work in enumerate(included))
+    parts.extend(_candidate_block(i, work, complete_abstracts=complete_abstracts)
+                 for i, work in enumerate(included))
     if context:
         parts.append(context)
     parts.append(_footer(len(included), spec))

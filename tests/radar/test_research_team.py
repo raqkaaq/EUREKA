@@ -314,7 +314,9 @@ class TestResearchTeam(unittest.TestCase):
         seen = []
         pool = works(25)
         for work in pool:
-            work.abstract = "abstract word " * 1000
+            # Full intact abstracts (no tail truncation): ~1.3KB each, so a
+            # non-trivial leading cohort fits every stage within budget.
+            work.abstract = "abstract word " * 100
 
         def respond(messages, info):
             prompt = next(part.content for message in messages for part in message.parts

@@ -115,9 +115,9 @@ class TestFullPoolOfflineAcceptance(unittest.TestCase):
                           "unknown=4", "failed=0", "selected=4",
                           "analyzed=4", f"model={MODEL}"):
                 self.assertIn(token, line)
-            # The larger specialist-context reserve admits four papers under
-            # the importance wording while screening still covers the entire
-            # 106-paper pool.
+            # Intact full abstracts (never truncated tails) plus the reserved
+            # specialist context admit four papers here; screening still covers
+            # the entire 106-paper pool.
             # Every evidence URL resolves inside the pool.
             pool_ids = {w.openalex_id for w in works}
             import re

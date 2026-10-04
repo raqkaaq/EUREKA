@@ -35,6 +35,8 @@ from radar.schema.papers import CollectedWork
 GRAPH_NAME = "radar"
 RDB_FILENAME = "graph.rdb"
 HYPOTHESIS_ORIGIN = "hypothesis"
+DOSSIER_ORIGIN = "model_interpretation"
+DOSSIER_EVIDENCE_LEVEL = "abstract"
 STARTUP_TIMEOUT_SECONDS = 15.0
 SHUTDOWN_TIMEOUT_SECONDS = 5.0
 SHUTDOWN_GRACE_SECONDS = 2.0
@@ -95,13 +97,20 @@ class FalkorGraph:
 
         Opportunities are model-generated hypotheses; evidence edges come only
         from deterministically attached links that name a stored paper, so no
-        citation or scientific relationship is invented here.
+        citation or scientific relationship is invented here. Learning
+        dossiers are model interpretations grounded at the abstract level:
+        ``HAS_LEARNING_DOSSIER`` (run -> dossier) and ``ABOUT_PAPER``
+        (dossier -> existing paper) use only the deterministically attached
+        source, with no invented scientific ontology.
         """
         identities = {paper.openalex_id for paper in papers}
         if any(link.openalex_id and link.openalex_id not in identities
                for _, report in reports for opportunity in report.opportunities
                for link in opportunity.evidence_links):
             raise FalkorError("Report evidence names a paper absent from SQLite projection")
+        if any(resolved.source.openalex_id not in identities
+               for _, report in reports for resolved in report.learning_dossiers):
+            raise FalkorError("Learning dossier source names a paper absent from SQLite projection")
         self._write("MATCH (n) DETACH DELETE n", {})
         for paper in papers:
             self._write(
@@ -132,6 +141,30 @@ class FalkorGraph:
                         "MERGE (o)-[:SUPPORTED_BY]->(p)",
                         {"opportunity_id": opportunity_id, "openalex_id": link.openalex_id},
                     )
+            for dossier_index, resolved in enumerate(report.learning_dossiers):
+                dossier_id = f"{run_id}/learning/{dossier_index}"
+                self._write(
+                    "MERGE (d:LearningDossier {id: $dossier_id}) "
+                    "SET d.paper_index = $paper_index, d.origin = $origin, "
+                    "d.evidence_level = $evidence_level",
+                    {"dossier_id": dossier_id,
+                     "paper_index": resolved.dossier.paper_index,
+                     "origin": DOSSIER_ORIGIN,
+                     "evidence_level": DOSSIER_EVIDENCE_LEVEL},
+                )
+                self._write(
+                    "MATCH (r:Run {id: $run_id}) MATCH (d:LearningDossier {id: $dossier_id}) "
+                    "MERGE (r)-[:HAS_LEARNING_DOSSIER]->(d)",
+                    {"run_id": run_id, "dossier_id": dossier_id},
+                )
+                if not resolved.source.openalex_id:
+                    continue
+                self._write(
+                    "MATCH (d:LearningDossier {id: $dossier_id}) "
+                    "MATCH (p:Paper {openalex_id: $openalex_id}) "
+                    "MERGE (d)-[:ABOUT_PAPER]->(p)",
+                    {"dossier_id": dossier_id, "openalex_id": resolved.source.openalex_id},
+                )
 
     def query(self, cypher: str, params: dict | None = None) -> list[Any]:
         """Read-only result rows for CLI querying and testing."""

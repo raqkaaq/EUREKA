@@ -8,9 +8,10 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from radar.config.runtime import MAX_EVIDENCE_PER_OPP, MAX_OPPORTUNITIES
+from radar.schema.learning import LearningDossierDraft
 
 
 class OpportunityDraft(BaseModel):
@@ -66,6 +67,53 @@ class EvidenceLink(BaseModel):
     openalex_id: str = Field(default="", max_length=500)
 
 
+class ResolvedLearningDossier(BaseModel):
+    """Primary dossier plus its deterministically attached abstract source.
+
+    ``evidence_level`` is code-owned (``Literal["abstract"]``, never
+    model-writable): the draft has no such field and ``extra="forbid"``
+    rejects any model-supplied value.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    dossier: LearningDossierDraft
+    source: EvidenceLink
+    evidence_level: Literal["abstract"] = "abstract"
+
+    @model_validator(mode="after")
+    def _matching_source(self) -> ResolvedLearningDossier:
+        if self.source.index != self.dossier.paper_index or not self.source.openalex_id:
+            raise ValueError("Learning dossier must reference its primary candidate.")
+        return self
+
+
+class LearningRadarDraft(RadarDraft):
+    """Final synthesis draft: opportunity hypotheses plus one primary dossier.
+
+    Used ONLY for final research-team synthesis. ``learning_dossiers`` holds
+    at most one primary dossier; the default empty list accepts legacy
+    opportunity-only drafts (including old test doubles) without requiring
+    learning output.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    learning_dossiers: list[LearningDossierDraft] = Field(
+        default_factory=list, max_length=1
+    )
+
+    @field_validator("learning_dossiers", mode="after")
+    @classmethod
+    def _unique_primary(
+        cls, value: list[LearningDossierDraft]
+    ) -> list[LearningDossierDraft]:
+        indices = [dossier.paper_index for dossier in value]
+        if len(set(indices)) != len(indices):
+            raise ValueError("duplicate primary dossier indices")
+        return value
+
+
 class Opportunity(BaseModel):
     """Opportunity draft plus deterministically attached evidence links."""
 
@@ -79,12 +127,17 @@ class RadarReport(BaseModel):
     opportunities: list[Opportunity] = Field(default_factory=list)
     ignore: list[str] = Field(default_factory=list)
     next_move: str = Field(default="")
+    learning_dossiers: list[ResolvedLearningDossier] = Field(
+        default_factory=list, max_length=1
+    )
 
 
 __all__ = [
     "EvidenceLink",
+    "LearningRadarDraft",
     "Opportunity",
     "OpportunityDraft",
     "RadarDraft",
     "RadarReport",
+    "ResolvedLearningDossier",
 ]
