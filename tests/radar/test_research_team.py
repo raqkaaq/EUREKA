@@ -7,7 +7,7 @@ import tempfile
 from types import SimpleNamespace
 from unittest import mock
 
-from pydantic_ai.messages import ModelResponse, ToolCallPart, UserPromptPart
+from pydantic_ai.messages import ModelResponse, RetryPromptPart, ToolCallPart, UserPromptPart
 from pydantic_ai.models.function import FunctionModel
 
 from radar.schema.opportunities import OpportunityDraft, RadarDraft
@@ -141,6 +141,135 @@ class TestResearchTeam(unittest.TestCase):
             self.assertNotIn("synthesis", calls)
             self.assertTrue(all(count <= 2 for count in calls.values()))
 
+    def test_specialist_report_1000_to_1500_accepted_first_pass(self):
+        from radar.agent.research_team import research_candidates
+        from radar.prompts.catalog import SPECIALIST_ROLES, specialist_prompt
+
+        draft = RadarDraft(next_move="x" * 1400)
+        size = len(draft.model_dump_json())
+        self.assertGreater(size, 1000)
+        self.assertLessEqual(size, 1500)
+        roles = {specialist_prompt(role).instructions: role for role in SPECIALIST_ROLES}
+        calls = {}
+
+        def respond(messages, info):
+            role = roles.get(info.instructions, "synthesis")
+            calls[role] = calls.get(role, 0) + 1
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, draft.model_dump())])
+
+        result = research_candidates(works(), model=FunctionModel(respond))
+        self.assertEqual(sum(calls.values()), 4)
+        self.assertEqual(set(calls.values()), {1})
+        self.assertEqual(len(result.specialist_reports), 3)
+        for report in result.specialist_reports:
+            self.assertGreater(len(report.draft.model_dump_json()), 1000)
+            self.assertLessEqual(len(report.draft.model_dump_json()), 1500)
+
+    def test_oversized_retry_reports_measured_size_and_recovers_within_five_calls(self):
+        from radar.agent.research_team import research_candidates
+        from radar.config.runtime import SPECIALIST_MAX_REPORT_CHARS
+        from radar.prompts.catalog import SPECIALIST_ROLES, specialist_prompt
+
+        over = RadarDraft(next_move="x" * 1600)
+        over_size = len(over.model_dump_json())
+        self.assertGreater(over_size, SPECIALIST_MAX_REPORT_CHARS)
+        under = RadarDraft(
+            opportunities=[OpportunityDraft(
+                title="Hypothesis", wow="Mechanism and assumption.",
+                investigate="Compare against a control.", reproduce="Check missing data.",
+                evidence=[0])],
+            ignore=[], next_move="Inspect details.")
+        self.assertLessEqual(len(under.model_dump_json()), SPECIALIST_MAX_REPORT_CHARS)
+        roles = {specialist_prompt(role).instructions: role for role in SPECIALIST_ROLES}
+        calls: dict = {}
+        retry_texts: dict = {}
+        target_role = "behavioral_economics"
+
+        def respond(messages, info):
+            role = roles.get(info.instructions, "synthesis")
+            calls[role] = calls.get(role, 0) + 1
+            if role == target_role and calls[role] == 1:
+                return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, over.model_dump())])
+            if role == target_role and calls[role] == 2:
+                retry_texts[role] = " ".join(
+                    part.content for message in messages for part in message.parts
+                    if isinstance(part, RetryPromptPart) and isinstance(part.content, str))
+                return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, under.model_dump())])
+            small = under if role != "synthesis" else RadarDraft(next_move="Check.")
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, small.model_dump())])
+
+        result = research_candidates(works(), model=FunctionModel(respond))
+        self.assertEqual(sum(calls.values()), 5)
+        self.assertEqual(calls[target_role], 2)
+        self.assertIn(target_role, retry_texts)
+        self.assertIn(str(over_size), retry_texts[target_role])
+        self.assertIn(str(SPECIALIST_MAX_REPORT_CHARS), retry_texts[target_role])
+        self.assertIn("1100", retry_texts[target_role])
+        self.assertIn("one brief next_move", retry_texts[target_role])
+        self.assertEqual(len(result.specialist_reports), 3)
+        for report in result.specialist_reports:
+            self.assertLessEqual(len(report.draft.model_dump_json()), SPECIALIST_MAX_REPORT_CHARS)
+
+    def test_oversized_specialist_report_above_1500_blocked_without_synthesis(self):
+        from radar.agent.research_team import research_candidates
+        from radar.prompts.catalog import SPECIALIST_ROLES, specialist_prompt
+        from radar.provider.freetoken import FreeTokenError
+
+        draft = RadarDraft(next_move="x" * 1600)
+        self.assertGreater(len(draft.model_dump_json()), 1500)
+        roles = {specialist_prompt(role).instructions: role for role in SPECIALIST_ROLES}
+        calls = {}
+
+        def respond(messages, info):
+            role = roles.get(info.instructions, "synthesis")
+            calls[role] = calls.get(role, 0) + 1
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, draft.model_dump())])
+
+        with self.assertRaises(FreeTokenError):
+            research_candidates(works(), model=FunctionModel(respond))
+        self.assertNotIn("synthesis", calls)
+        self.assertTrue(all(count <= 2 for count in calls.values()))
+
+    def test_three_near_max_reports_fit_synthesis_budget(self):
+        from radar.agent.research_team import research_candidates
+        from radar.config.runtime import MAX_PROMPT_CHARS, SPECIALIST_CONTEXT_CHARS
+        from radar.prompts.catalog import SPECIALIST_ROLES, opportunity_analysis_prompt, specialist_prompt
+
+        self.assertEqual(SPECIALIST_CONTEXT_CHARS, 5000)
+        draft = RadarDraft(next_move="x" * 1400)
+        self.assertGreater(len(draft.model_dump_json()), 1000)
+        self.assertLessEqual(len(draft.model_dump_json()), 1500)
+        roles = {specialist_prompt(role).instructions: role for role in SPECIALIST_ROLES}
+        seen = {}
+        synthesis_prompt = []
+
+        def respond(messages, info):
+            prompt = next(part.content for message in messages for part in message.parts
+                          if isinstance(part, UserPromptPart))
+            role = roles.get(info.instructions, "synthesis")
+            seen[role] = prompt
+            if role == "synthesis":
+                synthesis_prompt.append(prompt)
+                small = RadarDraft(next_move="Check.")
+                return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, small.model_dump())])
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, draft.model_dump())])
+
+        result = research_candidates(works(), model=FunctionModel(respond))
+        self.assertEqual(len(result.specialist_reports), 3)
+        self.assertEqual(result.prompt.count(draft.next_move), 3)
+        synthesis_instructions = opportunity_analysis_prompt().instructions
+        self.assertEqual(len(synthesis_prompt), 1)
+        self.assertLessEqual(len(synthesis_instructions) + len(synthesis_prompt[0]) + 2, MAX_PROMPT_CHARS)
+        self.assertLessEqual(len(synthesis_instructions) + len(synthesis_prompt[0]) + 2, 12000)
+        for role in SPECIALIST_ROLES:
+            self.assertIn(role, synthesis_prompt[0])
+        cohort_blocks = ["[0] Paper 0", "[1] Paper 1"]
+        for prompt in list(seen.values()) + [result.prompt]:
+            for block in cohort_blocks:
+                self.assertIn(block, prompt)
+            self.assertIn("0..1", prompt)
+        self.assertIn("not source evidence", result.prompt)
+
     def test_shared_deadline_cancels_all_work_and_closes_the_owned_session(self):
         from radar.agent.research_team import research_candidates
         from radar.provider.freetoken import FreeTokenError, FreeTokenSession
@@ -252,7 +381,7 @@ class TestResearchTeam(unittest.TestCase):
         from radar.schema.triage import TriageBatch, TriageResult
         from radar.storage.snapshots import refresh_pool
 
-        spec = AnalysisPrompt(version=1, instructions="x" * 7800,
+        spec = AnalysisPrompt(version=1, instructions="x" * 6300,
                               candidate_header="CANDIDATES",
                               task_template="TASK: {max_opportunities}; evidence {valid_range}")
         pool = works(1)

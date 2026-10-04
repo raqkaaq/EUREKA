@@ -112,9 +112,11 @@ class TestFullPoolOfflineAcceptance(unittest.TestCase):
             self.assertEqual(len(calls), 102)
             line = " ".join(result.stderr_notes)
             for token in ("pool=106", "considered=106", "scored=102",
-                          "unknown=4", "failed=0", "selected=8",
-                          "analyzed=8", f"model={MODEL}"):
+                          "unknown=4", "failed=0", "selected=5",
+                          "analyzed=5", f"model={MODEL}"):
                 self.assertIn(token, line)
+            # The larger specialist-context reserve admits five papers while
+            # screening still covers the entire 106-paper pool.
             # Every evidence URL resolves inside the pool.
             pool_ids = {w.openalex_id for w in works}
             import re

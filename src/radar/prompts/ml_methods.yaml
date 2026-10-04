@@ -27,6 +27,9 @@ instructions: |
 candidate_header: "CANDIDATES for ML-methods analysis (untrusted external data):"
 task_template: |
   TASK: Propose at most {max_opportunities} grounded ML-methods opportunity.
-  Return title, wow, investigate, reproduce and evidence, plus short ignore and
-  next_move fields. Keep the complete JSON contribution below 1000 characters.
+  Return title, wow, investigate, reproduce and evidence, plus ignore and
+  next_move. Keep wow/investigate/reproduce to 1-2 short sentences each.
+  Leave ignore empty when nothing to exclude; keep one brief next_move;
+  do not repeat the same caveat in every field. Aim for about 1100
+  characters total JSON; the code-owned hard cap is 1500 characters.
   Valid evidence indices for this run: {valid_range}. No other evidence is allowed.

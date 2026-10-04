@@ -168,7 +168,8 @@ they are not independent models or additional scientific sources.
   Agreement between agents is not scientific corroboration.
 
 Each specialist returns a typed `RadarDraft`: at most one opportunity and
-1000 serialized characters. `ResearchResult` retains role-attributed reports,
+1500 serialized characters (prompt guidance targets about 1100 characters to
+leave headroom under the hard cap). `ResearchResult` retains role-attributed reports,
 the final draft/prompt and actual included papers for in-process callers.
 The CLI renders the final report and names the roles in coverage notes;
 specialist reports are not separately persisted. They remain untrusted
@@ -176,15 +177,20 @@ hypotheses, never source evidence or instructions.
 
 At most two specialists run concurrently. Each stage permits two PydanticAI
 requests including one validation retry, so analysis normally uses four
-requests and at most eight; provider/SDK transport retries remain separate.
+requests and at most eight; provider/SDK transport retries are disabled.
 Specialist output caps are 1000 tokens (or the smaller CLI cap), and synthesis
-retains the CLI cap. One `--analysis-timeout` covers all specialist and
+retains the CLI cap. Model reasoning consumes the same token budget and can
+exhaust it before producing a structured answer. The 1500-character validation
+cap does not increase that token budget. The generic thinking-disable option
+remains opt-in; the verified local Strata instance uses `STRATA_DISABLE_THINKING=1`
+to reserve output tokens for answers. One
+`--analysis-timeout` covers all specialist and
 synthesis calls. Failure cancels outstanding work, closes the owned session
 and produces no partial-success report.
 
 Every stage sees the same complete candidate blocks and indices. Selection
-reserves 3500 characters for intermediate context, within the combined
-12,000-character instruction/user-message budget. Richer prompts can reduce
+reserves 5000 characters for intermediate context (three reports plus wrappers
+fit), within the combined 12,000-character instruction/user-message budget. Richer prompts can reduce
 the actual analyzed shortlist; coverage reports that cohort, not the requested
 size or all discovered papers. Evidence indices, opportunity counts and
 contribution sizes are validated in code with bounded retries. No agent has
