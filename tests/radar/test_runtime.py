@@ -21,7 +21,7 @@ from radar.agent import opportunity_analysis as _agent
 from radar.cli import main as _main
 from radar.pipeline import PipelineRequest, run as _run_pipeline
 from radar.processing import ranking as _ranking
-from radar.provider import freetoken as _ft
+from radar.provider import strata as _ft
 from radar.schema.opportunities import RadarDraft
 from radar.schema.papers import CollectedWork
 from radar.storage import snapshots as _refresh

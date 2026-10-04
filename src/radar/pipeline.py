@@ -28,7 +28,7 @@ from radar.config.runtime import (
 )
 from radar.processing import ranking as _ranking
 from radar.processing.evidence import attach_evidence
-from radar.provider import freetoken as _freetoken
+from radar.provider import strata as _strata
 from radar.schema.papers import CollectedWork
 
 if TYPE_CHECKING:
@@ -314,11 +314,11 @@ def _screen_full_pool(request: PipelineRequest, pool: list[CollectedWork],
 
         if request.triage_model_override is None:
             try:
-                _freetoken.resolve_base_url(request.base_url)
-            except _freetoken.FreeTokenError:
+                _strata.resolve_base_url(request.base_url)
+            except _strata.StrataError:
                 raise PipelineUsageError(
-                    "Qwen fallback requires a plain private-LAN FreeToken chat "
-                    "endpoint: set FREETOKEN_BASE_URL or pass --base-url, "
+                    "Qwen fallback requires a plain private-LAN Strata chat "
+                    "endpoint: set STRATA_BASE_URL (legacy FREETOKEN_BASE_URL) or pass --base-url, "
                     "without embedded credentials."
                 ) from None
         try:
@@ -327,14 +327,14 @@ def _screen_full_pool(request: PipelineRequest, pool: list[CollectedWork],
                 model_id="qwen-test-model" if request.triage_model_override else None,
                 base_url=request.base_url, configured_model=request.model,
                 overall_timeout_s=triage_timeout,
-                disable_thinking=_freetoken.resolve_disable_thinking(request.disable_thinking),
+                disable_thinking=_strata.resolve_disable_thinking(request.disable_thinking),
                 fallback_reason=reason)
             return _check_batch_shape(batch, pool)
         except PipelineAnalysisError:
             raise
         except Exception:
             raise PipelineAnalysisError(
-                "Qwen fallback routing failed; check the configured FreeToken "
+                "Qwen fallback routing failed; check the configured Strata "
                 "chat endpoint/model. No synthesis was attempted; snapshot preserved."
             ) from None
 
@@ -411,8 +411,8 @@ def _analyze_pool(
             f"{summary['backend']} screening incomplete: {summary['failed']} failed, "
             f"{_deadline_count(batch)} deadline "
             f"(model={summary['model_id']} rubric={summary['rubric_version']}); "
-            "stopping before FreeToken synthesis with the last valid "
-            "snapshot preserved. Qwen routing uses FreeToken Chat Completions "
+            "stopping before Strata synthesis with the last valid "
+            "snapshot preserved. Qwen routing uses Strata Chat Completions "
             "with Pydantic-validated SystemOne answer contracts."
         )
     shortlist = select_candidates(pool_full, batch, request.max_candidates)
@@ -425,16 +425,16 @@ def _analyze_pool(
             pool_total=len(pool_full), summary=summary, selected=0, opportunities=0))
         return PipelineResult(0, "No candidates fit the research prompt budget; nothing analyzed.",
                               tuple(notes))
-    disable_thinking = _freetoken.resolve_disable_thinking(request.disable_thinking)
+    disable_thinking = _strata.resolve_disable_thinking(request.disable_thinking)
     session = None
     if request.model_override is not None:
         model = request.model_override
     else:
         try:
-            config = _freetoken.FreeTokenConfig.resolve(
+            config = _strata.StrataConfig.resolve(
                 base_url=request.base_url, model=request.model)
-            session = _freetoken.build_session(config)
-        except _freetoken.FreeTokenError as exc:
+            session = _strata.build_session(config)
+        except _strata.StrataError as exc:
             raise PipelineAnalysisError(str(exc)) from exc
         model = None
     try:
@@ -447,7 +447,7 @@ def _analyze_pool(
             disable_thinking=disable_thinking,
             session=session,
         )
-    except _freetoken.FreeTokenError as exc:
+    except _strata.StrataError as exc:
         raise PipelineAnalysisError(str(exc)) from exc
     draft = research.draft
     included = list(research.included)

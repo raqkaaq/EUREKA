@@ -6,11 +6,11 @@ pipeline result, and exit codes. All behavior lives behind the
 
 - ``uv run python -m radar --collect-only --max-candidates 8`` prints
   bounded real OpenAlex candidates as JSON (no LLM calls).
-- ``uv run python -m radar`` collects, analyzes via the private-network FreeToken
+- ``uv run python -m radar`` collects, analyzes via the private-network Strata
   endpoint (PydanticAI only), and prints a Markdown report.
 
 Exit codes: 0 ok, 2 external-service (OpenAlex) failure, 3 analysis/report
-failure (including FreeToken), 4 usage/config error.
+failure (including Strata), 4 usage/config error.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from radar.pipeline import PipelineRequest, run
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="radar",
-        description="AI/ML opportunity radar (OpenAlex discovery + local FreeToken analysis).",
+        description="AI/ML opportunity radar (OpenAlex discovery + local Strata analysis).",
     )
     parser.add_argument(
         "--collect-only",
@@ -68,18 +68,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--base-url",
         default=None,
-        help="FreeToken base URL (loopback/private LAN only; or set FREETOKEN_BASE_URL).",
+        help="Strata base URL (loopback/private LAN only; or set STRATA_BASE_URL (legacy FREETOKEN_BASE_URL)).",
     )
     parser.add_argument(
         "--model",
         default=None,
-        help="FreeToken model id override (default: FREETOKEN_MODEL env or local /models).",
+        help="Strata model id override (default: STRATA_MODEL env or local /models).",
     )
     parser.add_argument(
         "--refresh-dir",
         default=None,
         help="Persist the FULL normalized pool as one atomic metadata-only "
-        "snapshot (snapshot.json) in PATH, independent of FreeToken. "
+        "snapshot (snapshot.json) in PATH, independent of Strata. "
         "Combine with --collect-only for unattended refresh (no LLM).",
     )
     parser.add_argument(
@@ -106,7 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--disable-thinking",
         action="store_true",
         help="Opt-in: send the server-specific thinking-disable key "
-        "(or set FREETOKEN_DISABLE_THINKING=1). Default omits it; not every "
+        "(or set STRATA_DISABLE_THINKING=1). Default omits it; not every "
         "backend supports it.",
     )
     parser.add_argument(

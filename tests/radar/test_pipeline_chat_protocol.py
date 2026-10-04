@@ -23,7 +23,7 @@ from radar.config.interests import default_profile
 from radar.pipeline import PipelineRequest, run
 from radar.processing.triage_input import build_input
 from radar.prompts.catalog import SPECIALIST_ROLES, specialist_prompt
-from radar.provider import freetoken
+from radar.provider import strata as freetoken
 from radar.schema.papers import CollectedWork
 from radar.source import openalex
 from radar.storage.snapshots import refresh_pool

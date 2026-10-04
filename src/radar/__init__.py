@@ -1,4 +1,4 @@
-"""AI/ML opportunity radar: OpenAlex discovery + local FreeToken analysis.
+"""AI/ML opportunity radar: OpenAlex discovery + local Strata analysis.
 
 Caller-facing seams are re-exported lazily (PEP 562) so importing leaf
 modules such as ``radar.schema.papers`` never pulls service dependencies
@@ -49,7 +49,8 @@ _LAZY: dict[str, str] = {
     # agent/opportunity_analysis.py
     "analyze_candidates": "radar.agent.opportunity_analysis",
     "build_agent": "radar.agent.opportunity_analysis",
-    # provider/freetoken.py
+    # provider/strata.py (retired-provider exception alias remains compatible)
+    "StrataError": "radar.provider.strata",
     "FreeTokenError": "radar.provider.freetoken",
     # output/markdown.py
     "render_markdown": "radar.output.markdown",

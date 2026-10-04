@@ -4,7 +4,7 @@ One-command radar: discover recent AI/ML papers via **OpenAlex** (the sole
 scholarly discovery API; arXiv appears only as an OpenAlex location string),
 screen the full pool with **CLEF** (preferred) or **Qwen** (chat fallback),
 then analyze the shortlist with three specialists and a synthesizer using
-the local **FreeToken** model through **PydanticAI** (typed outcomes,
+the local **Strata** model through **PydanticAI** (typed outcomes,
 Chat Completions path).
 
 > Refactor note (issue #34, finished): the code now lives in the
@@ -36,14 +36,15 @@ src/radar/
     openalex.py        HTTPX discovery requests, retry/quota,
                        normalization, dedup, provenance
   provider/
-    freetoken.py       LAN PydanticAI model construction + client lifecycle
+    strata.py          LAN PydanticAI model construction + client lifecycle
+    freetoken.py       retired-provider import compatibility only
     clef.py            LAN CLEF/SystemOne screening client (native HTTPX,
                        batch triage, deadlines, fail-fast)
   agent/
     research_team.py   common evidence cohort, specialists, shared deadline,
                        bounded contributions, synthesis and client cleanup
     paper_triage.py    same screening inputs/answer models over PydanticAI
-                       FreeToken chat, complete-paper batches and deadlines
+                       Strata chat, complete-paper batches and deadlines
     opportunity_analysis.py  typed Agent[None, RadarDraft], complete-paper prompt
                        assembly + YAML instructions, deadline/usage,
                        output validation
@@ -212,10 +213,10 @@ successful report. Metadata-only cached runs perform no inference.
 
 These tests use synthetic papers and predetermined HTTP model responses.
 They neither read `.env` nor open network sockets, and do not establish model
-quality, server compatibility or a successful live research run. As of
-2026-10-03 the operator is retiring FreeToken; live inference checks are stopped
-pending replacement details. Existing provider configuration is retained,
-not silently repointed or migrated to an unchosen service.
+quality, server compatibility or a successful live research run.
+The operator retired FreeToken and explicitly selected Strata as its replacement.
+The canonical adapter is now `provider/strata.py`; prior offline evidence does
+not establish live compatibility or model quality for the replacement service.
 
 `tests/radar/test_architecture.py` resolves the actual imported radar package
 and scans nested application modules, refusing empty scans. It checks static
@@ -232,7 +233,7 @@ rules, not arbitrary dynamic imports or transitive runtime reachability.
   confirmed-daily-quota fast-fail, and normalization into paper contracts.
   No LLM calls. Errors are redacted (no URLs, credentials, headers, or
   raw bodies).
-- **Provider** (`provider/freetoken.py`) talks to your LAN machine: it
+- **Provider** (`provider/strata.py`) talks to your LAN machine: it
   validates the private-network endpoint, resolves the model id, and owns
   the inference HTTP client lifecycle (upstream internal `httpx2`,
   explicitly opened and deterministically closed per run). No prompts,
@@ -246,7 +247,7 @@ rules, not arbitrary dynamic imports or transitive runtime reachability.
   slot (only when unknowns exist and the shortlist holds two or more).
   This is decision routing; the synthesis agent below does the thinking.
   CLEF is preferred. If absent or unsuccessful, the Qwen endpoint screens
-  the entire original pool through the existing FreeToken chat endpoint.
+  the entire original pool through the existing Strata chat endpoint.
   Both use the same canonical `{model,state,questions}` inputs and the
   same Pydantic `SystemOneResponse` answer model. Qwen chat framing adds
   batch/work-ID correlation, not a different question/rubric or truncated
@@ -264,14 +265,14 @@ rules, not arbitrary dynamic imports or transitive runtime reachability.
 uv run --env-file .env python -m radar --collect-only --max-candidates 8
 
 # Full run: collect + SystemOne screening + local-model analysis as Markdown
-# (requires working CLEF or the configured FreeToken Qwen chat service).
+# (requires working CLEF or the configured Strata Qwen chat service).
 uv run --env-file .env python -m radar --max-candidates 8
 
 # Unattended metadata refresh (full pool snapshot, no LLM).
 uv run --env-file .env python -m radar --collect-only --refresh-dir data/radar
 
 # Cached synthesis: zero OpenAlex calls (SystemOne screening still mandatory,
-# needs a working routing endpoint plus FreeToken for synthesis).
+# needs a working routing endpoint plus Strata for synthesis).
 uv run --env-file .env python -m radar --from-snapshot data/radar/snapshot.json --max-candidates 2
 
 # Analysis with CLEF routing (CLEF server user-owned, not running yet).
@@ -287,22 +288,22 @@ uv run --env-file .env python -m radar --keywords "graph neural networks" --look
 ## Screening (mandatory routing; CLEF preferred, Qwen chat fallback)
 
 Every analysis run screens the full pool before shortlist selection and
-FreeToken synthesis. CLEF uses `CLEF_BASE_URL` / `--clef-base-url` and
+Strata synthesis. CLEF uses `CLEF_BASE_URL` / `--clef-base-url` and
 `CLEF_MODEL` (default `clef-flash`). When CLEF is absent, unavailable,
 malformed, incomplete, or deadline-expired, the full original pool is
-screened through FreeToken Chat Completions. Explicit unsafe/invalid
+screened through Strata Chat Completions. Explicit unsafe/invalid
 CLEF configuration is refused, not bypassed.
 
-Qwen uses the existing `FREETOKEN_BASE_URL` / `--base-url` and
-`FREETOKEN_MODEL` / `--model` configuration and provider. CLEF receives
+Qwen uses the existing `STRATA_BASE_URL` / `--base-url` and
+`STRATA_MODEL` / `--model` configuration and provider. CLEF receives
 native SystemOne inputs; Qwen receives batches of those same full inputs
 as chat user-message content. Both validate `model` and the same two
 `answers` (`type: noul`, strict finite numeric `noul` in 0..1) via shared
 Pydantic models. Batch work IDs must match exactly, with one bounded
 validation retry. The questions, criteria and full paper data are shared;
 there is no heuristic substitute, rewritten decision task, or need for
-FreeToken to expose `/v1/systemone`. PydanticAI controls Qwen routing and
-synthesis. Provider endpoints are unchanged; normal synthesis now follows
+Strata to expose `/v1/systemone`. PydanticAI controls Qwen routing and
+synthesis. Native screening and chat protocol paths are unchanged; synthesis follows
 the specialist workflow described above.
 
 `--clef-timeout` bounds CLEF requests (default 10 s). Qwen chat requests
@@ -320,32 +321,46 @@ reason; strict v1 source snapshots are never mutated. `--collect-only`
 and an empty pool call no routing or synthesis model. No servers are launched.
 
 Earlier probing of FreeToken `/v1/systemone` was based on an incorrect
-transport interpretation. FreeToken correctly exposes chat; the same
+transport interpretation. Strata also exposes chat; the same
 screening input and Pydantic answer contract are carried over that endpoint.
 
 Exit codes: 0 ok, 2 external-service (OpenAlex) failure, 3 analysis/report
-failure (including FreeToken), 4 usage/config error.
+failure (including Strata), 4 usage/config error.
 
 ## Configuration (env)
 
 | Var | Meaning | Default |
 | --- | ------- | ------- |
-| `FREETOKEN_BASE_URL` | User-owned loopback or private-LAN endpoint | required unless `--base-url` is passed |
-| `FREETOKEN_MODEL` | Model id (skips `/models` lookup) | first id from `GET {base}/models` |
-| `FREETOKEN_API_KEY` | Local API key placeholder | `freetoken-local` |
-| `FREETOKEN_DISABLE_THINKING` | Opt-in server-specific thinking-disable key | unset (omitted) |
+| `STRATA_BASE_URL` | User-owned loopback or private-LAN endpoint | required unless `--base-url` is passed |
+| `STRATA_MODEL` | Model id (skips `/models` lookup) | first id from `GET {base}/models` |
+| `STRATA_API_KEY` | Local API key placeholder | `strata-local` |
+| `STRATA_DISABLE_THINKING` | Opt-in server-specific thinking-disable key | unset (omitted) |
 | `OPENALEX_API_KEY` | Optional personal OpenAlex budget | unset (shared anonymous pool) |
 | `CLEF_BASE_URL` | Preferred user-owned LAN CLEF endpoint | unset (Qwen fallback) |
 | `CLEF_MODEL` | CLEF model id | `clef-flash` |
 
 Loopback, RFC 1918, IPv6 ULA, and RFC 6598 endpoints are allowed. Public,
 link-local, multicast, reserved, and unspecified destinations are refused;
-LAN hostnames must resolve exclusively to allowed addresses. The FreeToken
+LAN hostnames must resolve exclusively to allowed addresses. The Strata
 server is user-owned: this tool never starts, stops, or alters it, and
 there are no cloud-model fallbacks. Configured private-LAN example (no
 secrets involved):
-`--base-url http://192.168.0.166:1919/v1 --model Qwen3.6-35B-A3B-NVFP4`
-(or the equivalent `FREETOKEN_*` env vars).
+`--base-url http://192.168.1.20:8080/v1 --model <served-model-id>`
+(or the equivalent `STRATA_*` env vars).
+
+Explicit `--base-url` / `--model` values win over `STRATA_*` settings;
+`FREETOKEN_*` settings are compatibility fallbacks only. `STRATA_DISABLE_THINKING=0`
+can override a legacy thinking-disable setting. The retired provider module
+re-exports the same contracts; it has no separate transport. No machine-specific
+endpoint is assumed when neither explicit nor environment configuration is set.
+The CLI does not automatically load `.env`; export it before running:
+
+```sh
+set -a
+. ./.env
+set +a
+python -m radar --from-snapshot data/radar/snapshot.json
+```
 
 ## Discovery, quota, and paper counts
 
@@ -401,7 +416,7 @@ tests green with a 106-work refresh in 3s, cached 3-paper briefing in
 synthesis. The Qwen fallback originally passed 190/190 tests, including 19 typed
 Qwen chat regressions and 106-work acceptance (102 synthetic decisions,
 4 missing-abstract unknowns, shortlist 8). Mock tests are not real model
-quality evidence. CLEF is absent and never launched; Qwen uses FreeToken chat.
+quality evidence. CLEF is absent and never launched; Qwen uses Strata chat.
 
 Live checks on 2026-10-03 are not yet successful: full cached106 routing
 and a three-paper probe each reached the60s deadline without validated
