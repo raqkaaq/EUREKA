@@ -501,6 +501,12 @@ def _analyze_pool(
             "with Pydantic-validated SystemOne answer contracts."
         )
     shortlist = select_candidates(pool_full, batch, request.max_candidates)
+    if not shortlist:
+        notes.append(_out_triage.triage_coverage_line(
+            pool_total=len(pool_full), summary=summary, selected=0, opportunities=0))
+        return PipelineResult(
+            0, "No scored papers met the importance threshold; no investigation performed.",
+            tuple(notes))
     try:
         included = _team.select_for_prompt(shortlist, request.max_candidates)
     except ValueError as exc:

@@ -56,7 +56,7 @@ def _scored_handler(calls: list):
         digest = int(hashlib.sha1(title.encode()).hexdigest()[:8], 16)
         rel = round(0.05 + (digest % 90) / 100.0, 4)
         payload = {"model": body["model"], "answers": {
-            "ai_ml_relevance": {"type": "noul", "noul": rel},
+            "research_importance": {"type": "noul", "noul": rel},
             "cross_domain_potential": {"type": "noul", "noul": 0.1}}}
         return httpx.Response(200, content=json.dumps(payload).encode(),
                               request=request)
@@ -112,11 +112,12 @@ class TestFullPoolOfflineAcceptance(unittest.TestCase):
             self.assertEqual(len(calls), 102)
             line = " ".join(result.stderr_notes)
             for token in ("pool=106", "considered=106", "scored=102",
-                          "unknown=4", "failed=0", "selected=5",
-                          "analyzed=5", f"model={MODEL}"):
+                          "unknown=4", "failed=0", "selected=4",
+                          "analyzed=4", f"model={MODEL}"):
                 self.assertIn(token, line)
-            # The larger specialist-context reserve admits five papers while
-            # screening still covers the entire 106-paper pool.
+            # The larger specialist-context reserve admits four papers under
+            # the importance wording while screening still covers the entire
+            # 106-paper pool.
             # Every evidence URL resolves inside the pool.
             pool_ids = {w.openalex_id for w in works}
             import re

@@ -77,7 +77,7 @@ def valid_output(body: dict) -> dict:
         papers = json.loads(user_prompt(body))["papers"]
         return {"responses": [{"work_id": paper["work_id"],
             "model": paper["input"]["model"], "answers": {
-                "ai_ml_relevance": {"type": "noul", "noul": 0.8},
+                "research_importance": {"type": "noul", "noul": 0.8},
                 "cross_domain_potential": {"type": "noul", "noul": 0.6},
             }} for paper in papers]}
     return {"opportunities": [{"title": "Offline hypothesis",
@@ -143,7 +143,7 @@ class TestPipelineChatProtocol(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, result.stderr_notes)
             self.assertEqual(Path(snapshot).read_bytes(), before)
             metadata = json.loads((Path(sidecar) / "triage.json").read_text())
-            self.assertEqual(metadata["rubric_version"], "clef-triage-v2")
+            self.assertEqual(metadata["rubric_version"], "clef-importance-v1")
             self.assertEqual(len(metadata["rubric_hash"]), 64)
             self.assertEqual(metadata["fallback_reason"], "missing_endpoint")
             self.assertEqual(len(clients), 2)  # Routing and research own separate sessions.
@@ -258,7 +258,7 @@ class TestPipelineChatProtocol(unittest.TestCase):
                     output = valid_output(body)
                     row = output["responses"][0]
                     if invalidity == "boolean_probability":
-                        row["answers"]["ai_ml_relevance"]["noul"] = True
+                        row["answers"]["research_importance"]["noul"] = True
                     elif invalidity == "wrong_model":
                         row["model"] = "different-model"
                     elif invalidity == "foreign_id":
@@ -273,7 +273,7 @@ class TestPipelineChatProtocol(unittest.TestCase):
                 self.assertEqual(len(seen), 2)
                 self.assertEqual(client_count, 1)
                 self.assertEqual(metadata["results"][0]["status"], "failed")
-                self.assertIsNone(metadata["results"][0]["ai_ml_relevance"])
+                self.assertIsNone(metadata["results"][0]["research_importance"])
 
     def test_cached_collect_mode_performs_no_chat_requests(self):
         def forbidden_chat(request):
@@ -316,7 +316,7 @@ class TestPipelineChatProtocol(unittest.TestCase):
                     if not available:
                         return httpx.Response(500, json={"error": "offline server unavailable"})
                     return httpx.Response(200, json={"model": MODEL, "answers": {
-                        "ai_ml_relevance": {"type": "noul", "noul": 0.8},
+                        "research_importance": {"type": "noul", "noul": 0.8},
                         "cross_domain_potential": {"type": "noul", "noul": 0.6},
                     }})
 

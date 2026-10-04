@@ -41,10 +41,10 @@ class TestSpecialistPrompts(unittest.TestCase):
         from radar.schema.configuration import ScreeningConfig
 
         rubric = screening_questions()
-        self.assertEqual(rubric.rubric_version, "clef-triage-v2")
+        self.assertEqual(rubric.rubric_version, "clef-importance-v1")
         self.assertEqual(len(rubric.fingerprint), 64)
         changed = rubric.model_dump(by_alias=True)
-        changed["questions"]["ai_ml_relevance"]["instructions"] += " More guidance."
+        changed["questions"]["research_importance"]["instructions"] += " More guidance."
         modified = ScreeningConfig.model_validate(changed)
         self.assertNotEqual(modified.fingerprint, rubric.fingerprint)
 

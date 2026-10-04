@@ -17,6 +17,7 @@ from radar.config.runtime import (
 )
 from radar.schema.opportunities import SpecialistRole
 from radar.schema.papers import SearchRole
+from radar.schema.triage import IMPORTANCE_RUBRIC_VERSION
 
 Text = Annotated[str, Field(strict=True, min_length=1, max_length=8000)]
 Version = Annotated[int, Field(strict=True, ge=1, le=1)]
@@ -56,7 +57,7 @@ class ScreeningQuestion(ConfigurationModel):
 
 
 class ScreeningQuestions(ConfigurationModel):
-    ai_ml_relevance: ScreeningQuestion
+    research_importance: ScreeningQuestion
     cross_domain_potential: ScreeningQuestion
 
 
@@ -64,6 +65,12 @@ class ScreeningConfig(ConfigurationModel):
     version: Version
     rubric_version: Annotated[str, Field(strict=True, min_length=1, max_length=200)]
     questions: ScreeningQuestions
+
+    @model_validator(mode="after")
+    def _supported_rubric(self) -> ScreeningConfig:
+        if self.rubric_version != IMPORTANCE_RUBRIC_VERSION:
+            raise ValueError("unsupported current screening rubric")
+        return self
 
     @property
     def fingerprint(self) -> str:

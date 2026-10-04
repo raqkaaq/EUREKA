@@ -35,7 +35,7 @@ def answers_model(calls, mutate=None):
         papers = json.loads(prompt)["papers"]
         calls.append(papers)
         rows = [{"work_id": p["work_id"], "model": p["input"]["model"],
-                 "answers": {"ai_ml_relevance": {"type": "noul", "noul": 0.8},
+                 "answers": {"research_importance": {"type": "noul", "noul": 0.8},
                              "cross_domain_potential": {"type": "noul", "noul": 0.4}}}
                 for p in papers]
         if mutate:
@@ -128,12 +128,29 @@ class TestQwenTriage(unittest.TestCase):
             with self.subTest(value=repr(value)):
                 calls = []
                 def invalid(rows):
-                    rows[0]["answers"]["ai_ml_relevance"]["noul"] = value
+                    rows[0]["answers"]["research_importance"]["noul"] = value
                     return rows
                 batch = screen_works(works(1), default_profile(), model=answers_model(calls, invalid))
                 self.assertEqual(batch.results[0].status, "failed")
                 self.assertEqual(batch.results[0].failure_kind, "invalid_response")
                 self.assertEqual(len(calls), 2)
+
+    def test_old_only_wire_answers_are_rejected_as_importance(self):
+        from radar.agent.paper_triage import screen_works
+        calls = []
+
+        def legacy(rows):
+            for row in rows:
+                row["answers"] = {
+                    "ai_ml_relevance": {"type": "noul", "noul": 0.8},
+                    "cross_domain_potential": {"type": "noul", "noul": 0.4},
+                }
+            return rows
+
+        batch = screen_works(works(1), default_profile(), model=answers_model(calls, legacy))
+        self.assertEqual(batch.results[0].status, "failed")
+        self.assertEqual(batch.results[0].failure_kind, "invalid_response")
+        self.assertEqual(len(calls), 2)
 
     def test_missing_duplicate_foreign_ids_and_wrong_model_are_rejected(self):
         from radar.agent.paper_triage import screen_works
@@ -224,7 +241,7 @@ class TestQwenTriage(unittest.TestCase):
             prompt = next(m["content"] for m in body["messages"] if m["role"] == "user")
             papers = json.loads(prompt)["papers"]
             responses = [{"work_id": p["work_id"], "model": p["input"]["model"], "answers": {
-                "ai_ml_relevance": {"type": "noul", "noul": 0.8},
+                "research_importance": {"type": "noul", "noul": 0.8},
                 "cross_domain_potential": {"type": "noul", "noul": 0.4}}} for p in papers]
             return httpx2.Response(200, json={"id": "chat-test", "object": "chat.completion", "created": 1,
                 "model": "test-qwen", "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
@@ -259,7 +276,7 @@ class TestQwenTriage(unittest.TestCase):
             if any("W0" in p["work_id"] or "W1" in p["work_id"] for p in papers):
                 raise RuntimeError("first-batch-boom")
             rows = [{"work_id": p["work_id"], "model": p["input"]["model"],
-                     "answers": {"ai_ml_relevance": {"type": "noul", "noul": 0.8},
+                     "answers": {"research_importance": {"type": "noul", "noul": 0.8},
                                  "cross_domain_potential": {"type": "noul", "noul": 0.4}}}
                     for p in papers]
             return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {"responses": rows})])
@@ -339,7 +356,7 @@ class TestQwenTriage(unittest.TestCase):
         for status in ("scored", "missing_abstract", "oversized"):
             kwargs = {"work_id": "W", "status": status}
             if status == "scored":
-                kwargs.update(ai_ml_relevance=0.5, cross_domain_potential=0.5)
+                kwargs.update(research_importance=0.5, cross_domain_potential=0.5)
             with self.subTest(status=status):
                 with self.assertRaises(pydantic.ValidationError):
                     TriageResult(**kwargs, failure_kind="request_timeout")
@@ -397,7 +414,7 @@ class TestQwenPipeline(unittest.TestCase):
         for token in ("pool=106", "considered=106", "scored=102", "unknown=4", "selected=8", "backend=qwen"):
             self.assertIn(token, " ".join(result.stderr_notes))
         self.assertEqual(sidecar["probability_kind"], "prompted_estimate")
-        self.assertEqual(sidecar["rubric_version"], "clef-triage-v2")
+        self.assertEqual(sidecar["rubric_version"], "clef-importance-v1")
         self.assertEqual(len(sidecar["rubric_hash"]), 64)
         self.assertEqual(sidecar["fallback_reason"], "missing_endpoint")
 
@@ -416,14 +433,14 @@ class TestQwenPipeline(unittest.TestCase):
         chat.pop("model")
         native.pop("model")
         self.assertEqual(chat, native)
-        self.assertIn("psychometrics", chat["questions"]["ai_ml_relevance"]["instructions"])
+        self.assertIn("psychometrics", chat["questions"]["research_importance"]["instructions"])
 
     def test_successful_clef_never_calls_qwen_routing(self):
         calls = []
         def clef(request):
             body = json.loads(request.content)
             return httpx.Response(200, json={"model": body["model"], "answers": {
-                "ai_ml_relevance": {"type": "noul", "noul": 0.9},
+                "research_importance": {"type": "noul", "noul": 0.9},
                 "cross_domain_potential": {"type": "noul", "noul": 0.3}}})
         result, synthesis = self.pipeline(works(), routing=answers_model(calls),
             clef_base_url="http://127.0.0.1:9", clef_transport=httpx.MockTransport(clef))
@@ -483,7 +500,7 @@ class TestQwenPipeline(unittest.TestCase):
                 return httpx.Response(503)
             body = json.loads(request.content)
             return httpx.Response(200, json={"model": body["model"], "answers": {
-                "ai_ml_relevance": {"type": "noul", "noul": 0.99},
+                "research_importance": {"type": "noul", "noul": 0.99},
                 "cross_domain_potential": {"type": "noul", "noul": 0.99}}})
         with tempfile.TemporaryDirectory() as out:
             result, synthesis = self.pipeline(works(6), routing=answers_model(calls),
@@ -492,4 +509,4 @@ class TestQwenPipeline(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.stderr_notes)
         self.assertEqual(sum(len(c) for c in calls), 6)
         self.assertEqual(synthesis, [1, 1, 1, 1])
-        self.assertTrue(all(r["ai_ml_relevance"] == 0.8 for r in sidecar["results"]))
+        self.assertTrue(all(r["research_importance"] == 0.8 for r in sidecar["results"]))

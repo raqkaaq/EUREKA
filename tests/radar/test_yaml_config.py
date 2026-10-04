@@ -12,14 +12,14 @@ from radar.schema.configuration import AgentPrompt, AnalysisPrompt, ScreeningCon
 
 SCREENING = '''
 version: 1
-rubric_version: clef-triage-v2
+rubric_version: clef-importance-v1
 questions:
-  ai_ml_relevance:
+  research_importance:
     type: noul
-    instructions: "Relevant to {keywords}?"
+    instructions: "Important for {keywords}?"
     criteria:
-      "true": "Relevant."
-      "false": "Not relevant."
+      "true": "Important."
+      "false": "Not important."
   cross_domain_potential:
     type: noul
     instructions: "Transfers to {domains}?"
@@ -30,13 +30,17 @@ questions:
 
 
 class TestTypedYaml(unittest.TestCase):
+    def test_unsupported_importance_rubric_fails_configuration_preflight(self):
+        with self.assertRaises(ConfigurationError):
+            parse_yaml(SCREENING.replace("clef-importance-v1", "clef-importance-v2"), ScreeningConfig)
+
     def test_questions_are_typed_and_render_without_changing_the_contract(self):
         config = parse_yaml(SCREENING, ScreeningConfig)
-        self.assertEqual(config.questions.ai_ml_relevance.type, "noul")
+        self.assertEqual(config.questions.research_importance.type, "noul")
         rendered = config.render(keywords="diffusion", domains="economics")
-        self.assertEqual(rendered["ai_ml_relevance"], {
-            "type": "noul", "instructions": "Relevant to diffusion?",
-            "criteria": {"true": "Relevant.", "false": "Not relevant."},
+        self.assertEqual(rendered["research_importance"], {
+            "type": "noul", "instructions": "Important for diffusion?",
+            "criteria": {"true": "Important.", "false": "Not important."},
         })
         self.assertEqual(rendered["cross_domain_potential"]["instructions"],
                          "Transfers to economics?")
@@ -46,11 +50,11 @@ class TestTypedYaml(unittest.TestCase):
             "!!python/object/apply:os.system ['SECRET-CONFIG-VALUE']",
             SCREENING.replace("version: 1", "version: 2"),
             SCREENING.replace("version: 1", "version: true"),
-            SCREENING.replace("clef-triage-v2", "x" * 201),
+            SCREENING.replace("clef-importance-v1", "x" * 201),
             SCREENING + "unknown: SECRET-CONFIG-VALUE\n",
             SCREENING.replace("version: 1", "version: 1\nversion: 1"),
-            SCREENING.replace('"Relevant."', 'false'),
-            SCREENING.replace('"Relevant."', '"   "'),
+            SCREENING.replace('"Important."', 'false'),
+            SCREENING.replace('"Important."', '"   "'),
             SCREENING.replace("{keywords}", "{keywords.__class__}"),
             SCREENING.replace("{keywords}", "{keywords!r}"),
             SCREENING.replace("{keywords}", "{keywords:>30}"),
@@ -79,12 +83,12 @@ class TestTypedYaml(unittest.TestCase):
         self.assertIsInstance(paper_triage_prompt(), AgentPrompt)
         self.assertIsInstance(screening_questions(), ScreeningConfig)
         with self.assertRaises(ValidationError):
-            screening_questions().questions.ai_ml_relevance.instructions = "changed"
+            screening_questions().questions.research_importance.instructions = "changed"
         # Rendered wire dictionaries are independent of cached defaults.
         first = screening_questions().render(keywords="ml", domains="economics")
-        first["ai_ml_relevance"]["criteria"]["true"] = "changed"
+        first["research_importance"]["criteria"]["true"] = "changed"
         second = screening_questions().render(keywords="ml", domains="economics")
-        self.assertNotEqual(second["ai_ml_relevance"]["criteria"]["true"], "changed")
+        self.assertNotEqual(second["research_importance"]["criteria"]["true"], "changed")
 
     def test_config_size_bound(self):
         with self.assertRaises(ConfigurationError):
@@ -241,7 +245,7 @@ class TestYamlAgentInstructions(unittest.TestCase):
             seen["questions"] = paper["input"]["questions"]
             return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {"responses": [{
                 "work_id": paper["work_id"], "model": paper["input"]["model"],
-                "answers": {"ai_ml_relevance": {"type": "noul", "noul": 0.8},
+                "answers": {"research_importance": {"type": "noul", "noul": 0.8},
                             "cross_domain_potential": {"type": "noul", "noul": 0.6}},
             }]})])
 

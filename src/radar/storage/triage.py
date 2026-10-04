@@ -43,6 +43,7 @@ def _result_to_json(result: Any) -> dict[str, Any]:
         "work_id": getattr(result, "work_id", ""),
         "status": getattr(result, "status", "failed"),
         "ai_ml_relevance": getattr(result, "ai_ml_relevance", None),
+        "research_importance": getattr(result, "research_importance", None),
         "cross_domain_potential": getattr(result, "cross_domain_potential", None),
     }
 
