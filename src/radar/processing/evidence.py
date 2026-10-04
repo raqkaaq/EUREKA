@@ -22,6 +22,7 @@ from radar.schema.opportunities import (
     ResolvedLearningDossier,
 )
 from radar.schema.papers import CollectedWork
+from radar.schema.documents import PDFReading, PDFSource, DocumentFailure
 
 
 def _link_for(index: int, candidates: list[CollectedWork]) -> EvidenceLink | None:
@@ -44,7 +45,11 @@ def _link_for(index: int, candidates: list[CollectedWork]) -> EvidenceLink | Non
     )
 
 
-def attach_evidence(draft: RadarDraft, candidates: list[CollectedWork]) -> RadarReport:
+def attach_evidence(
+    draft: RadarDraft, candidates: list[CollectedWork], *,
+    document_readings: list[PDFReading] | None = None,
+    document_failures: list[DocumentFailure] | None = None,
+) -> RadarReport:
     """Attach deterministic evidence links to a model draft."""
     opportunities: list[Opportunity] = []
     for item in draft.opportunities:
@@ -58,6 +63,7 @@ def attach_evidence(draft: RadarDraft, candidates: list[CollectedWork]) -> Radar
             links.append(link)
         opportunities.append(Opportunity(draft=item, evidence_links=links))
     dossiers: list[ResolvedLearningDossier] = []
+    readings = {r.work_id: r for r in document_readings or []}
     if isinstance(draft, LearningRadarDraft):
         seen_primary: set[int] = set()
         for dossier in draft.learning_dossiers:
@@ -71,10 +77,19 @@ def attach_evidence(draft: RadarDraft, candidates: list[CollectedWork]) -> Radar
                     f"Learning dossier source index {index} has no safe candidate link; "
                     "invalid learning sources are never silently dropped."
                 )
-            if not candidates[index].abstract.strip():
+            reading = readings.get(candidates[index].openalex_id)
+            if document_readings is not None and reading is None:
+                raise ValueError("Full-text investigation requires a completed PDF reading.")
+            if reading is None and not candidates[index].abstract.strip():
                 raise ValueError("An abstract-level learning dossier requires a supplied abstract.")
-            dossiers.append(ResolvedLearningDossier(
-                dossier=dossier, source=link, evidence_level="abstract"))
+            if reading is None:
+                dossiers.append(ResolvedLearningDossier(dossier=dossier, source=link))
+            else:
+                dossiers.append(ResolvedLearningDossier(
+                    dossier=dossier, source=link, evidence_level="pdf_text",
+                    source_pdf=PDFSource.model_validate(reading.model_dump(include=set(PDFSource.model_fields))),
+                    source_pages=dossier.supporting_pages,
+                ))
     elif getattr(draft, "learning_dossiers", None):
         raise ValueError("Unexpected learning dossiers on a non-learning draft.")
     ignore = [str(x).strip()[:300] for x in draft.ignore if str(x).strip()][:10]
@@ -82,6 +97,8 @@ def attach_evidence(draft: RadarDraft, candidates: list[CollectedWork]) -> Radar
         opportunities=opportunities,
         ignore=ignore,
         next_move=draft.next_move.strip()[:2000],
+        document_readings=document_readings or [],
+        document_failures=document_failures or [],
         learning_dossiers=dossiers,
     )
 

@@ -13,6 +13,7 @@ dependencies = [
     "pydantic-ai-slim[openai]>=2.52.0",
     "PyYAML>=6.0.3,<7",
     "falkordblite==0.10.0",
+    "pypdf>=6.19,<7",
 ]
 
 [project.scripts]

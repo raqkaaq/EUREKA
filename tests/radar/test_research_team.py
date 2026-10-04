@@ -358,8 +358,13 @@ class TestResearchTeam(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             snapshot = refresh_pool(works(), tmp)["snapshot"]
             before = Path(snapshot).read_bytes()
+            from pdf_support import empty_notes_model, make_loader, make_pdf_document
+            pool = works()
+            docs = {w.openalex_id: make_pdf_document(w.openalex_id) for w in pool}
             result = run(PipelineRequest(mode="analyze", from_snapshot=snapshot,
-                                        triage_scorer=score, model_override=FunctionModel(respond)))
+                                        triage_scorer=score, model_override=FunctionModel(respond),
+                                        document_loader=make_loader(docs),
+                                        document_model_override=empty_notes_model()))
             self.assertEqual(Path(snapshot).read_bytes(), before)
         self.assertEqual(result.exit_code, 0, result.stderr_notes)
         self.assertEqual(len(calls), 4)
@@ -400,10 +405,12 @@ class TestResearchTeam(unittest.TestCase):
             with mock.patch("radar.agent.research_team.opportunity_analysis_prompt", return_value=spec):
                 result = run(PipelineRequest(mode="analyze", from_snapshot=snapshot,
                                             triage_scorer=score, model_override=model))
-        self.assertEqual(result.exit_code, 0, result.stderr_notes)
-        self.assertIn("prompt budget", result.stdout)
-        self.assertIn("pool=1", " ".join(result.stderr_notes))
-        self.assertIn("analyzed=0", " ".join(result.stderr_notes))
+        # Full-PDF mode never uses the abstract prompt budget: without an
+        # explicit document loader there are no readings, so analysis fails
+        # closed with no synthesis and no inference.
+        self.assertEqual(result.exit_code, 3, result.stderr_notes)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("No PDF readings completed", " ".join(result.stderr_notes))
 
     def test_synthesis_deadline_has_no_fresh_budget_and_closes_successful_specialists(self):
         from radar.agent.research_team import research_candidates

@@ -29,3 +29,22 @@ def specialist_prompt(role: SpecialistRole) -> SpecialistPrompt:
     if prompt.role != role:
         raise ConfigurationError("specialist document has the wrong role")
     return prompt
+
+
+def pdf_reading_prompt() -> AgentPrompt:
+    return load_yaml("radar.prompts", "pdf_reading.yaml", AgentPrompt)
+
+
+def pdf_reduction_prompt() -> AgentPrompt:
+    return load_yaml("radar.prompts", "pdf_reduction.yaml", AgentPrompt)
+
+
+def validate_pdf_prompts() -> None:
+    """PDF-only preflight: reader/reducer YAMLs load typed with safe wording."""
+    for loader in (pdf_reading_prompt, pdf_reduction_prompt):
+        spec = loader()
+        text = spec.instructions.lower()
+        if "untrusted" not in text or "not visually verified" not in text:
+            raise ConfigurationError("pdf prompt missing safety disclosure")
+        if "no tools" not in text:
+            raise ConfigurationError("pdf prompt missing tool prohibition")

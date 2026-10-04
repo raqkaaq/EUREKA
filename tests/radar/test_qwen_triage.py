@@ -394,8 +394,12 @@ class TestQwenPipeline(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}, clear=True):
             snapshot = refresh_pool(pool, tmp)["snapshot"]
             before = Path(snapshot).read_bytes()
+            from pdf_support import empty_notes_model, make_loader, make_pdf_document
+            docs = {w.openalex_id: make_pdf_document(w.openalex_id) for w in pool}
             args = dict(mode="analyze", from_snapshot=snapshot, max_candidates=2,
-                        model_override=synth_model(synthesis), triage_model_override=routing)
+                        model_override=synth_model(synthesis), triage_model_override=routing,
+                        document_loader=make_loader(docs),
+                        document_model_override=empty_notes_model())
             args.update(kwargs)
             result = run(PipelineRequest(**args))
             self.assertEqual(Path(snapshot).read_bytes(), before)

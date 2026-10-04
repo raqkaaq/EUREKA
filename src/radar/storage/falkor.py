@@ -98,7 +98,7 @@ class FalkorGraph:
         Opportunities are model-generated hypotheses; evidence edges come only
         from deterministically attached links that name a stored paper, so no
         citation or scientific relationship is invented here. Learning
-        dossiers are model interpretations grounded at the abstract level:
+        dossiers are model interpretations labelled by their actual source basis:
         ``HAS_LEARNING_DOSSIER`` (run -> dossier) and ``ABOUT_PAPER``
         (dossier -> existing paper) use only the deterministically attached
         source, with no invented scientific ontology.
@@ -111,6 +111,9 @@ class FalkorGraph:
         if any(resolved.source.openalex_id not in identities
                for _, report in reports for resolved in report.learning_dossiers):
             raise FalkorError("Learning dossier source names a paper absent from SQLite projection")
+        if any(record.work_id not in identities for _, report in reports
+               for record in [*report.document_readings, *report.document_failures]):
+            raise FalkorError("Document outcome names a paper absent from SQLite projection")
         self._write("MATCH (n) DETACH DELETE n", {})
         for paper in papers:
             self._write(
@@ -150,7 +153,7 @@ class FalkorGraph:
                     {"dossier_id": dossier_id,
                      "paper_index": resolved.dossier.paper_index,
                      "origin": DOSSIER_ORIGIN,
-                     "evidence_level": DOSSIER_EVIDENCE_LEVEL},
+                     "evidence_level": resolved.evidence_level},
                 )
                 self._write(
                     "MATCH (r:Run {id: $run_id}) MATCH (d:LearningDossier {id: $dossier_id}) "

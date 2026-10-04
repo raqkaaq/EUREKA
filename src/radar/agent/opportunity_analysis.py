@@ -150,6 +150,94 @@ def build_prompt(
     return "\n".join(parts)
 
 
+def pdf_candidate_block(index: int, work: CollectedWork, reading) -> str:
+    """Full-text candidate block from a completed PDF reading."""
+    from radar.schema.documents import PDFReading as _PDFReading
+
+    if not isinstance(reading, _PDFReading):
+        raise ValueError("PDF block requires a completed PDFReading")
+    title = _truncate(work.title or "(untitled)", MAX_TITLE_IN_PROMPT)
+    year = work.publication_year or "n/a"
+    notes_json = reading.notes.model_dump_json()
+    quotes = "; ".join(
+        f"p{item.page}: {item.quote!r}" for item in reading.notes.evidence) or "(no verified quotes)"
+    return (
+        f"[{index}] {title} ({year}, cited_by={work.cited_by_count})\n"
+        f"--- begin untrusted candidate {index} data ---\n"
+        f"    Source coverage: full extracted PDF text read via "
+        f"{len(reading.chunks)} chunks ({reading.page_count} pages, "
+        f"{reading.text_chars} chars)\n"
+        f"    Extraction warning: {reading.extraction_warning}\n"
+        f"    Final reading notes: {notes_json}\n"
+        f"    Verified page quotes: {quotes}\n"
+        f"--- end untrusted candidate {index} data ---"
+    )
+
+
+def select_for_pdf_prompt(
+    candidates: list[CollectedWork],
+    readings_by_id: dict[str, object],
+    max_candidates: int = MAX_CANDIDATES_IN_PROMPT,
+    *,
+    prompt_spec: AnalysisPrompt | None = None,
+    reserved_context_chars: int = 0,
+    max_chars: int | None = None,
+) -> list[CollectedWork]:
+    """Common complete-paper cohort over full-text PDF blocks.
+
+    Only candidates with a completed reading are eligible; every returned
+    paper is present verbatim in the submitted input within ``max_chars``.
+    """
+    from radar.config.documents import PDF_RESEARCH_PROMPT_CHARS
+
+    bound = PDF_RESEARCH_PROMPT_CHARS if max_chars is None else max_chars
+    spec = prompt_spec if prompt_spec is not None else opportunity_analysis_prompt()
+    if not 0 <= reserved_context_chars <= bound:
+        raise ValueError("invalid reserved prompt context budget")
+    bounded = bound_candidates(candidates, max_candidates)
+    eligible = [w for w in bounded if w.openalex_id in readings_by_id]
+    header = _header(spec)
+    footer = _footer(len(eligible), spec)
+    used = len(spec.instructions) + len(header) + len(footer) + reserved_context_chars + 6
+    included: list[CollectedWork] = []
+    for work in eligible:
+        block = pdf_candidate_block(len(included), work, readings_by_id[work.openalex_id])
+        if used + len(block) + 1 > bound:
+            break
+        included.append(work)
+        used += len(block) + 1
+    return included
+
+
+def build_pdf_prompt(
+    candidates: list[CollectedWork],
+    readings_by_id: dict[str, object],
+    max_candidates: int = MAX_CANDIDATES_IN_PROMPT,
+    *,
+    prompt_spec: AnalysisPrompt | None = None,
+    context: str = "",
+    max_chars: int | None = None,
+) -> str:
+    """Build the bounded full-text PDF prompt (complete blocks + footer)."""
+    from radar.config.documents import PDF_RESEARCH_PROMPT_CHARS
+
+    bound = PDF_RESEARCH_PROMPT_CHARS if max_chars is None else max_chars
+    spec = prompt_spec if prompt_spec is not None else opportunity_analysis_prompt()
+    included = select_for_pdf_prompt(
+        candidates, readings_by_id, max_candidates, prompt_spec=spec,
+        reserved_context_chars=len(context), max_chars=bound)
+    parts = [_header(spec)]
+    parts.extend(pdf_candidate_block(i, work, readings_by_id[work.openalex_id])
+                 for i, work in enumerate(included))
+    if context:
+        parts.append(context)
+    parts.append(_footer(len(included), spec))
+    prompt = "\n".join(parts)
+    if len(spec.instructions) + len(prompt) + 2 > bound:
+        raise ValueError("PDF prompt exceeded its bound")
+    return prompt
+
+
 def run_bounds(
     disable_thinking: bool = False,
     max_tokens: int = ANALYSIS_MAX_TOKENS,
@@ -376,7 +464,10 @@ __all__ = [
     "analyze_candidates",
     "analyze_candidates_async",
     "build_agent",
+    "build_pdf_prompt",
     "build_prompt",
+    "pdf_candidate_block",
     "run_bounds",
+    "select_for_pdf_prompt",
     "select_for_prompt",
 ]

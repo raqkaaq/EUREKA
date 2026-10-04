@@ -3,7 +3,8 @@
 One-command radar: discover recent AI/ML papers via **OpenAlex** (the sole
 scholarly discovery API; arXiv appears only as an OpenAlex location string),
 screen the full pool with **CLEF** (preferred) or **Qwen** (chat fallback),
-then analyze the shortlist with three specialists and a synthesizer using
+then read every shortlisted paper's full PDF text and analyze the verified
+readings with three specialists and a synthesizer using
 the local **Strata** model through **PydanticAI** (typed outcomes,
 Chat Completions path).
 
@@ -20,6 +21,7 @@ src/radar/
   config/
     interests.py       interest profile (AI/ML core + behavioral/economic lenses)
     runtime.py         all numeric bounds (service-free)
+    documents.py       PDF download/parser/chunk/reading hard bounds
     searches.yaml      research questions and historical/frontier/challenge retrieval
     searches.py        profile/template expansion, bounded query plan
     qwen_screening.yaml  small-batch fallback concurrency and deadline policy
@@ -33,8 +35,11 @@ src/radar/
     ml_methods.yaml           technical mechanisms and controlled evaluation
     behavioral_economics.yaml behavioral/economic transfer and identification
     evidence_review.yaml      falsification, evidence gaps and replication
+    pdf_reading.yaml          page-grounded full-text chunk investigation
+    pdf_reduction.yaml        preserve all chunk notes and counterevidence
     catalog.py                typed access to the prompt documents
   source/
+    pdf.py             safe HTTPX acquisition from OpenAlex PDF locations/cache
     openalex.py        HTTPX discovery requests, retry/quota,
                        normalization, dedup, provenance
   provider/
@@ -43,6 +48,7 @@ src/radar/
     clef.py            LAN CLEF/SystemOne screening client (native HTTPX,
                        batch triage, deadlines, fail-fast)
   agent/
+    pdf_reading.py     PydanticAI chunk reading and hierarchical note reduction
     research_team.py   common evidence cohort, specialists, shared deadline,
                        bounded contributions, synthesis and client cleanup
     paper_triage.py    same screening inputs/answer models over PydanticAI
@@ -51,6 +57,9 @@ src/radar/
                        assembly + YAML instructions, deadline/usage,
                        output validation
   processing/
+    document_chunks.py lossless page-marked text and deterministic chunk spans
+    pdf_text.py        resource-limited isolated pypdf text-layer extraction
+    isolated.py        bounded child pipes/deadline/cleanup, no runtime files
     triage_input.py    canonical model/state/questions input for both backends
     ranking.py         deterministic scoring/selection (pool → ranked topN)
     evidence.py        evidence index resolution/validation
@@ -68,6 +77,7 @@ src/radar/
     json.py            JSON output shaping only (collect-only envelopes)
     triage.py          triage coverage summaries (considered/scored/unknown/failed)
   schema/
+    documents.py       PDF source, pages, notes, verified coverage and outcomes
     papers.py          paper/plan contracts (CollectedWork and friends)
     opportunities.py   analysis/briefing contracts (RadarDraft and friends)
     triage.py          shared SystemOneResponse, Qwen batch correlation,
@@ -176,7 +186,7 @@ they are not independent models or additional scientific sources.
   spots, robustness and efficiency trade-offs.
 - Behavioral/economics: grounded transfers through incentives, constructs,
   causal designs and human-system effects; no superficial analogies.
-- Evidence/replication: independently examine the same abstracts for missing
+- Evidence/replication: independently examine the same source blocks for missing
   controls, alternatives and replication needs. This reviewer does not receive
   or approve the other specialists' proposals.
 - Synthesis: reconcile contributions against original candidate data, retain
@@ -204,17 +214,56 @@ to reserve output tokens for answers. One
 synthesis calls. Failure cancels outstanding work, closes the owned session
 and produces no partial-success report.
 
-Every stage sees the same complete candidate blocks and indices. Selection
+Legacy abstract-only programmatic calls see complete candidate blocks and indices. Selection
 reserves 5000 characters for intermediate context (three reports plus wrappers
 fit), within the combined 12,000-character instruction/user-message budget. Richer prompts can reduce
 the actual analyzed shortlist; coverage reports that cohort, not the requested
 size or all discovered papers. Evidence indices, opportunity counts and
 contribution sizes are validated in code with bounded retries. No agent has
-research tools or PDF access; abstracts alone cannot establish quality,
+research tools; abstracts alone cannot establish quality,
 causality, global novelty, replication or deployment safety. Specialization
 adds inference cost/latency; metadata-only refreshes remain model-free.
 
-### Learning dossier (CORE slice)
+### Full PDF text investigation
+
+Normal CLI analysis now attempts **every System1-shortlisted paper** before
+final-team prompt selection. PDF acquisition uses only OpenAlex-supplied
+`locations[].pdf_url`, not landing-page scraping or another discovery source.
+HTTPX validates public hosts, pins connections to validated IPs, preserves TLS
+SNI, revalidates redirects, and never forwards provider/OpenAlex credentials.
+Only content-addressed final `pdf/W…-SHA256.pdf` downloads are created.
+
+Downloads share a 30-second deadline per paper, including DNS and alternate
+locations, and a 20-MiB byte bound. The isolated pypdf parser has a 20-second
+deadline, memory/CPU bounds, and bounded pipe output. More than 80 pages or
+120,000 extracted text characters fail explicitly, never truncate. Encrypted,
+invalid or unreadable/no-text pages also fail; there is **no abstract fallback**.
+Cache reuse checks the PDF hash and re-extracts pages from the immutable bytes.
+
+PydanticAI reads every character of the page-marked text in contiguous
+6,000-character chunks (at most 24). Code owns offsets and page coverage;
+model outputs contain notes only. Quotes must occur in both their actual chunk
+and cited source page. Hierarchical reduction consumes all notes, including
+the final/remainder group, and cannot introduce new quotes. Reader and reducer
+use the same configured Strata model as the final team. `--document-timeout`
+defaults to 900 seconds across all paper readings (maximum 3600); the existing
+`--analysis-timeout` separately bounds the final specialists/synthesis.
+
+All final-team roles receive whole reduced reading notes and verified quotes,
+within a 48,000-character PDF prompt budget. Coverage distinguishes PDFs read
+from papers included in synthesis. SQLite retains extracted documents, actual
+readings and failures **before** final-team work, so a later synthesis failure
+does not erase reading history. Reports include hashes, pages/chunks, explicit
+access failures and page links; dossiers cite only supplied verified quote pages.
+
+This is complete **text-layer** investigation, not visual verification or OCR:
+figures/images and equation/table extraction fidelity remain unverified.
+Model notes remain interpretations, not proof, replication or calibrated quality
+judgments. A paper without an accessible PDF is recorded as inaccessible, not
+scientifically unimportant. Only databases, downloaded PDFs and explicitly
+requested reports belong in the storage directory; no sidecars or harness files.
+
+### Learning dossier
 
 Final synthesis may return one primary learning dossier for the single most
 study-worthy paper (`schema/learning.py`: `LearningDossierDraft` with
@@ -228,7 +277,7 @@ most one dossier); specialists still return plain `RadarDraft` exactly as
 before, and legacy opportunity-only drafts validate with an empty dossier
 list. Old stored reports read back with default empty `learning_dossiers`.
 
-All research-team stages (three specialists plus synthesis) see the same
+Legacy abstract-only research-team calls (without `documents`) see the same
 intact full normalized abstracts via opt-in `complete_abstracts=True` on the
 shared prompt builder (default `False` preserves truncated excerpts for old
 callers). Blocks are never tail-truncated: an oversized leading source
@@ -239,19 +288,21 @@ proofs, equations, or full-text results. A grounded dossier is preferred over
 an invented opportunity; opportunities may be zero.
 
 Code attaches the dossier source deterministically (`EvidenceLink` plus
-code-owned `evidence_level="abstract"`, never model-written). Out-of-range or
+code-owned `evidence_level="abstract"` or `"pdf_text"`, never model-written). Out-of-range or
 duplicate primary indices fail the synthesis validator for a bounded retry and
 are never silently dropped; `attach_evidence` raises on an invalid dossier
-source instead of filtering it, and rejects sources without a supplied abstract.
+source instead of filtering it. Abstract-only dossiers require a supplied abstract;
+PDF dossiers require the matching completed reading and verified page references.
 SQLite `save_report` requires the source to belong to this run's pool, fall within
-its analyzed index range, and have a nonblank abstract in the immutable pool record.
+its analyzed index range, and have a matching stored reading (or a nonblank
+abstract in the immutable pool record for legacy abstract-only reports).
 Falkor preflights dossier sources before graph deletion
 and projects grounded `LearningDossier` nodes
-(`origin="model_interpretation"`, `evidence_level="abstract"`) with
+(`origin="model_interpretation"`, source-accurate `evidence_level`) with
 `HAS_LEARNING_DOSSIER` (run -> dossier) and `ABOUT_PAPER` (dossier ->
 existing paper) edges only; no invented scientific ontology. Markdown leads with
 one grounded dossier section (hypotheses labeled, interpretation marked,
-abstract-level source linked); opportunity-only reports render unchanged.
+source basis linked); legacy opportunity-only reports render unchanged.
 
 ### Reopening saved reports (offline)
 
@@ -262,8 +313,9 @@ discovery, model calls, graph process, schema changes, new run records or output
 files. Missing/corrupt/unsupported databases are preserved and fail safely.
 Old opportunity-only reports are marked as such rather than rewritten into
 unverified learning dossiers. These commands browse reports, not a full paper
-catalogue or web dashboard. Current dossiers remain abstract-based study seeds,
-not full-text lessons or evidence that the proposed tasks have been completed.
+catalogue or web dashboard. Legacy dossiers remain explicitly abstract-based;
+new PDF dossiers identify their text-layer provenance. Neither is evidence that
+the proposed study tasks have been completed.
 
 ### Evidence boundary
 

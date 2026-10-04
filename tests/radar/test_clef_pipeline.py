@@ -260,9 +260,13 @@ class TestMandatoryRoutingIntegration(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             snap = _write_snapshot(tmp, works)
+            from pdf_support import empty_notes_model, make_loader, make_pdf_document
+            docs = {w.openalex_id: make_pdf_document(w.openalex_id) for w in works}
             result = _run_pipeline(PipelineRequest(
                 mode="analyze", max_candidates=3, from_snapshot=snap,
-                model_override=_fixed_model(), triage_scorer=_scorer))
+                model_override=_fixed_model(), triage_scorer=_scorer,
+                document_loader=make_loader(docs),
+                document_model_override=empty_notes_model()))
             self.assertEqual(result.exit_code, 0)
             expected = select_candidates(
                 works,

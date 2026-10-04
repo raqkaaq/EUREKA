@@ -110,8 +110,11 @@ class TestPipelineChatProtocol(unittest.TestCase):
             snapshot = refresh_pool(pool, tmp)["snapshot"]
             before = Path(snapshot).read_bytes()
             sidecar_dir = str(Path(tmp) / "triage")
+            from pdf_support import empty_notes_model, make_any_loader
             settings = dict(mode="analyze", from_snapshot=snapshot, max_candidates=2,
-                            base_url=BASE, model=MODEL, triage_output=sidecar_dir)
+                            base_url=BASE, model=MODEL, triage_output=sidecar_dir,
+                            document_loader=make_any_loader(),
+                            document_model_override=empty_notes_model())
             settings.update(options)
             result = run(PipelineRequest(**settings))
             self.assertEqual(Path(snapshot).read_bytes(), before)
@@ -137,9 +140,12 @@ class TestPipelineChatProtocol(unittest.TestCase):
             snapshot = refresh_pool(pool, tmp)["snapshot"]
             before = Path(snapshot).read_bytes()
             sidecar = str(Path(tmp) / "triage")
+            from pdf_support import empty_notes_model, make_any_loader
             result = run(PipelineRequest(
                 mode="analyze", from_snapshot=snapshot, max_candidates=8,
-                base_url=BASE, model=MODEL, triage_output=sidecar))
+                base_url=BASE, model=MODEL, triage_output=sidecar,
+                document_loader=make_any_loader(),
+                document_model_override=empty_notes_model()))
             self.assertEqual(result.exit_code, 0, result.stderr_notes)
             self.assertEqual(Path(snapshot).read_bytes(), before)
             metadata = json.loads((Path(sidecar) / "triage.json").read_text())
@@ -429,9 +435,12 @@ class TestPipelineChatProtocol(unittest.TestCase):
                                      trust_env=False, follow_redirects=False)
         with tempfile.TemporaryDirectory() as tmp, chat_boundary(chat) as clients, mock.patch.object(
                 openalex, "default_client", return_value=source_client):
+            from pdf_support import empty_notes_model, make_any_loader
             result = run(PipelineRequest(
                 mode="analyze", refresh_dir=tmp, max_candidates=3,
-                base_url=BASE, model=MODEL, triage_output=tmp))
+                base_url=BASE, model=MODEL, triage_output=tmp,
+                document_loader=make_any_loader(),
+                document_model_override=empty_notes_model()))
             self.assertEqual(result.exit_code, 0, result.stderr_notes)
             snapshot = json.loads((Path(tmp) / "snapshot.json").read_text())
             self.assertEqual(len(snapshot["works"]), 13)

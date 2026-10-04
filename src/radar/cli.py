@@ -19,6 +19,7 @@ import argparse
 import os
 import sys
 
+from radar.config.documents import DOCUMENT_ANALYSIS_TIMEOUT_S
 from radar.config.runtime import (
     ANALYSIS_MAX_TIMEOUT_S,
     ANALYSIS_TIMEOUT_S,
@@ -158,6 +159,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Deprecated storage-directory alias; screening is saved in SQLite, never a JSON sidecar.",
     )
+    parser.add_argument(
+        "--document-timeout",
+        type=float,
+        default=DOCUMENT_ANALYSIS_TIMEOUT_S,
+        help="Full-PDF reading deadline in seconds, (0, 3600] (default 900).",
+    )
     return parser
 
 
@@ -201,6 +208,7 @@ def main(argv: list[str] | None = None) -> int:
         rebuild_graph=args.rebuild_graph,
         list_reports=args.reports,
         report_id=args.report,
+        document_timeout_s=args.document_timeout,
     )
     result = run(request)
     for note in result.stderr_notes:

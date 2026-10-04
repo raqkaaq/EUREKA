@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 
 from radar.config.runtime import MAX_EVIDENCE_PER_OPP, MAX_OPPORTUNITIES
 from radar.schema.learning import LearningDossierDraft
+from radar.schema.documents import PDFSource, PDFReading, DocumentFailure
 
 
 class OpportunityDraft(BaseModel):
@@ -68,9 +69,9 @@ class EvidenceLink(BaseModel):
 
 
 class ResolvedLearningDossier(BaseModel):
-    """Primary dossier plus its deterministically attached abstract source.
+    """Primary dossier plus its deterministically attached source basis.
 
-    ``evidence_level`` is code-owned (``Literal["abstract"]``, never
+    ``evidence_level`` is code-owned (abstract or PDF text, never
     model-writable): the draft has no such field and ``extra="forbid"``
     rejects any model-supplied value.
     """
@@ -79,12 +80,21 @@ class ResolvedLearningDossier(BaseModel):
 
     dossier: LearningDossierDraft
     source: EvidenceLink
-    evidence_level: Literal["abstract"] = "abstract"
+    evidence_level: Literal["abstract", "pdf_text"] = "abstract"
+    source_pdf: PDFSource | None = None
+    source_pages: list[StrictInt] = Field(default_factory=list, max_length=8)
 
     @model_validator(mode="after")
     def _matching_source(self) -> ResolvedLearningDossier:
         if self.source.index != self.dossier.paper_index or not self.source.openalex_id:
             raise ValueError("Learning dossier must reference its primary candidate.")
+        if self.evidence_level == "pdf_text":
+            if self.source_pdf is None or self.source_pdf.work_id != self.source.openalex_id or not self.source_pages:
+                raise ValueError("PDF evidence requires its own source and page references.")
+            if self.source_pages != self.dossier.supporting_pages:
+                raise ValueError("Resolved PDF pages must match the model's validated references.")
+        elif self.source_pdf is not None or self.source_pages or self.dossier.supporting_pages:
+            raise ValueError("Abstract evidence cannot claim PDF page coverage.")
         return self
 
 
@@ -130,6 +140,31 @@ class RadarReport(BaseModel):
     learning_dossiers: list[ResolvedLearningDossier] = Field(
         default_factory=list, max_length=1
     )
+    document_readings: list[PDFReading] = Field(default_factory=list, max_length=25)
+    document_failures: list[DocumentFailure] = Field(default_factory=list, max_length=25)
+
+    @model_validator(mode="after")
+    def _pdf_provenance(self) -> RadarReport:
+        readings = {r.work_id: r for r in self.document_readings}
+        if len(readings) != len(self.document_readings):
+            raise ValueError("Duplicate full-document reading.")
+        failed = [r.work_id for r in self.document_failures]
+        if len(set(failed)) != len(failed) or set(failed) & set(readings):
+            raise ValueError("Document outcome must be unambiguous.")
+        for item in self.learning_dossiers:
+            if item.evidence_level != "pdf_text":
+                continue
+            reading = readings.get(item.source.openalex_id)
+            if reading is None or item.source_pdf != PDFSource.model_validate(
+                reading.model_dump(include=set(PDFSource.model_fields))
+            ):
+                raise ValueError("PDF dossier requires its matching completed reading.")
+            if any(p < 1 or p > reading.page_count for p in item.source_pages):
+                raise ValueError("PDF reference names an unavailable page.")
+            verified_pages = {e.page for e in reading.notes.evidence}
+            if not set(item.source_pages) <= verified_pages:
+                raise ValueError("PDF dossier must cite supplied verified evidence pages.")
+        return self
 
 
 __all__ = [

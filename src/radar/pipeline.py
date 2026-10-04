@@ -31,6 +31,7 @@ from radar.processing import ranking as _ranking
 from radar.processing.evidence import attach_evidence
 from radar.provider import strata as _strata
 from radar.schema.papers import CollectedWork
+from radar.schema.documents import PDFDocument, DocumentFailure
 
 if TYPE_CHECKING:
     from pydantic_ai.models import Model as _Model
@@ -91,6 +92,10 @@ class PipelineRequest:
     triage_scorer: (
         Callable[[Sequence[CollectedWork], "_RadarProfile"], "_TriageBatch"] | None
     ) = None
+    document_timeout_s: float = 900.0
+    # Explicit acquisition seam: (work, directory, cached) -> PDFDocument.
+    document_loader: Callable[[CollectedWork, str, PDFDocument | None], PDFDocument] | None = None
+    document_model_override: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -184,6 +189,8 @@ def _validate_request(request: PipelineRequest) -> None:
         validate_analysis_timeout(request.analysis_timeout_s)
         validate_max_tokens(request.max_tokens)
         validate_lookback_days(request.lookback_days)
+        from radar.config.documents import validate_document_timeout
+        validate_document_timeout(request.document_timeout_s)
         from radar.config.runtime import validate_qwen_overall_timeout
         if request.qwen_triage_timeout_s is not None:
             validate_qwen_overall_timeout(request.qwen_triage_timeout_s)
@@ -500,6 +507,57 @@ def _deadline_count(batch: Any) -> int:
         if getattr(r, "status", None) == "deadline")
 
 
+def _default_document_loader(work: CollectedWork, directory: str,
+                             cached: PDFDocument | None) -> PDFDocument:
+    """Production acquisition through OpenAlex locations only."""
+    from radar.source import pdf as _pdf
+
+    return _pdf.acquire_pdf(work, directory, cached=cached)
+
+
+def _acquire_shortlist_pdfs(
+    request: PipelineRequest,
+    shortlist: list[CollectedWork],
+    *,
+    storage: "_SQLiteStore | None" = None,
+    stored_run: str | None = None,
+) -> tuple[list[PDFDocument], list[DocumentFailure]]:
+    """Attempt every shortlisted PDF; persist each outcome immediately."""
+    from radar.source.pdf import PDFError as _PDFError
+
+    loader = request.document_loader or _default_document_loader
+    documents: list[PDFDocument] = []
+    failures: list[DocumentFailure] = []
+    # Even legacy API runs keep downloads in the normal data location, never
+    # temporary directories or generated harness/sidecar files.
+    pdf_root = str(storage.directory) if storage is not None else _os.environ.get("RADAR_STORAGE_DIR", "data/radar")
+    for work in shortlist:
+        cached = None
+        if storage is not None:
+            cached = storage.cached_document(work.openalex_id)
+        try:
+            try:
+                document = loader(work, pdf_root, cached)
+            except _PDFError as exc:
+                if cached is None or exc.category != "cache_mismatch":
+                    raise
+                document = loader(work, pdf_root, None)
+            document = PDFDocument.model_validate(document.model_dump())
+            if document.work_id != work.openalex_id:
+                raise ValueError("Acquisition returned an unrelated document")
+        except Exception as exc:
+            category = exc.category if isinstance(exc, _PDFError) else "acquisition_failed"
+            failure = DocumentFailure(work_id=work.openalex_id, category=category)
+            failures.append(failure)
+            if storage is not None and stored_run is not None:
+                storage.save_document_failure(stored_run, failure)
+            continue
+        documents.append(document)
+        if storage is not None and stored_run is not None:
+            storage.save_document(stored_run, document)
+    return documents, failures
+
+
 def _analyze_pool(
     request: PipelineRequest,
     *,
@@ -547,15 +605,28 @@ def _analyze_pool(
         return PipelineResult(
             0, "No scored papers met the importance threshold; no investigation performed.",
             tuple(notes))
+    # Full-PDF integration: every shortlisted paper is attempted; no
+    # abstract-budget pre-filter and no abstract fallback.
+    from radar.config.documents import validate_document_timeout as _validate_doc_timeout
+
     try:
-        included = _team.select_for_prompt(shortlist, request.max_candidates)
+        document_timeout = _validate_doc_timeout(request.document_timeout_s)
     except ValueError as exc:
         raise PipelineUsageError(str(exc)) from exc
-    if not included:
-        notes.append(_out_triage.triage_coverage_line(
-            pool_total=len(pool_full), summary=summary, selected=0, opportunities=0))
-        return PipelineResult(0, "No candidates fit the research prompt budget; nothing analyzed.",
-                              tuple(notes))
+    documents, acquisition_failures = _acquire_shortlist_pdfs(
+        request, shortlist, storage=storage, stored_run=stored_run)
+    if not documents:
+        raise PipelineAnalysisError(
+            "No PDF readings completed; no synthesis produced. "
+            f"Attempted {len(shortlist)} shortlisted paper(s); "
+            "explicit acquisition failures are recorded, no abstract fallback.")
+    def retain_readings(readings, failures):
+        if storage is not None and stored_run is not None:
+            for reading in readings:
+                storage.save_document_reading(stored_run, reading)
+            for failure in failures:
+                storage.save_document_failure(stored_run, failure)
+
     disable_thinking = _strata.resolve_disable_thinking(request.disable_thinking)
     session = None
     if request.model_override is not None:
@@ -570,20 +641,34 @@ def _analyze_pool(
         model = None
     try:
         research = _team.research_candidates(
-            included,
+            shortlist,
             model=model,
             max_candidates=request.max_candidates,
             analysis_timeout_s=request.analysis_timeout_s,
             max_tokens=request.max_tokens,
             disable_thinking=disable_thinking,
             session=session,
+            documents=documents,
+            document_timeout_s=document_timeout,
+            document_model=request.document_model_override,
+            on_documents_read=retain_readings,
         )
     except _strata.StrataError as exc:
         raise PipelineAnalysisError(str(exc)) from exc
+    readings = list(research.document_readings)
+    prior_ids = {f.work_id for f in acquisition_failures}
+    merged_failures = list(acquisition_failures)
+    merged_failures.extend(f for f in research.document_failures if f.work_id not in prior_ids)
+    if not readings or not research.included:
+        raise PipelineAnalysisError(
+            "No PDF readings completed; no synthesis produced. "
+            "Explicit acquisition/reading failures are recorded, no abstract fallback.")
     draft = research.draft
     included = list(research.included)
     try:
-        report = attach_evidence(draft, included)
+        report = attach_evidence(
+            draft, included,
+            document_readings=readings, document_failures=merged_failures)
         rendered = _out_md.render_markdown(report)
     except Exception as exc:
         raise PipelineAnalysisError(
@@ -591,9 +676,15 @@ def _analyze_pool(
         ) from exc
     if storage is not None and stored_run is not None:
         storage.save_report(stored_run, report, len(included))
+    pages = sum(r.page_count for r in readings)
+    chunks = sum(len(r.chunks) for r in readings)
     notes.append(_out_triage.triage_coverage_line(
         pool_total=len(pool_full), summary=summary,
         selected=len(included), opportunities=len(draft.opportunities)))
+    notes.append(
+        f"radar: pdf coverage attempted={len(shortlist)} read={len(readings)} "
+        f"pages={pages} chunks={chunks} synthesized={len(included)} "
+        f"failures={len(merged_failures)}")
     notes.append("research: specialists=" + ",".join(
         report.role for report in research.specialist_reports) + "; synthesis=opportunity_analysis")
     if request.refresh_dir and refresh_collected_at is not None:

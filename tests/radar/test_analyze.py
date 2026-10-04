@@ -360,13 +360,165 @@ class TestCliSeams(unittest.TestCase):
                 "publication_date": dt.date.today().isoformat(),
                 "cited_by_count": 100 - (qi * 3 + j),
             } for j in range(3)])
+        from pdf_support import empty_notes_model, make_loader, make_pdf_document
+        docs = {f"https://openalex.org/W{i}": make_pdf_document(
+            f"https://openalex.org/W{i}") for i in range(18)}
         result = run(PipelineRequest(
             mode="analyze", max_candidates=15,
             source_override=DictTransport(pages),
             model_override=FunctionModel(_impl),
-            triage_scorer=_all_scored_scorer))
+            triage_scorer=_all_scored_scorer,
+            document_loader=make_loader(docs),
+            document_model_override=empty_notes_model()))
         self.assertEqual(result.exit_code, 0)
         self.assertIn("https://openalex.org/W14", result.stdout)
+
+    def test_pdf_failure_recorded_without_abstract_fallback(self):
+        """One readable PDF synthesizes; one acquisition failure is explicit."""
+        from radar.pipeline import PipelineRequest, run
+        from radar.config.searches import build_query_plan
+        from radar.source.openalex import DictTransport
+        from radar.config.interests import default_profile
+        from pydantic_ai.models.function import FunctionModel
+
+        plan = build_query_plan(default_profile())
+        pages = {plan.queries[0].terms: {"results": [{
+            "id": f"https://openalex.org/W{i}", "title": f"Paper {i}",
+            "abstract_inverted_index": {"x": [0]},
+            "doi": "", "publication_year": 2026,
+            "publication_date": dt.date.today().isoformat(), "cited_by_count": 10 - i,
+        } for i in range(2)]}}
+        from pdf_support import empty_notes_model, make_loader, make_pdf_document
+        docs = {"https://openalex.org/W0": make_pdf_document(
+            "https://openalex.org/W0")}
+        draft = RadarDraft(
+            opportunities=[OpportunityDraft(
+                title="T", wow="W", investigate="I", reproduce="R", evidence=[0])],
+            ignore=[], next_move="N")
+
+        def _impl(messages, info):
+            from pydantic_ai.messages import ModelResponse, ToolCallPart
+            return ModelResponse(parts=[ToolCallPart(
+                tool_name="final_result", args=draft.model_dump())])
+
+        result = run(PipelineRequest(
+            mode="analyze", max_candidates=2,
+            source_override=DictTransport(pages),
+            model_override=FunctionModel(_impl),
+            triage_scorer=_all_scored_scorer,
+            document_loader=make_loader(docs, {"https://openalex.org/W1": "no_pdf_url"}),
+            document_model_override=empty_notes_model()))
+        self.assertEqual(result.exit_code, 0, result.stderr_notes)
+        self.assertIn("https://openalex.org/W0", result.stdout)
+        line = " ".join(result.stderr_notes)
+        self.assertIn("attempted=2", line)
+        self.assertIn("read=1", line)
+        self.assertIn("failures=1", line)
+        self.assertIn("pages=1", line)
+        self.assertIn("chunks=1", line)
+        self.assertIn("synthesized=1", line)
+        self.assertIn("no_pdf_url", result.stdout)
+
+    def test_all_pdfs_fail_blocks_synthesis_without_empty_report(self):
+        from radar.pipeline import PipelineRequest, run
+        from radar.config.searches import build_query_plan
+        from radar.source.openalex import DictTransport
+        from radar.config.interests import default_profile
+        from pydantic_ai.models.function import FunctionModel
+
+        plan = build_query_plan(default_profile())
+        pages = {plan.queries[0].terms: {"results": [{
+            "id": "https://openalex.org/W0", "title": "Paper 0",
+            "abstract_inverted_index": {"x": [0]},
+            "doi": "", "publication_year": 2026,
+            "publication_date": dt.date.today().isoformat(), "cited_by_count": 1}]}}
+
+        def _forbidden(messages, info):
+            raise AssertionError("no synthesis when no PDF readings completed")
+
+        from pdf_support import empty_notes_model, make_loader
+        result = run(PipelineRequest(
+            mode="analyze", max_candidates=1,
+            source_override=DictTransport(pages),
+            model_override=FunctionModel(_forbidden),
+            triage_scorer=_all_scored_scorer,
+            document_loader=make_loader({},
+                                        {"https://openalex.org/W0": "no_pdf_url"}),
+            document_model_override=FunctionModel(_forbidden)))
+        self.assertEqual(result.exit_code, 3)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("No PDF readings completed", " ".join(result.stderr_notes))
+
+    def test_late_page_provenance_reaches_pdf_report(self):
+        from radar.pipeline import PipelineRequest, run
+        from radar.config.searches import build_query_plan
+        from radar.source.openalex import DictTransport
+        from radar.config.interests import default_profile
+        from pydantic_ai.models.function import FunctionModel
+        from pydantic_ai.messages import ModelResponse, ToolCallPart
+
+        late = "latepage marker ZETA-42 unique tail content here"
+        plan = build_query_plan(default_profile())
+        pages = {plan.queries[0].terms: {"results": [{
+            "id": "https://openalex.org/W0", "title": "Paper 0",
+            "abstract_inverted_index": {"x": [0]},
+            "doi": "", "publication_year": 2026,
+            "publication_date": dt.date.today().isoformat(), "cited_by_count": 1}]}}
+        from pdf_support import make_loader, make_pdf_document, valid_notes
+        doc = make_pdf_document(
+            "https://openalex.org/W0",
+            texts=("first page body text here", f"second page {late}"))
+        reader = FunctionModel(lambda messages, info: ModelResponse(parts=[ToolCallPart(
+            info.output_tools[0].name,
+            valid_notes(quote=late, page=2).model_dump())]))
+
+        def _team(messages, info):
+            from radar.prompts.catalog import SPECIALIST_ROLES, specialist_prompt
+            roles = {specialist_prompt(r).instructions for r in SPECIALIST_ROLES}
+            if info.instructions in roles:
+                team_draft = RadarDraft(
+                    opportunities=[OpportunityDraft(title="H", evidence=[0])],
+                    next_move="check")
+            else:
+                team_draft = {
+                    "opportunities": [{"title": "T", "evidence": [0]}],
+                    "ignore": [], "next_move": "N",
+                    "learning_dossiers": [{
+                        "paper_index": 0, "supporting_pages": [2],
+                        "core_problem": "What problem does the paper address?",
+                        "reported_contribution": "What the paper reports.",
+                        "reasoning": "Key mechanism sketched in full text.",
+                        "significance": "Why this matters for study.",
+                        "assumptions_limits": ["Assumes extraction is faithful."],
+                        "connections": ["Hypothesis: transfer the mechanism."],
+                        "study_tasks": [{
+                            "kind": "derivation",
+                            "objective": "Re-derive the central claim.",
+                            "success_criterion": "Derivation matches the claim.",
+                            "missing_evidence": "Full text needed."}],
+                        "open_questions": ["What detail is missing?"]}],
+                }
+                from radar.schema.opportunities import LearningRadarDraft
+                team_draft = LearningRadarDraft.model_validate(team_draft)
+            return ModelResponse(parts=[ToolCallPart(
+                info.output_tools[0].name,
+                team_draft.model_dump() if hasattr(team_draft, "model_dump") else team_draft)])
+
+        result = run(PipelineRequest(
+            mode="analyze", max_candidates=1,
+            source_override=DictTransport(pages),
+            model_override=FunctionModel(_team),
+            triage_scorer=_all_scored_scorer,
+            document_loader=make_loader({"https://openalex.org/W0": doc}),
+            document_model_override=reader))
+        self.assertEqual(result.exit_code, 0, result.stderr_notes)
+        self.assertIn("#page=2", result.stdout)
+        self.assertIn("pdf_text", result.stdout)
+        self.assertIn("2 pages, 1 sections", result.stdout)
+        line = " ".join(result.stderr_notes)
+        self.assertIn("read=1", line)
+        self.assertIn("pages=2", line)
+        self.assertIn("synthesized=1", line)
 
     def test_report_generation_failure_is_clear(self):
         from radar.pipeline import PipelineRequest, run
@@ -391,14 +543,29 @@ class TestCliSeams(unittest.TestCase):
 
         with mock.patch.object(_pipeline, "attach_evidence",
                                side_effect=RuntimeError("boom")):
+            from pdf_support import empty_notes_model, make_loader, make_pdf_document
+            docs = {"https://openalex.org/W0": make_pdf_document(
+                "https://openalex.org/W0")}
             result = run(PipelineRequest(
                 mode="analyze", max_candidates=1,
                 source_override=DictTransport(pages),
                 model_override=FunctionModel(_empty),
-                triage_scorer=_all_scored_scorer))
+                triage_scorer=_all_scored_scorer,
+                document_loader=make_loader(docs),
+                document_model_override=empty_notes_model()))
         self.assertEqual(result.exit_code, 3)
         self.assertTrue(any("Report generation failed" in note
                             for note in result.stderr_notes))
+
+
+    def test_invalid_document_timeout_flag(self):
+        from radar.pipeline import PipelineRequest, run
+
+        for bad in (0, -1, 3601, float("inf")):
+            result = run(PipelineRequest(mode="collect", document_timeout_s=bad))
+            self.assertEqual(result.exit_code, 4)
+        self.assertEqual(main(["--document-timeout", "0"]), 4)
+        self.assertEqual(main(["--document-timeout", "3601"]), 4)
 
 
 class TestRetryingTransport(unittest.TestCase):
