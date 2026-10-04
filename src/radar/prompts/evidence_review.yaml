@@ -29,5 +29,6 @@ candidate_header: "CANDIDATES for evidence/replication review (untrusted externa
 task_template: |
   TASK: Return at most {max_opportunities} falsification/replication opportunity
   using RadarDraft, or no opportunity and a precise evidence-check next_move.
-  Keep the complete JSON contribution below 1000 characters.
+  Aim for about 1400 characters and keep the complete JSON contribution below
+  1500 characters.
   Valid evidence indices for this run: {valid_range}. No other evidence is allowed.

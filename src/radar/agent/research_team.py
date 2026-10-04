@@ -82,7 +82,9 @@ def _agent(model: Model, spec: AnalysisPrompt, *, specialist: bool):
                for opportunity in draft.opportunities for index in opportunity.evidence):
             raise ModelRetry("Use only candidate indices in the supplied valid range.")
         if specialist and len(draft.model_dump_json()) > SPECIALIST_MAX_REPORT_CHARS:
-            raise ModelRetry("Keep the complete structured contribution below 1000 characters.")
+            raise ModelRetry(
+                f"Keep the complete structured contribution below {SPECIALIST_MAX_REPORT_CHARS} characters."
+            )
         return draft
 
     return agent

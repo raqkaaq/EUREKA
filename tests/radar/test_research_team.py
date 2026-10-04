@@ -141,6 +141,90 @@ class TestResearchTeam(unittest.TestCase):
             self.assertNotIn("synthesis", calls)
             self.assertTrue(all(count <= 2 for count in calls.values()))
 
+    def test_specialist_report_1000_to_1500_accepted_first_pass(self):
+        from radar.agent.research_team import research_candidates
+        from radar.prompts.catalog import SPECIALIST_ROLES, specialist_prompt
+
+        draft = RadarDraft(next_move="x" * 1400)
+        size = len(draft.model_dump_json())
+        self.assertGreater(size, 1000)
+        self.assertLessEqual(size, 1500)
+        roles = {specialist_prompt(role).instructions: role for role in SPECIALIST_ROLES}
+        calls = {}
+
+        def respond(messages, info):
+            role = roles.get(info.instructions, "synthesis")
+            calls[role] = calls.get(role, 0) + 1
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, draft.model_dump())])
+
+        result = research_candidates(works(), model=FunctionModel(respond))
+        self.assertEqual(sum(calls.values()), 4)
+        self.assertEqual(set(calls.values()), {1})
+        self.assertEqual(len(result.specialist_reports), 3)
+        for report in result.specialist_reports:
+            self.assertGreater(len(report.draft.model_dump_json()), 1000)
+            self.assertLessEqual(len(report.draft.model_dump_json()), 1500)
+
+    def test_oversized_specialist_report_above_1500_blocked_without_synthesis(self):
+        from radar.agent.research_team import research_candidates
+        from radar.prompts.catalog import SPECIALIST_ROLES, specialist_prompt
+        from radar.provider.freetoken import FreeTokenError
+
+        draft = RadarDraft(next_move="x" * 1600)
+        self.assertGreater(len(draft.model_dump_json()), 1500)
+        roles = {specialist_prompt(role).instructions: role for role in SPECIALIST_ROLES}
+        calls = {}
+
+        def respond(messages, info):
+            role = roles.get(info.instructions, "synthesis")
+            calls[role] = calls.get(role, 0) + 1
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, draft.model_dump())])
+
+        with self.assertRaises(FreeTokenError):
+            research_candidates(works(), model=FunctionModel(respond))
+        self.assertNotIn("synthesis", calls)
+        self.assertTrue(all(count <= 2 for count in calls.values()))
+
+    def test_three_near_max_reports_fit_synthesis_budget(self):
+        from radar.agent.research_team import research_candidates
+        from radar.config.runtime import MAX_PROMPT_CHARS, SPECIALIST_CONTEXT_CHARS
+        from radar.prompts.catalog import SPECIALIST_ROLES, opportunity_analysis_prompt, specialist_prompt
+
+        self.assertEqual(SPECIALIST_CONTEXT_CHARS, 5000)
+        draft = RadarDraft(next_move="x" * 1400)
+        self.assertGreater(len(draft.model_dump_json()), 1000)
+        self.assertLessEqual(len(draft.model_dump_json()), 1500)
+        roles = {specialist_prompt(role).instructions: role for role in SPECIALIST_ROLES}
+        seen = {}
+        synthesis_prompt = []
+
+        def respond(messages, info):
+            prompt = next(part.content for message in messages for part in message.parts
+                          if isinstance(part, UserPromptPart))
+            role = roles.get(info.instructions, "synthesis")
+            seen[role] = prompt
+            if role == "synthesis":
+                synthesis_prompt.append(prompt)
+                small = RadarDraft(next_move="Check.")
+                return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, small.model_dump())])
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, draft.model_dump())])
+
+        result = research_candidates(works(), model=FunctionModel(respond))
+        self.assertEqual(len(result.specialist_reports), 3)
+        self.assertEqual(result.prompt.count(draft.next_move), 3)
+        synthesis_instructions = opportunity_analysis_prompt().instructions
+        self.assertEqual(len(synthesis_prompt), 1)
+        self.assertLessEqual(len(synthesis_instructions) + len(synthesis_prompt[0]) + 2, MAX_PROMPT_CHARS)
+        self.assertLessEqual(len(synthesis_instructions) + len(synthesis_prompt[0]) + 2, 12000)
+        for role in SPECIALIST_ROLES:
+            self.assertIn(role, synthesis_prompt[0])
+        cohort_blocks = ["[0] Paper 0", "[1] Paper 1"]
+        for prompt in list(seen.values()) + [result.prompt]:
+            for block in cohort_blocks:
+                self.assertIn(block, prompt)
+            self.assertIn("0..1", prompt)
+        self.assertIn("not source evidence", result.prompt)
+
     def test_shared_deadline_cancels_all_work_and_closes_the_owned_session(self):
         from radar.agent.research_team import research_candidates
         from radar.provider.freetoken import FreeTokenError, FreeTokenSession
@@ -252,7 +336,7 @@ class TestResearchTeam(unittest.TestCase):
         from radar.schema.triage import TriageBatch, TriageResult
         from radar.storage.snapshots import refresh_pool
 
-        spec = AnalysisPrompt(version=1, instructions="x" * 7800,
+        spec = AnalysisPrompt(version=1, instructions="x" * 6300,
                               candidate_header="CANDIDATES",
                               task_template="TASK: {max_opportunities}; evidence {valid_range}")
         pool = works(1)
