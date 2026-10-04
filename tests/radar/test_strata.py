@@ -91,3 +91,18 @@ class TestStrataConfiguration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+class TestBoundedTransport(unittest.TestCase):
+    def test_provider_does_not_hide_network_retries_from_stage_budget(self):
+        from unittest import mock
+        from radar.provider.strata import StrataConfig, build_session, close_session
+        import httpx2
+
+        client = httpx2.AsyncClient(transport=httpx2.MockTransport(
+            lambda request: httpx2.Response(503)))
+        config = StrataConfig(base_url="http://127.0.0.1:8080/v1", model="test")
+        with mock.patch("radar.provider.strata._provider_http_client", return_value=client):
+            session = build_session(config)
+        try:
+            self.assertEqual(session.model.client.max_retries, 0)
+        finally:
+            close_session(session)

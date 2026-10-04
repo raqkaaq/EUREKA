@@ -9,7 +9,8 @@ status carries none, so unknown works stay explicitly unknown.
 from __future__ import annotations
 
 import math as _math
-from typing import Literal
+from enum import Enum
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -30,6 +31,18 @@ TriageStatus = Literal[
 ]
 
 
+class ScreeningFailureKind(str, Enum):
+    """Typed screening failure diagnosis (local Qwen path only)."""
+
+    CONNECT_TIMEOUT = "connect_timeout"
+    READ_TIMEOUT = "read_timeout"
+    REQUEST_TIMEOUT = "request_timeout"
+    INVALID_RESPONSE = "invalid_response"
+    SERVICE_ERROR = "service_error"
+    UNEXPECTED_ERROR = "unexpected_error"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+
+
 class TriageResult(BaseModel):
     """One work's screening outcome (model-set fields only)."""
 
@@ -37,6 +50,7 @@ class TriageResult(BaseModel):
     status: TriageStatus
     ai_ml_relevance: float | None = None
     cross_domain_potential: float | None = None
+    failure_kind: ScreeningFailureKind | None = None
 
     @field_validator(
         "ai_ml_relevance", "cross_domain_potential", mode="before"
@@ -53,7 +67,43 @@ class TriageResult(BaseModel):
                 raise ValueError("scored results require both probabilities")
         elif any(p is not None for p in probs):
             raise ValueError(f"{self.status} results must not carry probabilities")
+        if self.status in ("scored", "missing_abstract", "oversized"):
+            if self.failure_kind is not None:
+                raise ValueError(f"{self.status} results must not carry failure_kind")
         return self
+
+
+def _finite_timeout(value: object, name: str, low: float, high: float) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a finite number within ({low}, {high}]")
+    if not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite number within ({low}, {high}]")
+    number = float(value)
+    if not _math.isfinite(number) or not (low < number <= high):
+        raise ValueError(f"{name} must be a finite number within ({low}, {high}]")
+    return number
+
+
+class QwenScreeningPolicy(BaseModel):
+    """Immutable packaged Qwen screening reliability policy."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: Annotated[int, Field(strict=True, ge=1, le=1)]
+    batch_size: Annotated[int, Field(strict=True, ge=1, le=24)] = 2
+    concurrency: Annotated[int, Field(strict=True, ge=1, le=2)] = 1
+    request_timeout_s: float = 90.0
+    overall_timeout_s: float = 1800.0
+
+    @field_validator("request_timeout_s", mode="before")
+    @classmethod
+    def _check_request_timeout(cls, value: object) -> float:
+        return _finite_timeout(value, "request_timeout_s", 0, 300)
+
+    @field_validator("overall_timeout_s", mode="before")
+    @classmethod
+    def _check_overall_timeout(cls, value: object) -> float:
+        return _finite_timeout(value, "overall_timeout_s", 0, 3600)
 
 
 class TriageBatch(BaseModel):

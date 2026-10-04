@@ -26,10 +26,11 @@ QUOTA_BODY_READ_LIMIT = 4096
 LONG_QUOTA_RESET_S = 3600.0
 
 # --- Query-plan bounds ---
-MAX_QUERIES = 6
+MAX_QUERIES = 12
 MAX_PER_PAGE = 50
 MAX_KEYWORDS = 20
 MAX_TERM_CHARS = 300
+MAX_SEMANTIC_CHARS = 2000
 
 # --- Analysis bounds (proven live 2026-10-03) ---
 ANALYSIS_TIMEOUT_S = 90.0
@@ -42,7 +43,7 @@ ANALYSIS_REQUEST_LIMIT = 2
 # Single output-validation retry: real prompts sporadically emit malformed
 # envelopes (live categories: ignore.0 string_type, opportunities list_type).
 # Bounded by request_limit=2 (at most 2 provider requests) and the overall
-# deadline; network-level SDK retries are separate and unchanged.
+# deadline; network-level SDK retries are disabled by the provider.
 ANALYSIS_RETRIES = 1
 
 # --- Prompt bounds ---
@@ -71,6 +72,21 @@ CLEF_MAX_TEXT_JSON_BYTES = 65536
 CLEF_MAX_REQUEST_TIMEOUT_S = 60.0
 CLEF_MAX_OVERALL_TIMEOUT_S = 300.0
 CLEF_MAX_CONCURRENCY = 16
+QWEN_MAX_OVERALL_TIMEOUT_S = 3600.0
+
+
+def validate_qwen_overall_timeout(value: float) -> float:
+    """Separate slow chat-fallback stage budget; never changes CLEF's budget."""
+    message = "--qwen-triage-timeout must be within (0, 3600]s"
+    if isinstance(value, bool):
+        raise ValueError(message)
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(message) from None
+    if not _math.isfinite(timeout) or not (0 < timeout <= QWEN_MAX_OVERALL_TIMEOUT_S):
+        raise ValueError(message)
+    return timeout
 
 
 def validate_analysis_timeout(value: float) -> float:
@@ -172,6 +188,7 @@ __all__ = [
     "MAX_QUERIES",
     "MAX_RETRY_AFTER_S",
     "MAX_TERM_CHARS",
+    "MAX_SEMANTIC_CHARS",
     "MAX_TITLE_IN_PROMPT",
     "MAX_TIMEOUT_S",
     "MAX_TOTAL_WORKS",
@@ -187,4 +204,6 @@ __all__ = [
     "validate_clef_request_timeout",
     "validate_max_tokens",
     "validate_openalex_timeout",
+    "validate_qwen_overall_timeout",
+    "QWEN_MAX_OVERALL_TIMEOUT_S",
 ]

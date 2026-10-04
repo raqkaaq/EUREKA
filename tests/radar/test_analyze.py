@@ -8,6 +8,7 @@ only — no network, no real inference.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import unittest
 from unittest import mock
@@ -266,7 +267,8 @@ class TestCliSeams(unittest.TestCase):
             "id": f"https://openalex.org/W{i}",
             "title": f"Work {i}",
             "abstract_inverted_index": {"x": [0]},
-            "doi": "", "publication_year": 2026, "cited_by_count": 0,
+            "doi": "", "publication_year": 2026,
+            "publication_date": dt.date.today().isoformat(), "cited_by_count": 0,
         } for i in range(3)]}}
         result = run(PipelineRequest(
             mode="collect", max_candidates=8, source_override=DictTransport(pages)))
@@ -304,7 +306,8 @@ class TestCliSeams(unittest.TestCase):
         pages = {plan.queries[0].terms: {"results": [{
             "id": "https://openalex.org/W0", "title": "T",
             "abstract_inverted_index": {"x": [0]},
-            "doi": "", "publication_year": 2026, "cited_by_count": 0}]}}
+            "doi": "", "publication_year": 2026,
+            "publication_date": dt.date.today().isoformat(), "cited_by_count": 0}]}}
         public_answer = [
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))
         ]
@@ -354,6 +357,7 @@ class TestCliSeams(unittest.TestCase):
                 # Distinct citations force ranked order == numeric order,
                 # so fixed evidence index 14 resolves to W14.
                 "doi": "", "publication_year": 2026,
+                "publication_date": dt.date.today().isoformat(),
                 "cited_by_count": 100 - (qi * 3 + j),
             } for j in range(3)])
         result = run(PipelineRequest(
@@ -381,7 +385,8 @@ class TestCliSeams(unittest.TestCase):
         pages = {plan.queries[0].terms: {"results": [{
             "id": "https://openalex.org/W0", "title": "T",
             "abstract_inverted_index": {"x": [0]},
-            "doi": "", "publication_year": 2026, "cited_by_count": 0}]}}
+            "doi": "", "publication_year": 2026,
+            "publication_date": dt.date.today().isoformat(), "cited_by_count": 0}]}}
         import radar.pipeline as _pipeline
 
         with mock.patch.object(_pipeline, "attach_evidence",

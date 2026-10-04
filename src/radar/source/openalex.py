@@ -9,6 +9,7 @@ or raw bodies.
 from __future__ import annotations
 
 import json as _json
+import datetime as _dt
 import math as _math
 import os as _os
 import time as _time
@@ -26,6 +27,7 @@ from radar.config.runtime import (
     MAX_QUERIES,
     MAX_RETRY_AFTER_S,
     MAX_TERM_CHARS,
+    MAX_SEMANTIC_CHARS,
     MAX_TIMEOUT_S,
     MAX_TOTAL_WORKS,
     QUOTA_BODY_READ_LIMIT,
@@ -34,6 +36,7 @@ from radar.config.runtime import (
 from radar.processing.link_validation import is_openalex_work_link
 from radar.schema.papers import (
     CollectedWork,
+    DiscoveryMatch,
     LocationInfo,
     PlannedQuery,
     QueryPlan,
@@ -42,7 +45,7 @@ from radar.schema.papers import (
 BASE_URL = "https://api.openalex.org/works"
 # Bound the `select` payload; respected by current OpenAlex /works API.
 SELECT_FIELDS = (
-    "id,title,abstract_inverted_index,doi,publication_year,"
+    "id,title,abstract_inverted_index,doi,publication_year,publication_date,"
     "primary_location,best_oa_location,locations,cited_by_count"
 )
 USER_AGENT = "eureka-radar-prototype/0.1 (mailto:prototype@example.com)"
@@ -347,7 +350,7 @@ class DictTransport:
     def get_json(self, url, params, headers, timeout):
         _check_timeout(timeout)
         self.calls.append({"url": url, "params": dict(params)})
-        key = params.get("search", "")
+        key = params.get("search", params.get("search.semantic", ""))
         payload = self.pages.get(key, {"results": []})
         if not isinstance(payload, dict):
             raise ValueError("canned payload must be an object")
@@ -397,35 +400,32 @@ def build_request(
 ) -> tuple[str, dict[str, str], dict[str, str], float]:
     """Build (url, params, headers, timeout) respecting OpenAlex constraints.
 
-    - `search` carries keyword/semantic terms (OpenAlex has no separate
-      semantic endpoint on /works; relevance ranking applies when `search`
-      is present).
-    - Every query with `from_date` adds
-      `filter=from_publication_date:<date>` so the configured lookback
-      window applies to the whole plan; only the recent kind additionally
-      sends `sort=publication_date:desc`. The semantic kind omits `sort`
-      because OpenAlex applies relevance ranking by default when `search`
-      is present (verified live 2026-09-30: `sort=relevance` is rejected
-      with 400, while omitting `sort` returns 200).
+    - `search.semantic` carries natural-language research questions.
+      `search` carries Boolean keyword/recent searches. Never send both.
+    - Date filters apply only when requested; historical agenda branches
+      have none. Only newest-first keyword queries send an explicit sort.
     - `per-page` capped at 50; `select` bounds payload; `mailto` polite pool.
     """
     timeout = _check_timeout(timeout)
     per_page = max(1, min(int(planned.per_page), MAX_PER_PAGE))
+    search_key = "search.semantic" if planned.kind == "semantic" else "search"
+    limit = MAX_SEMANTIC_CHARS if planned.kind == "semantic" else MAX_TERM_CHARS
+    terms = planned.terms.strip()
+    if not terms or len(terms) > limit:
+        raise ValueError("planned query is empty or exceeds its character bound")
     params: dict[str, str] = {
-        "search": planned.terms.strip()[:MAX_TERM_CHARS],
+        search_key: terms,
         "per-page": str(per_page),
         "select": SELECT_FIELDS,
     }
-    if not params["search"]:
-        raise ValueError("planned query has empty search terms")
     if planned.from_date:
-        params["filter"] = f"from_publication_date:{planned.from_date}"
+        params["filter"] = (f"publication_year:{planned.from_date[:4]}-"
+                            if planned.kind == "semantic" else
+                            f"from_publication_date:{planned.from_date}")
     if planned.kind == "recent":
         if not planned.from_date:
             raise ValueError("recent query requires from_date")
         params["sort"] = "publication_date:desc"
-    # Semantic kind: no `sort` param — OpenAlex relevance ranking is the
-    # default when `search` is present. (`sort=relevance` is invalid.)
     key = get_api_key(api_key)
     if key:
         params["api_key"] = key
@@ -510,6 +510,15 @@ def normalize_work(
         year = None
     if year is not None and not (1500 <= year <= 2100):
         year = None
+    publication_date = raw.get("publication_date")
+    try:
+        if not isinstance(publication_date, str) or len(publication_date) != 10:
+            publication_date = None
+        else:
+            if _dt.date.fromisoformat(publication_date).isoformat() != publication_date:
+                publication_date = None
+    except ValueError:
+        publication_date = None
     doi = _safe_str(raw.get("doi"), 500)
     cited = raw.get("cited_by_count")
     if isinstance(cited, bool) or not isinstance(cited, int) or cited < 0:
@@ -522,12 +531,13 @@ def normalize_work(
             break
     if not primary_url:
         primary_url = _safe_str(raw.get("id"), 2000)
-    mq = _safe_str(matched_query, 300)
+    mq = _safe_str(matched_query, MAX_SEMANTIC_CHARS if query_kind == "semantic" else MAX_TERM_CHARS)
     return CollectedWork(
         openalex_id=wid,
         title=title,
         abstract=abstract,
         publication_year=year,
+        publication_date=publication_date,
         doi=doi,
         primary_url=primary_url,
         locations=locations,
@@ -565,20 +575,39 @@ def collect(
     timeout = _check_timeout(timeout)
     max_total = max(1, min(int(max_total), MAX_TOTAL_WORKS))
     by_id: dict[str, CollectedWork] = {}
+    last_semantic_completion: float | None = None
     for planned in plan.queries[:MAX_QUERIES]:
         url, params, headers, _ = build_request(
             planned, api_key=api_key, mailto=mailto, timeout=timeout
         )
+        # OpenAlex's semantic endpoint permits one request/second. Keep this
+        # policy at the source boundary, including injected transports.
+        if planned.kind == "semantic":
+            now = _time.monotonic()
+            if last_semantic_completion is not None:
+                _time.sleep(max(0.0, 1.0 - (now - last_semantic_completion)))
         payload = transport.get_json(url, params, headers, timeout)
+        if planned.kind == "semantic":
+            # Completion, not the first attempt: RetryingTransport may have
+            # issued a later attempt. Its retries already wait at least 1s.
+            last_semantic_completion = _time.monotonic()
         if not isinstance(payload, dict):
             continue  # malformed envelope -> skip page, keep others
         results = payload.get("results")
         if not isinstance(results, list):
             continue
-        for raw in results[:MAX_PER_PAGE]:  # bound per-query results
+        for raw in results[:int(params["per-page"])]:
             work = normalize_work(raw, planned.terms, planned.kind)
             if work is None:
                 continue
+            if planned.kind == "semantic" and planned.from_date:
+                # Semantic API rejects day-level date filters. Fetch its
+                # supported year range, then enforce the exact lower bound.
+                if not work.publication_date or work.publication_date < planned.from_date:
+                    continue
+            if planned.question_id is not None:
+                work.discovery_matches = [DiscoveryMatch(
+                    question_id=planned.question_id, role=planned.role)]
             existing = by_id.get(work.openalex_id)
             if existing is None:
                 by_id[work.openalex_id] = work
@@ -590,6 +619,9 @@ def collect(
                 for k in work.query_kinds:
                     if k and k not in existing.query_kinds:
                         existing.query_kinds.append(k)
+                for match in work.discovery_matches:
+                    if match not in existing.discovery_matches:
+                        existing.discovery_matches.append(match)
             if len(by_id) >= max_total:
                 break
         if len(by_id) >= max_total:

@@ -151,7 +151,7 @@ class TestPipelineChatProtocol(unittest.TestCase):
 
         routing = [body for body in requests if is_triage(body)]
         analysis = [body for body in requests if not is_triage(body)]
-        self.assertEqual(len(routing), 5)
+        self.assertEqual(len(routing), 51)
         self.assertEqual(len(analysis), 4)
         submitted = [paper for body in routing
                      for paper in json.loads(user_prompt(body))["papers"]]
@@ -337,7 +337,7 @@ class TestPipelineChatProtocol(unittest.TestCase):
                     # still screen every abstract, not only unattempted papers.
                     self.assertGreater(len(native_inputs), 0)
                     self.assertLessEqual(len(native_inputs), 102)
-                self.assertEqual(sum(is_triage(body) for body in chat_requests), 0 if available else 5)
+                self.assertEqual(sum(is_triage(body) for body in chat_requests), 0 if available else 51)
                 self.assertEqual(sum(not is_triage(body) for body in chat_requests), 4)
                 self.assertEqual(client_count, 1 if available else 2)
                 self.assertEqual(metadata["backend"], "clef" if available else "qwen")
@@ -404,17 +404,20 @@ class TestPipelineChatProtocol(unittest.TestCase):
             self.assertEqual(request.method, "GET")
             self.assertEqual(request.url.host, "api.openalex.org")
             self.assertEqual(request.url.path, "/works")
-            self.assertIn("from_publication_date:", request.url.params["filter"])
+            if "search.semantic" in request.url.params:
+                self.assertIn("publication_year:", request.url.params["filter"])
+            else:
+                self.assertNotIn("filter", request.url.params)
             self.assertLessEqual(int(request.url.params["per-page"]), 50)
             source_requests.append(request)
             i = len(source_requests)
             return httpx.Response(200, json={"results": [
                 {"id": "https://openalex.org/W1000", "title": "Shared discovery paper",
                  "abstract_inverted_index": {"Learning": [0], "incentives": [1]},
-                 "publication_year": 2026, "cited_by_count": 5},
+                 "publication_year": 2026, "publication_date": "2026-10-04", "cited_by_count": 5},
                 {"id": f"https://openalex.org/W{1000+i}", "title": f"Branch paper {i}",
                  "abstract_inverted_index": None if i == 6 else {"Learning": [0], "mechanisms": [1]},
-                 "publication_year": 2026, "cited_by_count": i},
+                 "publication_year": 2026, "publication_date": "2026-10-04", "cited_by_count": i},
             ]})
 
         def chat(request):
@@ -431,21 +434,21 @@ class TestPipelineChatProtocol(unittest.TestCase):
                 base_url=BASE, model=MODEL, triage_output=tmp))
             self.assertEqual(result.exit_code, 0, result.stderr_notes)
             snapshot = json.loads((Path(tmp) / "snapshot.json").read_text())
-            self.assertEqual(len(snapshot["works"]), 7)
-            self.assertEqual(snapshot["coverage"]["collected"], 7)
-            self.assertEqual(snapshot["coverage"]["with_abstracts"], 6)
+            self.assertEqual(len(snapshot["works"]), 13)
+            self.assertEqual(snapshot["coverage"]["collected"], 13)
+            self.assertEqual(snapshot["coverage"]["with_abstracts"], 12)
             self.assertEqual(snapshot["coverage"]["missing_abstracts"], 1)
             self.assertEqual(snapshot["coverage"]["llm_selected"], 3)
             self.assertEqual(snapshot["coverage"]["llm_analyzed"], 3)
             sidecar = json.loads((Path(tmp) / "triage.json").read_text())
-            self.assertEqual(len(sidecar["results"]), 7)
-            self.assertEqual(sum(row["status"] == "scored" for row in sidecar["results"]), 6)
+            self.assertEqual(len(sidecar["results"]), 13)
+            self.assertEqual(sum(row["status"] == "scored" for row in sidecar["results"]), 12)
             self.assertEqual(sum(row["status"] == "missing_abstract" for row in sidecar["results"]), 1)
             self.assertFalse((Path(tmp) / "snapshot.lock").exists())
             self.assertTrue(all(client.is_closed for client in clients))
         self.assertTrue(source_client.is_closed)
-        self.assertEqual(len(source_requests), 6)
-        self.assertEqual(sum(is_triage(body) for body in chat_requests), 1)
+        self.assertEqual(len(source_requests), 12)
+        self.assertEqual(sum(is_triage(body) for body in chat_requests), 6)
         self.assertEqual(sum(not is_triage(body) for body in chat_requests), 4)
         self.assertIn("**Evidence:**", result.stdout)
         self.assertIn("https://openalex.org/W", result.stdout)
@@ -494,7 +497,7 @@ class TestPipelineChatProtocol(unittest.TestCase):
                          for paper in json.loads(user_prompt(body))["papers"]]
         self.assertEqual(len(submitted_ids), 192)
         self.assertEqual(len(set(submitted_ids)), 192)
-        self.assertEqual(sum(is_triage(body) for body in seen), 8)
+        self.assertEqual(sum(is_triage(body) for body in seen), 96)
         self.assertEqual(sum(not is_triage(body) for body in seen), 4)
         for token in ("pool=200", "scored=192", "unknown=8", "selected=2", "analyzed=2"):
             self.assertIn(token, " ".join(result.stderr_notes))

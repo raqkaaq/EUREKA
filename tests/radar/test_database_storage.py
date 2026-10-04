@@ -137,6 +137,39 @@ class TestSQLiteStorage(unittest.TestCase):
 
 
 class TestDatabasePipeline(unittest.TestCase):
+    def test_independent_screening_success_and_safe_failure_are_saved_before_refusal(self):
+        from radar.pipeline import PipelineRequest, run
+        from radar.schema.triage import TriageBatch
+        from test_qwen_triage import works, answers_model, synth_model
+
+        pool, routing, synthesis = works(4), [], []
+
+        def first_batch_fails(rows):
+            if rows[0]["work_id"] == pool[0].openalex_id:
+                raise RuntimeError("PRIVATE-FAILURE")
+            return rows
+
+        with tempfile.TemporaryDirectory() as directory:
+            with SQLiteStore(directory) as store:
+                initial = store.begin_run("collect", "fixture")
+                store.save_pool(initial, pool)
+                store.finish_run(initial, 0)
+            result = run(PipelineRequest(mode="analyze", from_database=True,
+                storage_dir=directory, triage_model_override=answers_model(routing, first_batch_fails),
+                model_override=synth_model(synthesis)))
+            self.assertEqual(result.exit_code, 3)
+            self.assertEqual(synthesis, [])
+            self.assertIn("unexpected_error", str(result.stderr_notes))
+            self.assertNotIn("PRIVATE", str(result.stderr_notes))
+            with SQLiteStore(directory) as store:
+                payload = store.connection.execute("SELECT payload FROM screening").fetchone()[0]
+                batch = TriageBatch.model_validate_json(payload)
+                self.assertEqual([r.status for r in batch.results], ["failed", "failed", "scored", "scored"])
+                self.assertEqual(len(store.latest_pool()[0]), 4)
+                self.assertNotIn("PRIVATE", payload)
+                self.assertEqual(store.connection.execute("SELECT COUNT(*) FROM reports").fetchone()[0], 0)
+            self.assertEqual({p.name for p in Path(directory).iterdir()}, {"radar.sqlite3"})
+
     def test_collection_persists_full_pool_despite_output_bound(self):
         import json
         from radar.pipeline import PipelineRequest, run
@@ -149,7 +182,7 @@ class TestDatabasePipeline(unittest.TestCase):
             self.assertEqual(result.exit_code, 0, result.stderr_notes)
             self.assertEqual(len(json.loads(result.stdout)['works']), 1)
             with SQLiteStore(directory) as store:
-                self.assertEqual(len(store.latest_pool()[0]), 6)
+                self.assertEqual(len(store.latest_pool()[0]), 12)
             self.assertEqual({p.name for p in Path(directory).iterdir()}, {'radar.sqlite3', 'graph.rdb'})
 
     def test_graph_failure_preserves_pool_and_explicit_rebuild_repairs(self):
@@ -164,7 +197,7 @@ class TestDatabasePipeline(unittest.TestCase):
             self.assertIn('--rebuild-graph', result.stderr_notes[0])
             self.assertNotIn('SECRET', result.stderr_notes[0])
             with SQLiteStore(directory) as store:
-                self.assertEqual(len(store.latest_pool()[0]), 6)
+                self.assertEqual(len(store.latest_pool()[0]), 12)
                 self.assertFalse(store.graph_state()['ready'])
                 self.assertEqual(store.connection.execute('SELECT exit_code FROM runs').fetchone()[0], 3)
             with mock.patch('radar.storage.graph_projection.FalkorGraph', GraphBoundary), mock.patch(
@@ -249,7 +282,7 @@ class TestDatabasePipeline(unittest.TestCase):
             self.assertEqual(failed.exit_code, 3)
             self.assertNotIn('SECRET', str(failed.stderr_notes))
             with SQLiteStore(directory) as store:
-                self.assertEqual(len(store.projection()[0]), 6)
+                self.assertEqual(len(store.projection()[0]), 12)
                 reports = store.projection()[1]
                 self.assertEqual(len(reports), 1)
                 self.assertEqual(reports[0][1].opportunities[0].draft.title, 'Hypothesis')

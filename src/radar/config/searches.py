@@ -1,4 +1,4 @@
-"""Expand the editable baseline search plan into bounded OpenAlex requests."""
+"""Expand a learning agenda into bounded retrieval, without screening papers."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def build_query_plan(
     configuration: SearchConfig | None = None,
     today: dt.date | None = None,
 ) -> QueryPlan:
-    """Render YAML policy with the active profile and a shared lookback window.
+    """Render historical/fresh research branches (or legacy v1 templates).
 
     Invalid/oversized terms fail rather than truncating Boolean syntax. Empty
     domain branches are omitted; exact duplicate requests are deduplicated.
@@ -37,7 +37,7 @@ def build_query_plan(
     """
     profile = RadarProfile.model_validate(profile.model_dump())
     config = configuration if configuration is not None else search_config()
-    bound = max(1, min(int(max_queries), MAX_QUERIES))
+    bound = max(1, min(int(max_queries), 6 if config.version == 1 else MAX_QUERIES))
     date = (
         (today or dt.date.today()) - dt.timedelta(days=profile.lookback_days)
     ).isoformat()
@@ -46,6 +46,31 @@ def build_query_plan(
         "domains": " OR ".join(_phrase(term) for term in profile.domains),
     }
     queries: list[PlannedQuery] = []
+    if config.version == 2:
+        # Round-robin roles so smaller caps cover more questions.
+        questions = [q for q in config.learning_questions
+                     if q.scope != "cross_domain" or profile.domains]
+        prose = {"keywords": ", ".join(profile.keywords), "domains": ", ".join(profile.domains)}
+        for role in ("frontier", "foundation", "counterevidence"):
+            for question in questions:
+                definition = next(s for s in question.searches if s.role == role)
+                rendered_values = prose if definition.kind == "semantic" else values
+                try:
+                    queries.append(PlannedQuery(
+                        kind=definition.kind, terms=definition.terms.format_map(rendered_values),
+                        per_page=definition.per_page,
+                        from_date=date if role == "frontier" else None,
+                        question_id=question.id, role=role,
+                    ))
+                except ValidationError:
+                    raise ConfigurationError("searches.yaml: rendered research search exceeds its bound") from None
+                if len(queries) == bound:
+                    break
+            if len(queries) == bound:
+                break
+        if not queries:
+            raise ConfigurationError("searches.yaml: no research questions apply to the active profile")
+        return QueryPlan(queries=queries, profile_summary=f"searches=v2 research_questions={len(questions)}")
     seen: set[tuple[str, str]] = set()
     for definition in config.queries:
         if definition.scope == "cross_domain" and not profile.domains:
@@ -63,7 +88,9 @@ def build_query_plan(
                 continue
             try:
                 query = PlannedQuery(
-                    kind=definition.kind, terms=rendered,
+                    # v1 used the misleading "semantic" name for keyword search.
+                    kind="keyword" if definition.kind == "semantic" else definition.kind,
+                    terms=rendered,
                     per_page=definition.per_page, from_date=date,
                 )
             except ValidationError:

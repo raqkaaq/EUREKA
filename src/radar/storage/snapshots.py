@@ -1,6 +1,6 @@
 """Metadata-only refresh persistence: atomic full-pool snapshot + deltas.
 
-The collector gathers a bounded OpenAlex pool (<=6 requests, <=200 works)
+The collector gathers a bounded OpenAlex pool (<=12 requests, <=200 works)
 but the CLI otherwise only exposes the topN slice. This module persists the
 *full* normalized pool (metadata/abstracts/locations/provenance) as a single
 atomic JSON snapshot, without any LLM involvement.
@@ -41,7 +41,7 @@ SNAPSHOT_FILENAME = "snapshot.json"
 LOCK_FILENAME = "snapshot.lock"
 
 DISCLOSURE = (
-    "Bounded OpenAlex discovery sample (at most 6 requests, at most 200 "
+    f"Bounded OpenAlex discovery sample (at most {MAX_QUERIES} requests, at most {MAX_TOTAL_WORKS} "
     "pooled works); coverage counts describe this snapshot only, "
     "not all of OpenAlex."
 )

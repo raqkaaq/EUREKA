@@ -9,6 +9,7 @@ deadlines; failure covers service errors. No printing: callers print.
 from __future__ import annotations
 
 from typing import Any
+from collections import Counter
 
 UNKNOWN_STATUSES = frozenset({"missing_abstract", "oversized", "deadline"})
 
@@ -29,6 +30,10 @@ def summarize_batch(batch: Any) -> dict[str, Any]:
         "backend": getattr(batch, "backend", "clef"),
         "probability_kind": getattr(batch, "probability_kind", "native_noul"),
         "fallback_reason": getattr(batch, "fallback_reason", None),
+        "failure_categories": dict(sorted(Counter(
+            str(getattr(r.failure_kind, "value", r.failure_kind))
+            for r in results if getattr(r, "failure_kind", None) is not None
+        ).items())),
     }
 
 

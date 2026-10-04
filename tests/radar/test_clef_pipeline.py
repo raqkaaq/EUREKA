@@ -6,6 +6,7 @@ External HTTP/model boundaries are substituted; no services or .env reads.
 from __future__ import annotations
 
 import json
+import datetime as dt
 import os
 import tempfile
 import unittest
@@ -56,7 +57,8 @@ def _pages(n: int) -> dict:
             rows.append({
                 "id": f"https://openalex.org/W{i}", "title": f"Work {i}",
                 "abstract_inverted_index": {"x": [0]},
-                "doi": "", "publication_year": 2026, "cited_by_count": i})
+                "doi": "", "publication_year": 2026,
+                "publication_date": dt.date.today().isoformat(), "cited_by_count": i})
             i += 1
         # Relevance and recent requests may share terms. Preserve their
         # canned pool instead of overwriting the earlier request's rows.
@@ -208,7 +210,8 @@ class TestTriageCoverageFormat(unittest.TestCase):
         self.assertEqual(summary, {
             "considered": 5, "scored": 1, "unknown": 3, "failed": 1,
             "model_id": "clef-flash", "rubric_version": "rubric-7",
-            "backend": "clef", "probability_kind": "native_noul", "fallback_reason": None})
+            "backend": "clef", "probability_kind": "native_noul", "fallback_reason": None,
+            "failure_categories": {}})
         line = _out_triage.triage_coverage_line(
             pool_total=9, summary=summary, selected=2, opportunities=1)
         for token in ("pool=9", "considered=5", "scored=1", "unknown=3",

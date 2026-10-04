@@ -76,6 +76,7 @@ class PipelineRequest:
     clef_model: str | None = None
     clef_timeout_s: float = 10.0
     triage_timeout_s: float = 60.0
+    qwen_triage_timeout_s: float | None = None
     triage_output: str | None = None
     storage_dir: str | None = None
     from_database: bool = False
@@ -143,10 +144,14 @@ def _validate_request(request: PipelineRequest) -> None:
         validate_analysis_timeout(request.analysis_timeout_s)
         validate_max_tokens(request.max_tokens)
         validate_lookback_days(request.lookback_days)
+        from radar.config.runtime import validate_qwen_overall_timeout
+        if request.qwen_triage_timeout_s is not None:
+            validate_qwen_overall_timeout(request.qwen_triage_timeout_s)
     except ValueError as exc:
         raise PipelineUsageError(str(exc)) from exc
     # Validate editable policy before any source, provider or storage I/O.
-    from radar.config.searches import search_config
+    from radar.config.searches import build_query_plan
+    from radar.config.triage import qwen_screening_policy
     from radar.prompts.catalog import (
         opportunity_analysis_prompt, paper_triage_prompt, screening_questions,
     )
@@ -154,9 +159,10 @@ def _validate_request(request: PipelineRequest) -> None:
 
     try:
         if request.from_snapshot is None and not (request.from_database or request.rebuild_graph):
-            search_config()
+            build_query_plan(_active_profile(request))
         if request.mode == "analyze" and not request.rebuild_graph:
             screening_questions()
+            qwen_screening_policy()
             paper_triage_prompt()
             opportunity_analysis_prompt()
             validate_research_prompts()
@@ -400,7 +406,7 @@ def _screen_full_pool(request: PipelineRequest, pool: list[CollectedWork],
                 pool, profile, model=request.triage_model_override,
                 model_id="qwen-test-model" if request.triage_model_override else None,
                 base_url=request.base_url, configured_model=request.model,
-                overall_timeout_s=triage_timeout,
+                overall_timeout_s=request.qwen_triage_timeout_s,
                 disable_thinking=_strata.resolve_disable_thinking(request.disable_thinking),
                 fallback_reason=reason)
             return _check_batch_shape(batch, pool)
@@ -489,8 +495,9 @@ def _analyze_pool(
             f"{summary['backend']} screening incomplete: {summary['failed']} failed, "
             f"{_deadline_count(batch)} deadline "
             f"(model={summary['model_id']} rubric={summary['rubric_version']}); "
-            "stopping before Strata synthesis with the last valid "
-            "snapshot preserved. Qwen routing uses Strata Chat Completions "
+            f"failure_categories={summary['failure_categories']}; "
+            "stopping before Strata synthesis with the stored paper pool preserved. "
+            "Qwen routing uses Strata Chat Completions "
             "with Pydantic-validated SystemOne answer contracts."
         )
     shortlist = select_candidates(pool_full, batch, request.max_candidates)

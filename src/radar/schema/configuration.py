@@ -12,10 +12,11 @@ from radar.config.runtime import (
     MAX_ANALYSIS_OPPORTUNITIES,
     MAX_PER_PAGE,
     MAX_PROMPT_CHARS,
-    MAX_QUERIES,
     MAX_TERM_CHARS,
+    MAX_SEMANTIC_CHARS,
 )
 from radar.schema.opportunities import SpecialistRole
+from radar.schema.papers import SearchRole
 
 Text = Annotated[str, Field(strict=True, min_length=1, max_length=8000)]
 Version = Annotated[int, Field(strict=True, ge=1, le=1)]
@@ -123,7 +124,7 @@ class SearchDefinition(ConfigurationModel):
     scope: Literal["broad", "cross_domain"] = "broad"
     terms: Annotated[str, Field(strict=True, min_length=1, max_length=MAX_TERM_CHARS)]
     repeat: Literal["once", "keywords"] = "once"
-    limit: Annotated[int, Field(strict=True, ge=1, le=MAX_QUERIES)] = 1
+    limit: Annotated[int, Field(strict=True, ge=1, le=6)] = 1
     per_page: Annotated[int, Field(strict=True, ge=1, le=MAX_PER_PAGE)] = 25
 
     @model_validator(mode="after")
@@ -137,12 +138,48 @@ class SearchDefinition(ConfigurationModel):
         return self
 
 
+class ResearchSearch(ConfigurationModel):
+    role: SearchRole
+    kind: Literal["keyword", "semantic", "recent"]
+    terms: Annotated[str, Field(strict=True, min_length=1, max_length=MAX_SEMANTIC_CHARS)]
+    per_page: Annotated[int, Field(strict=True, ge=1, le=MAX_PER_PAGE)] = 15
+
+    @model_validator(mode="after")
+    def _terms(self) -> ResearchSearch:
+        validate_template(self.terms, {"keywords", "domains"})
+        if self.kind != "semantic" and len(self.terms) > MAX_TERM_CHARS:
+            raise ValueError("keyword template exceeds its bound")
+        if self.kind == "recent" and self.role != "frontier":
+            raise ValueError("newest-first retrieval is only for frontier searches")
+        return self
+
+
+class ResearchQuestion(ConfigurationModel):
+    id: Annotated[str, Field(strict=True, pattern=r"^[a-z][a-z0-9_]{0,79}$")]
+    question: Text
+    scope: Literal["broad", "cross_domain"] = "broad"
+    searches: tuple[ResearchSearch, ...] = Field(min_length=3, max_length=3)
+
+    @model_validator(mode="after")
+    def _roles(self) -> ResearchQuestion:
+        if {s.role for s in self.searches} != {"foundation", "frontier", "counterevidence"}:
+            raise ValueError("each question needs all three retrieval roles")
+        return self
+
+
 class SearchConfig(ConfigurationModel):
-    version: Version
-    queries: tuple[SearchDefinition, ...] = Field(min_length=1, max_length=MAX_QUERIES)
+    version: Annotated[int, Field(strict=True, ge=1, le=2)]
+    queries: tuple[SearchDefinition, ...] = Field(default=(), max_length=6)
+    learning_questions: tuple[ResearchQuestion, ...] = Field(default=(), max_length=4)
 
     @model_validator(mode="after")
     def _unique_names(self) -> SearchConfig:
+        if self.version == 1 and (not self.queries or self.learning_questions):
+            raise ValueError("version 1 requires only legacy queries")
+        if self.version == 2 and (not self.learning_questions or self.queries):
+            raise ValueError("version 2 requires only learning questions")
         if len({query.name for query in self.queries}) != len(self.queries):
             raise ValueError("search names must be unique")
+        if len({q.id for q in self.learning_questions}) != len(self.learning_questions):
+            raise ValueError("research question identities must be unique")
         return self
