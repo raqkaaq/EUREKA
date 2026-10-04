@@ -168,7 +168,7 @@ they are not independent models or additional scientific sources.
   Agreement between agents is not scientific corroboration.
 
 Each specialist returns a typed `RadarDraft`: at most one opportunity and
-1500 serialized characters (prompt guidance targets about 1400 characters to
+1500 serialized characters (prompt guidance targets about 1100 characters to
 leave headroom under the hard cap). `ResearchResult` retains role-attributed reports,
 the final draft/prompt and actual included papers for in-process callers.
 The CLI renders the final report and names the roles in coverage notes;

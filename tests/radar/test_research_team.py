@@ -7,7 +7,7 @@ import tempfile
 from types import SimpleNamespace
 from unittest import mock
 
-from pydantic_ai.messages import ModelResponse, ToolCallPart, UserPromptPart
+from pydantic_ai.messages import ModelResponse, RetryPromptPart, ToolCallPart, UserPromptPart
 from pydantic_ai.models.function import FunctionModel
 
 from radar.schema.opportunities import OpportunityDraft, RadarDraft
@@ -164,6 +164,51 @@ class TestResearchTeam(unittest.TestCase):
         for report in result.specialist_reports:
             self.assertGreater(len(report.draft.model_dump_json()), 1000)
             self.assertLessEqual(len(report.draft.model_dump_json()), 1500)
+
+    def test_oversized_retry_reports_measured_size_and_recovers_within_five_calls(self):
+        from radar.agent.research_team import research_candidates
+        from radar.config.runtime import SPECIALIST_MAX_REPORT_CHARS
+        from radar.prompts.catalog import SPECIALIST_ROLES, specialist_prompt
+
+        over = RadarDraft(next_move="x" * 1600)
+        over_size = len(over.model_dump_json())
+        self.assertGreater(over_size, SPECIALIST_MAX_REPORT_CHARS)
+        under = RadarDraft(
+            opportunities=[OpportunityDraft(
+                title="Hypothesis", wow="Mechanism and assumption.",
+                investigate="Compare against a control.", reproduce="Check missing data.",
+                evidence=[0])],
+            ignore=[], next_move="Inspect details.")
+        self.assertLessEqual(len(under.model_dump_json()), SPECIALIST_MAX_REPORT_CHARS)
+        roles = {specialist_prompt(role).instructions: role for role in SPECIALIST_ROLES}
+        calls: dict = {}
+        retry_texts: dict = {}
+        target_role = "behavioral_economics"
+
+        def respond(messages, info):
+            role = roles.get(info.instructions, "synthesis")
+            calls[role] = calls.get(role, 0) + 1
+            if role == target_role and calls[role] == 1:
+                return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, over.model_dump())])
+            if role == target_role and calls[role] == 2:
+                retry_texts[role] = " ".join(
+                    part.content for message in messages for part in message.parts
+                    if isinstance(part, RetryPromptPart) and isinstance(part.content, str))
+                return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, under.model_dump())])
+            small = under if role != "synthesis" else RadarDraft(next_move="Check.")
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, small.model_dump())])
+
+        result = research_candidates(works(), model=FunctionModel(respond))
+        self.assertEqual(sum(calls.values()), 5)
+        self.assertEqual(calls[target_role], 2)
+        self.assertIn(target_role, retry_texts)
+        self.assertIn(str(over_size), retry_texts[target_role])
+        self.assertIn(str(SPECIALIST_MAX_REPORT_CHARS), retry_texts[target_role])
+        self.assertIn("1100", retry_texts[target_role])
+        self.assertIn("one brief next_move", retry_texts[target_role])
+        self.assertEqual(len(result.specialist_reports), 3)
+        for report in result.specialist_reports:
+            self.assertLessEqual(len(report.draft.model_dump_json()), SPECIALIST_MAX_REPORT_CHARS)
 
     def test_oversized_specialist_report_above_1500_blocked_without_synthesis(self):
         from radar.agent.research_team import research_candidates
