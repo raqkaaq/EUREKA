@@ -215,10 +215,15 @@ class TestCachedSnapshot(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = _seed_snapshot(tmp, [_work("https://openalex.org/W1")])
             before = Path(path).read_bytes()
+            from pdf_support import empty_notes_model, make_loader, make_pdf_document
+            docs = {"https://openalex.org/W1": make_pdf_document(
+                "https://openalex.org/W1")}
             result = _run_pipeline(PipelineRequest(
                 mode="analyze", max_candidates=1, from_snapshot=path,
                 model_override=_fixed_draft_model(),
-                triage_scorer=lambda pool, profile: _scored_batch(pool)))
+                triage_scorer=lambda pool, profile: _scored_batch(pool),
+                document_loader=make_loader(docs),
+                document_model_override=empty_notes_model()))
             self.assertEqual(result.exit_code, 0)
             self.assertIn("Next move", result.stdout)
             self.assertEqual(Path(path).read_bytes(), before)
@@ -227,10 +232,15 @@ class TestCachedSnapshot(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = _seed_snapshot(tmp, [_work(f"https://openalex.org/W{i}")
                                         for i in range(5)])
+            from pdf_support import empty_notes_model, make_loader, make_pdf_document
+            docs = {f"https://openalex.org/W{i}": make_pdf_document(
+                f"https://openalex.org/W{i}") for i in range(5)}
             result = _run_pipeline(PipelineRequest(
                 mode="analyze", max_candidates=2, from_snapshot=path,
                 model_override=_fixed_draft_model(),
-                triage_scorer=lambda pool, profile: _scored_batch(pool)))
+                triage_scorer=lambda pool, profile: _scored_batch(pool),
+                document_loader=make_loader(docs),
+                document_model_override=empty_notes_model()))
             self.assertEqual(result.exit_code, 0)
             coverage = " ".join(result.stderr_notes)
             self.assertIn("pool=5", coverage)

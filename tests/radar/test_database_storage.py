@@ -273,12 +273,23 @@ class TestDatabasePipeline(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
                 'radar.storage.graph_projection.FalkorGraph', GraphBoundary):
+            from pdf_support import empty_notes_model, make_loader, make_pdf_document
+            from radar.source.openalex import DictTransport as _DT
+            from radar.config.searches import build_query_plan as _plan
+            from radar.config.interests import default_profile as _prof
+            # FakeSource yields W1..W12; pre-build matching PDF doubles.
+            _docs = {f"https://openalex.org/W{i}": make_pdf_document(
+                f"https://openalex.org/W{i}") for i in range(1, 13)}
             successful = run(PipelineRequest(mode='analyze', storage_dir=directory, max_candidates=1,
                                              source_override=FakeSource(), triage_scorer=score,
-                                             model_override=FunctionModel(respond)))
+                                             model_override=FunctionModel(respond),
+                                             document_loader=make_loader(_docs),
+                                             document_model_override=empty_notes_model()))
             self.assertEqual(successful.exit_code, 0, successful.stderr_notes)
             failed = run(PipelineRequest(mode='analyze', storage_dir=directory, from_database=True,
-                                         triage_scorer=score, model_override=FunctionModel(fail)))
+                                         triage_scorer=score, model_override=FunctionModel(fail),
+                                         document_loader=make_loader(_docs),
+                                         document_model_override=empty_notes_model()))
             self.assertEqual(failed.exit_code, 3)
             self.assertNotIn('SECRET', str(failed.stderr_notes))
             with SQLiteStore(directory) as store:

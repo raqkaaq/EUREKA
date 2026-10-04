@@ -18,6 +18,7 @@ from radar.config.runtime import MAX_TOTAL_WORKS
 from radar.schema.opportunities import RadarReport
 from radar.schema.papers import CollectedWork
 from radar.schema.triage import TriageBatch
+from radar.schema.documents import PDFDocument, PDFSource, PDFReading, DocumentFailure, DocumentRecord
 from radar.storage.snapshots import DISCLOSURE, compute_delta, coverage_of
 
 
@@ -51,6 +52,14 @@ CREATE TABLE IF NOT EXISTS reports (
     run_id TEXT PRIMARY KEY REFERENCES runs(id), payload TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS paper_documents (
+    work_id TEXT NOT NULL REFERENCES papers(openalex_id), sha256 TEXT NOT NULL,
+    payload TEXT NOT NULL, PRIMARY KEY(work_id,sha256)
+);
+CREATE TABLE IF NOT EXISTS run_documents (
+    run_id TEXT NOT NULL REFERENCES runs(id), work_id TEXT NOT NULL REFERENCES papers(openalex_id),
+    payload TEXT NOT NULL, PRIMARY KEY(run_id,work_id)
+);
 INSERT OR IGNORE INTO state VALUES ('revision', 0), ('graph_revision', -1);
 PRAGMA user_version = 1;
 COMMIT;
@@ -180,6 +189,88 @@ class SQLiteStore:
         with self._db:
             self._db.execute("INSERT INTO screening VALUES (?,?)", (run_id, batch.model_dump_json()))
 
+    def _document_member(self, run_id: str, work_id: str) -> None:
+        if self._db.execute("SELECT 1 FROM pool_papers WHERE run_id=? AND work_id=?",
+                            (run_id, work_id)).fetchone() is None:
+            raise StorageError("Document must belong to this run's paper pool.")
+
+    def save_document(self, run_id: str, document: PDFDocument) -> None:
+        document = PDFDocument.model_validate(document.model_dump())
+        self._document_member(run_id, document.work_id)
+        source = PDFSource.model_validate(document.model_dump(include=set(PDFSource.model_fields)))
+        record = DocumentRecord(work_id=document.work_id, status="extracted", source=source)
+        with self._db:
+            # This is the verified extraction cache, not immutable run history.
+            # Re-extraction of the same PDF can repair a corrupt cached payload.
+            self._db.execute("INSERT INTO paper_documents VALUES (?,?,?) "
+                             "ON CONFLICT(work_id,sha256) DO UPDATE SET payload=excluded.payload",
+                             (document.work_id, document.sha256, document.model_dump_json()))
+            self._db.execute("INSERT INTO run_documents VALUES (?,?,?) ON CONFLICT(run_id,work_id) "
+                             "DO UPDATE SET payload=excluded.payload",
+                             (run_id, document.work_id, record.model_dump_json()))
+
+    def cached_document(self, work_id: str) -> PDFDocument | None:
+        row = self._db.execute("SELECT payload FROM paper_documents WHERE work_id=? ORDER BY rowid DESC LIMIT 1",
+                               (work_id,)).fetchone()
+        try:
+            return PDFDocument.model_validate_json(row[0]) if row else None
+        except ValueError as exc:
+            raise StorageError("Stored document is invalid; database preserved.") from exc
+
+    def document_records(self, run_id: str) -> list[DocumentRecord]:
+        try:
+            return [DocumentRecord.model_validate_json(row[0]) for row in self._db.execute(
+                "SELECT payload FROM run_documents WHERE run_id=? ORDER BY rowid", (run_id,))]
+        except ValueError as exc:
+            raise StorageError("Stored document outcome is invalid; database preserved.") from exc
+
+    def save_document_failure(self, run_id: str, failure: DocumentFailure) -> None:
+        failure = DocumentFailure.model_validate(failure.model_dump())
+        self._document_member(run_id, failure.work_id)
+        previous = next((r for r in self.document_records(run_id) if r.work_id == failure.work_id), None)
+        record = DocumentRecord(work_id=failure.work_id, status="failed", failure=failure,
+                                source=previous.source if previous else None)
+        with self._db:
+            self._db.execute("INSERT INTO run_documents VALUES (?,?,?) ON CONFLICT(run_id,work_id) "
+                             "DO UPDATE SET payload=excluded.payload",
+                             (run_id, failure.work_id, record.model_dump_json()))
+
+    def save_document_reading(self, run_id: str, reading: PDFReading) -> None:
+        reading = PDFReading.model_validate(reading.model_dump())
+        self._document_member(run_id, reading.work_id)
+        previous = next((r for r in self.document_records(run_id) if r.work_id == reading.work_id), None)
+        if previous is None or previous.source is None or previous.source.sha256 != reading.sha256:
+            raise StorageError("A reading requires this run's extracted document.")
+        row = self._db.execute("SELECT payload FROM paper_documents WHERE work_id=? AND sha256=?",
+                               (reading.work_id, reading.sha256)).fetchone()
+        try:
+            document = PDFDocument.model_validate_json(row[0]) if row else None
+            if document is None or len(document.pages) != reading.page_count:
+                raise ValueError("Source page mismatch")
+            from radar.processing.document_chunks import chunk_document
+            text, spans = chunk_document(document)
+            actual_spans = [(c.start, c.end, c.pages) for c in reading.chunks]
+            if len(text) != reading.text_chars or spans != actual_spans:
+                raise ValueError("Source text coverage mismatch")
+            pages = {p.number: " ".join(p.text.split()) for p in document.pages}
+            child_quotes = set()
+            for chunk in reading.chunks:
+                for evidence in chunk.notes.evidence:
+                    quote = " ".join(evidence.quote.split())
+                    if (not quote or evidence.page not in chunk.pages
+                            or quote not in pages.get(evidence.page, "")
+                            or quote not in " ".join(text[chunk.start:chunk.end].split())):
+                        raise ValueError("Unsupported source quote")
+                    child_quotes.add((evidence.page, quote))
+            if any((e.page, " ".join(e.quote.split())) not in child_quotes for e in reading.notes.evidence):
+                raise ValueError("Final notes introduce unsupported source quotes")
+            record = DocumentRecord(work_id=reading.work_id, status="read", source=previous.source, reading=reading)
+        except ValueError as exc:
+            raise StorageError("Document reading does not match its immutable PDF source.") from exc
+        with self._db:
+            self._db.execute("UPDATE run_documents SET payload=? WHERE run_id=? AND work_id=?",
+                             (record.model_dump_json(), run_id, reading.work_id))
+
     def save_report(self, run_id: str, report: RadarReport, selected: int) -> None:
         report = RadarReport.model_validate(report.model_dump())
         expected = {r[0] for r in self._db.execute("SELECT work_id FROM pool_papers WHERE run_id=?", (run_id,))}
@@ -190,9 +281,20 @@ class SQLiteStore:
         row = self._db.execute("SELECT metadata FROM pools WHERE run_id=?", (run_id,)).fetchone()
         if row is None or not 0 <= selected <= len(expected):
             raise StorageError("Invalid stored report coverage.")
+        outcomes = {r.work_id: r for r in self.document_records(run_id)}
+        for reading in report.document_readings:
+            record = outcomes.get(reading.work_id)
+            if record is None or record.status != "read" or record.reading != reading:
+                raise StorageError("Report requires this run's verified complete PDF reading.")
+        for failure in report.document_failures:
+            record = outcomes.get(failure.work_id)
+            if record is None or record.status != "failed" or record.failure != failure:
+                raise StorageError("Report PDF failures must match this run's outcomes.")
         for resolved in report.learning_dossiers:
             if not 0 <= resolved.source.index < selected:
                 raise StorageError("Learning dossier source must be in the analyzed index range.")
+            if resolved.evidence_level == "pdf_text":
+                continue  # Validated above against the run's immutable document reading.
             source = self._db.execute(
                 "SELECT payload FROM pool_papers WHERE run_id=? AND work_id=?",
                 (run_id, resolved.source.openalex_id),

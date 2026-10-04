@@ -101,23 +101,26 @@ class TestFullPoolOfflineAcceptance(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             snap = _seed(tmp, works)
             before = Path(snap).read_bytes()
+            from pdf_support import empty_notes_model, make_loader, make_pdf_document
+            docs = {w.openalex_id: make_pdf_document(w.openalex_id) for w in works}
             result = _run_pipeline(PipelineRequest(
                 mode="analyze", max_candidates=8, from_snapshot=snap,
                 clef_base_url="http://127.0.0.1:9", clef_model=MODEL,
                 clef_transport=transport,
                 model_override=_fixed_model(),
-                source_override=_NoOpenAlex()))
+                source_override=_NoOpenAlex(),
+                document_loader=make_loader(docs),
+                document_model_override=empty_notes_model()))
             self.assertEqual(result.exit_code, 0)
             # 102 SystemOne calls (4 missing abstracts need none).
             self.assertEqual(len(calls), 102)
             line = " ".join(result.stderr_notes)
             for token in ("pool=106", "considered=106", "scored=102",
-                          "unknown=4", "failed=0", "selected=4",
-                          "analyzed=4", f"model={MODEL}"):
+                          "unknown=4", "failed=0", "selected=8",
+                          "analyzed=8", f"model={MODEL}"):
                 self.assertIn(token, line)
-            # Intact full abstracts (never truncated tails) plus the reserved
-            # specialist context admit four papers here; screening still covers
-            # the entire 106-paper pool.
+            # Fixture PDFs are tiny so the full 8-paper shortlist fits the
+            # PDF prompt budget; screening still covers the entire pool.
             # Every evidence URL resolves inside the pool.
             pool_ids = {w.openalex_id for w in works}
             import re

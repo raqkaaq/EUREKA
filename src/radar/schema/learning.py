@@ -51,6 +51,7 @@ class LearningDossierDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     paper_index: StrictInt = Field(ge=0)
+    supporting_pages: list[StrictInt] = Field(default_factory=list, max_length=8)
     core_problem: str = Field(min_length=1, max_length=500)
     reported_contribution: str = Field(min_length=1, max_length=500)
     reasoning: str = Field(min_length=1, max_length=500)

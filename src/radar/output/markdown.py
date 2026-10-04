@@ -56,10 +56,24 @@ def render_markdown(report: RadarReport) -> str:
     """Lead with grounded learning; preserve opportunity-only report rendering."""
     title = "AI/ML Learning Radar" if report.learning_dossiers else "AI/ML Opportunity Radar"
     lines: list[str] = [f"# {title}", ""]
+    if report.document_readings:
+        lines.extend(["## Full PDF text investigation", "",
+                      "All extracted text was read in bounded sections. Figures, images and equation/table fidelity were not visually verified.", ""])
+        for reading in report.document_readings:
+            lines.append(f"- {reading.work_id}: {reading.page_count} pages, {len(reading.chunks)} sections; "
+                         f"SHA-256 `{reading.sha256}`.")
+        lines.append("")
+    if report.document_failures:
+        lines.extend(["## PDFs not investigated", "",
+                      "Access/extraction/reading gaps—not judgments of scientific importance. No abstract fallback.", ""])
+        for failure in report.document_failures:
+            lines.append(f"- {failure.work_id}: {failure.category}")
+        lines.append("")
     for resolved in report.learning_dossiers:
         dossier = resolved.dossier
         source = resolved.source
-        lines.append("## Learning dossier (primary, abstract-level only)")
+        basis = "PDF text" if resolved.evidence_level == "pdf_text" else "abstract-level only"
+        lines.append(f"## Learning dossier (primary, {basis})")
         lines.append("")
         lines.append(f"**Core problem:** {dossier.core_problem or '—'}")
         lines.append("")
@@ -93,8 +107,14 @@ def render_markdown(report: RadarReport) -> str:
             lines.append(f"- {item}")
         lines.append("")
         title = _escape_link_label(source.title)
-        lines.append(f"**Source (abstract-level evidence):** [{title}]({source.url}) "
+        lines.append(f"**Source ({basis} evidence):** [{title}]({source.url}) "
                      f"({source.openalex_id}; evidence_level={resolved.evidence_level})")
+        if resolved.source_pdf is not None:
+            lines.append("")
+            lines.append("**PDF page references:**")
+            lines.append("")
+            for page in resolved.source_pages:
+                lines.append(f"- [PDF page {page}](<{resolved.source_pdf.source_url}#page={page}>)")
         lines.append("")
     lines.extend(_opportunity_lines(report))
     lines.append("## Next move")
