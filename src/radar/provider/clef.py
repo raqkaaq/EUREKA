@@ -20,7 +20,7 @@ from typing import Any
 import httpx as _httpx
 
 from radar.config.interests import RadarProfile
-from radar.provider.freetoken import FreeTokenError, check_local_network
+from radar.provider.strata import StrataError, check_local_network
 from radar.processing.triage_input import build_input
 from radar.schema.papers import CollectedWork
 from radar.schema.triage import SystemOneResponse, TriageBatch, TriageResult
@@ -104,7 +104,7 @@ class ClefConfig:
         base = _normalize_base(raw)
         try:
             check_local_network(base)
-        except FreeTokenError:
+        except StrataError:
             raise ClefError(
                 "CLEF base URL must be a loopback or private-LAN http(s) URL "
                 "without credentials."

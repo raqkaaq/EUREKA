@@ -34,7 +34,7 @@ from radar.config.runtime import (
 )
 from radar.processing.ranking import bound_candidates
 from radar.prompts.catalog import opportunity_analysis_prompt
-from radar.provider import freetoken as _freetoken
+from radar.provider import strata as _strata
 from radar.schema.opportunities import RadarDraft
 from radar.schema.papers import CollectedWork
 from radar.schema.configuration import AnalysisPrompt
@@ -164,7 +164,7 @@ def run_bounds(
         raise ValueError("request timeout must be within (0, overall deadline]s")
     settings: _ModelSettings = {"max_tokens": tokens, "timeout": per_request}  # type: ignore[typeddict-item]
     if disable_thinking:
-        settings["extra_body"] = _freetoken.thinking_extra_body()  # type: ignore[typeddict-unknown-key]
+        settings["extra_body"] = _strata.thinking_extra_body()  # type: ignore[typeddict-unknown-key]
     from pydantic_ai.usage import UsageLimits
 
     return settings, UsageLimits(request_limit=limit), ANALYSIS_RETRIES
@@ -208,14 +208,14 @@ def _validation_categories(exc: BaseException) -> list[str]:
     return categories[:12]
 
 
-def _actionable(exc: Exception, disable_thinking: bool) -> _freetoken.FreeTokenError:
+def _actionable(exc: Exception, disable_thinking: bool) -> _strata.StrataError:
     text = str(exc)
     lowered = text.lower()
     if disable_thinking and (
         "400" in text or "bad request" in lowered or "extra_body" in lowered
     ):
-        return _freetoken.FreeTokenError(
-            f"FreeToken server rejected the optional thinking-disable key "
+        return _strata.StrataError(
+            f"Strata server rejected the optional thinking-disable key "
             f"({type(exc).__name__}: {exc}). Rerun without --disable-thinking; "
             "that server-specific key is not supported by every backend."
         )
@@ -225,12 +225,12 @@ def _actionable(exc: Exception, disable_thinking: bool) -> _freetoken.FreeTokenE
         if categories
         else ""
     )
-    return _freetoken.FreeTokenError(
-        f"FreeToken inference failed ({type(exc).__name__}: {exc}).{detail} "
-        "Check that your user-owned FreeToken server is serving "
+    return _strata.StrataError(
+        f"Strata inference failed ({type(exc).__name__}: {exc}).{detail} "
+        "Check that your user-owned Strata server is serving "
         "OpenAI-compatible Chat Completions at the configured private-network "
-        "endpoint from FREETOKEN_BASE_URL/--base-url and that "
-        "FREETOKEN_MODEL names a served model."
+        "endpoint from STRATA_BASE_URL (legacy FREETOKEN_BASE_URL)/--base-url and that "
+        "STRATA_MODEL names a served model."
     )
 
 
@@ -242,7 +242,7 @@ async def analyze_candidates_async(
     max_tokens: int = ANALYSIS_MAX_TOKENS,
     request_limit: int = ANALYSIS_REQUEST_LIMIT,
     disable_thinking: bool = False,
-    session: "_freetoken.FreeTokenSession | None" = None,
+    session: "_strata.StrataSession | None" = None,
 ) -> tuple[RadarDraft, str]:
     """Run the radar analysis under a hard overall deadline.
 
@@ -250,7 +250,7 @@ async def analyze_candidates_async(
     could not be interrupted). When ``session`` is given, its model is used
     and its HTTP client is closed in the same event loop once the run
     settles (including on cancellation), so cleanup is deterministic.
-    Raises :class:`freetoken.FreeTokenError` on deadline breach or
+    Raises :class:`strata.StrataError` on deadline breach or
     inference failure.
     """
     try:
@@ -277,7 +277,7 @@ async def analyze_candidates_async(
                 await session.http_client.aclose()
             except Exception:
                 pass
-        raise _freetoken.FreeTokenError(
+        raise _strata.StrataError(
             "No model or session was provided to the analysis agent; "
             "the pipeline must supply one."
         )
@@ -291,13 +291,13 @@ async def analyze_candidates_async(
                 retries=retries,
             )
     except (TimeoutError, _asyncio.CancelledError) as exc:
-        raise _freetoken.FreeTokenError(
-            f"FreeToken analysis exceeded the overall {analysis_timeout_s}s "
+        raise _strata.StrataError(
+            f"Strata analysis exceeded the overall {analysis_timeout_s}s "
             f"deadline ({type(exc).__name__}); no partial report was produced. "
             "Retry with fewer candidates, a smaller --max-tokens, or a larger "
             "--analysis-timeout."
         ) from exc
-    except _freetoken.FreeTokenError:
+    except _strata.StrataError:
         raise
     except Exception as exc:
         raise _actionable(exc, disable_thinking) from exc
@@ -316,7 +316,7 @@ async def analyze_candidates_async(
         try:
             output = RadarDraft.model_validate(output)
         except Exception as exc:
-            raise _freetoken.FreeTokenError(
+            raise _strata.StrataError(
                 f"Model returned output that does not validate as RadarDraft: {exc}"
             ) from exc
     return output, prompt
@@ -330,12 +330,12 @@ def analyze_candidates(
     max_tokens: int = ANALYSIS_MAX_TOKENS,
     request_limit: int = ANALYSIS_REQUEST_LIMIT,
     disable_thinking: bool = False,
-    session: "_freetoken.FreeTokenSession | None" = None,
+    session: "_strata.StrataSession | None" = None,
 ) -> tuple[RadarDraft, str]:
     """Run the radar analysis; return ``(draft, prompt)``.
 
     Synchronous wrapper around :func:`analyze_candidates_async` (fresh event
-    loop per call, never nested). Raises :class:`freetoken.FreeTokenError`
+    loop per call, never nested). Raises :class:`strata.StrataError`
     when the local model endpoint is unreachable/misconfigured or the
     overall deadline is breached.
     """

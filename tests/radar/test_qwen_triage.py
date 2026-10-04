@@ -133,7 +133,7 @@ class TestQwenTriage(unittest.TestCase):
 
     def test_deadline_cancels_tasks_and_closes_owned_client(self):
         from radar.agent.paper_triage import screen_works
-        from radar.provider import freetoken
+        from radar.provider import strata as freetoken
         active, settled = [], []
         async def stall(messages, info):
             active.append(1)
@@ -153,7 +153,7 @@ class TestQwenTriage(unittest.TestCase):
 
     def test_failed_inference_is_redacted_and_owned_client_closed(self):
         from radar.agent.paper_triage import screen_works
-        from radar.provider import freetoken
+        from radar.provider import strata as freetoken
         def fail(messages, info):
             raise RuntimeError("sensitive-body")
         client = SimpleNamespace(aclose=mock.AsyncMock())
@@ -168,7 +168,7 @@ class TestQwenTriage(unittest.TestCase):
     def test_real_pydanticai_provider_uses_chat_completions_and_shared_inputs(self):
         import httpx2
         from radar.agent.paper_triage import screen_works
-        from radar.provider import freetoken
+        from radar.provider import strata as freetoken
         requests = []
         def chat(request):
             body = json.loads(request.content)
@@ -189,9 +189,11 @@ class TestQwenTriage(unittest.TestCase):
             client = httpx2.AsyncClient(transport=httpx2.MockTransport(chat), trust_env=False)
             clients.append(client)
             return client
-        with mock.patch.object(freetoken, "_provider_http_client", side_effect=create_client):
-            batch = screen_works(works(), default_profile(), base_url="http://127.0.0.1:1919/v1",
-                                 configured_model="test-qwen")
+        with mock.patch.dict(os.environ, {
+            "STRATA_BASE_URL": "http://127.0.0.1:8080/v1",
+            "STRATA_MODEL": "test-qwen",
+        }, clear=True), mock.patch.object(freetoken, "_provider_http_client", side_effect=create_client):
+            batch = screen_works(works(), default_profile())
         self.assertTrue(all(r.status == "scored" for r in batch.results))
         self.assertEqual([path for path, _ in requests], ["/v1/chat/completions"])
         self.assertTrue(clients[0].is_closed)

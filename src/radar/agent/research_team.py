@@ -25,14 +25,14 @@ from radar.processing.ranking import bound_candidates
 from radar.prompts.catalog import (
     SPECIALIST_ROLES, opportunity_analysis_prompt, specialist_prompt,
 )
-from radar.provider.freetoken import FreeTokenError
+from radar.provider.strata import StrataError
 from radar.schema.configuration import AnalysisPrompt
 from radar.schema.opportunities import RadarDraft, SpecialistContribution, SpecialistRole
 from radar.schema.papers import CollectedWork
 
 if TYPE_CHECKING:
     from pydantic_ai.models import Model
-    from radar.provider.freetoken import FreeTokenSession
+    from radar.provider.strata import StrataSession
 
 
 @dataclass(frozen=True)
@@ -95,7 +95,7 @@ def _reports_context(reports: tuple[SpecialistContribution, ...]) -> str:
                           ensure_ascii=False, separators=(",", ":")) +
                "\n--- end untrusted specialist data ---")
     if len(context) > SPECIALIST_CONTEXT_CHARS:
-        raise FreeTokenError("Specialist context exceeded its bound; no report produced.")
+        raise StrataError("Specialist context exceeded its bound; no report produced.")
     return context
 
 
@@ -104,7 +104,7 @@ async def research_candidates_async(
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
     analysis_timeout_s: float = ANALYSIS_TIMEOUT_S,
     max_tokens: int = ANALYSIS_MAX_TOKENS, disable_thinking: bool = False,
-    session: FreeTokenSession | None = None,
+    session: StrataSession | None = None,
 ) -> ResearchResult:
     """Three specialists, then synthesis; at most eight PydanticAI requests total."""
     from pydantic_ai.usage import UsageLimits
@@ -120,7 +120,7 @@ async def research_candidates_async(
                                   "", ())
         active_model = session.model if session is not None else model
         if active_model is None:
-            raise FreeTokenError("Research team requires a supplied FreeToken model or session.")
+            raise StrataError("Research team requires a supplied Strata model or session.")
         async with asyncio.timeout(float(analysis_timeout_s)):
             semaphore = asyncio.Semaphore(SPECIALIST_CONCURRENCY)
 
@@ -144,17 +144,17 @@ async def research_candidates_async(
                 usage_limits=UsageLimits(request_limit=ANALYSIS_REQUEST_LIMIT), retries=retries)
             return ResearchResult(result.output, prompt, tuple(included), reports)
     except TimeoutError:
-        raise FreeTokenError(
+        raise StrataError(
             f"Research team exceeded the overall {analysis_timeout_s}s deadline; "
-            "no partial report produced. Check FREETOKEN_BASE_URL or use fewer candidates."
+            "no partial report produced. Check STRATA_BASE_URL (legacy FREETOKEN_BASE_URL) or use fewer candidates."
         ) from None
-    except (ConfigurationError, FreeTokenError):
+    except (ConfigurationError, StrataError):
         raise
     except Exception as exc:
         # Never include upstream bodies, prompts, validation inputs or auth data.
-        raise FreeTokenError(
+        raise StrataError(
             f"Research team failed ({type(exc).__name__}); no partial report produced. "
-            "Check the user-owned FREETOKEN_BASE_URL/model and typed response support."
+            "Check the user-owned STRATA_BASE_URL (legacy FREETOKEN_BASE_URL)/model and typed response support."
         ) from None
     finally:
         if session is not None:

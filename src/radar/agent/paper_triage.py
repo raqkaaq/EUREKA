@@ -1,4 +1,4 @@
-"""Same screening input/answer contracts over FreeToken PydanticAI chat.
+"""Same screening input/answer contracts over Strata PydanticAI chat.
 
 The only adaptation is transport framing: complete native screening inputs
 are grouped with work IDs in the chat user message; output is validated
@@ -9,14 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from typing import TYPE_CHECKING
 
 from radar.config.interests import RadarProfile
 from radar.config.runtime import MAX_TOTAL_WORKS, validate_clef_overall_timeout
 from radar.processing.triage_input import build_input
 from radar.prompts.catalog import paper_triage_prompt, screening_questions
-from radar.provider import freetoken
+from radar.provider import strata
 from radar.schema.papers import CollectedWork
 from radar.schema.triage import QwenResponses, TriageBatch, TriageResult
 
@@ -89,7 +88,7 @@ async def screen_works_async(
     if len(ids) > MAX_TOTAL_WORKS or len(set(ids)) != len(ids):
         raise ValueError("routing pool exceeds its bound or contains duplicate IDs")
     paper_triage_prompt()  # Validate before provider resolution or network I/O.
-    name = model_id or configured_model or os.environ.get("FREETOKEN_MODEL", "").strip() or "qwen-not-called"
+    name = model_id or configured_model or strata.model_from_env() or "qwen-not-called"
     batches, results = _plan(works, profile, name)
     session = None
     try:
@@ -97,11 +96,11 @@ async def screen_works_async(
             try:
                 async with asyncio.timeout(budget):
                     if model is None:
-                        config = freetoken.FreeTokenConfig.resolve(
+                        config = strata.StrataConfig.resolve(
                             base_url=base_url, model=configured_model,
                             timeout_s=min(budget, MAX_REQUEST_TIMEOUT_S))
                         name = config.model
-                        session = freetoken.build_session(config)
+                        session = strata.build_session(config)
                         model = session.model
                         batches, results = _plan(works, profile, name)
                     agent = build_agent(model)
@@ -109,7 +108,7 @@ async def screen_works_async(
                     settings = {"max_tokens": MAX_REQUEST_TOKENS,
                                 "timeout": min(budget, MAX_REQUEST_TIMEOUT_S)}
                     if disable_thinking:
-                        settings["extra_body"] = freetoken.thinking_extra_body()
+                        settings["extra_body"] = strata.thinking_extra_body()
 
                     async def score(chunk: list[CollectedWork]):
                         async with semaphore:
