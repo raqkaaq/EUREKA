@@ -135,7 +135,7 @@ def _notes_agent(model: Model, instructions: str, excerpts: list[EvidenceExcerpt
         try:
             _resolve_notes(notes, excerpts)
         except ValueError:
-            raise ModelRetry("Use valid supplied evidence references and keep final resolved notes within 2500 characters.") from None
+            raise ModelRetry("Use only valid supplied evidence references.") from None
         return notes
 
     return agent

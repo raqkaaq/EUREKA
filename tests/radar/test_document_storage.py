@@ -31,6 +31,23 @@ def reading(doc):
 
 
 class TestDocumentStorage(unittest.TestCase):
+    def test_detailed_reading_survives_storage_and_discovery_memory_without_truncation(self):
+        doc = document()
+        original = reading(doc)
+        summary = "Mechanism, assumptions, results and counterevidence. " * 25
+        notes = original.notes.model_copy(update={"summary": summary})
+        detailed = original.model_copy(update={
+            "notes": notes,
+            "chunks": [chunk.model_copy(update={"notes": notes}) for chunk in original.chunks]})
+        with tempfile.TemporaryDirectory() as directory:
+            with SQLiteStore(directory) as store:
+                run_id = self.seed(store)
+                store.save_document(run_id, doc)
+                store.save_document_reading(run_id, detailed)
+            with SQLiteStore(directory) as store:
+                self.assertEqual(store.document_records(run_id)[0].reading, detailed)
+                self.assertEqual(store.discovery_memory().findings[0].contribution, summary.strip())
+
     def test_verified_reextraction_repairs_same_hash_cache_without_rewriting_runs(self):
         with tempfile.TemporaryDirectory() as directory, SQLiteStore(directory) as store:
             old_run = self.seed(store)

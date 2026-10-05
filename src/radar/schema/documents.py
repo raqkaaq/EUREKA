@@ -6,7 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from radar.config.documents import (
-    DOCUMENT_MAX_CHUNKS, DOCUMENT_MAX_EXCERPTS, DOCUMENT_MAX_NOTE_CHARS, PDF_MAX_PAGES, PDF_MAX_TEXT_CHARS,
+    DOCUMENT_MAX_CHUNKS, DOCUMENT_MAX_EXCERPTS, PDF_MAX_PAGES, PDF_MAX_TEXT_CHARS,
 )
 
 
@@ -94,7 +94,7 @@ class PDFDocument(PDFSource):
 class PageEvidence(DocumentModel):
     page: StrictInt = Field(ge=1, le=PDF_MAX_PAGES)
     quote: str = Field(min_length=1, max_length=180)
-    finding: str = Field(min_length=1, max_length=180)
+    finding: str = Field(min_length=1)
 
     @field_validator("quote", "finding")
     @classmethod
@@ -105,12 +105,12 @@ class PageEvidence(DocumentModel):
 
 
 class DocumentNoteFields(DocumentModel):
-    """Shared unchanged scalar contract for wire references and stored notes."""
+    """Required narrative fields, without arbitrary content-length limits."""
 
-    summary: str = Field(min_length=1, max_length=600)
-    methods: str = Field(min_length=1, max_length=300)
-    results: str = Field(min_length=1, max_length=300)
-    limitations: str = Field(min_length=1, max_length=300)
+    summary: str = Field(min_length=1)
+    methods: str = Field(min_length=1)
+    results: str = Field(min_length=1)
+    limitations: str = Field(min_length=1)
 
     @field_validator("summary", "methods", "results", "limitations")
     @classmethod
@@ -122,12 +122,6 @@ class DocumentNoteFields(DocumentModel):
 
 class DocumentNotes(DocumentNoteFields):
     evidence: list[PageEvidence] = Field(default_factory=list, max_length=2)
-
-    @model_validator(mode="after")
-    def _bounded(self) -> DocumentNotes:
-        if len(self.model_dump_json()) > DOCUMENT_MAX_NOTE_CHARS:
-            raise ValueError("Reading notes exceed the serialized bound.")
-        return self
 
 
 class EvidenceExcerpt(DocumentModel):
@@ -152,7 +146,7 @@ class EvidenceExcerpt(DocumentModel):
 
 class EvidenceReference(DocumentModel):
     excerpt_id: StrictInt = Field(ge=0, lt=DOCUMENT_MAX_EXCERPTS)
-    finding: str = Field(min_length=1, max_length=180)
+    finding: str = Field(min_length=1)
 
     @field_validator("finding")
     @classmethod

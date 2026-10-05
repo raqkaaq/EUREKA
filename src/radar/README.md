@@ -263,6 +263,15 @@ under the unchanged 60-second request and overall document deadlines. A schema
 repair can therefore be followed by a separate evidence-reference repair; persistent invalid
 notes still fail explicitly, with no partial reading or abstract fallback.
 
+Narrative notes (`summary`, `methods`, `results`, `limitations` and evidence
+`finding`) have no per-field character limit or aggregate serialized-note cap.
+They remain required, typed and nonblank. Detailed notes are preserved in
+SQLite and, when included, search memory without shortening their contents.
+Generation token budgets, complete-input prompt budgets and deadlines are
+separate execution controls; they are not validation limits on a field's
+scientific detail. If intact notes cannot fit a reduction prompt, reading fails
+explicitly rather than silently truncating them.
+
 All final-team roles receive whole reduced reading notes and verified quotes,
 within a 48,000-character PDF prompt budget. Coverage distinguishes PDFs read
 from papers included in synthesis. SQLite retains extracted documents, actual

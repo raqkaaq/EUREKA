@@ -70,7 +70,7 @@ class RetrievalResult(DiscoveryModel):
 class SavedFinding(DiscoveryModel):
     work_id: str = Field(min_length=1, max_length=500)
     title: str = Field(default="", max_length=2000)
-    contribution: str = Field(default="", max_length=600)
+    contribution: str = ""
     limits: list[str] = Field(default_factory=list, max_length=6)
     open_questions: list[str] = Field(default_factory=list, max_length=3)
     evidence_level: Literal["abstract", "pdf_text", "metadata"] = "metadata"

@@ -92,28 +92,47 @@ class TestChunking(unittest.TestCase):
         self.assertIsInstance(pdf_reduction_prompt(), AgentPrompt)
         validate_pdf_prompts()
 
-    def test_pdf_prompts_state_schema_character_limits(self):
-        # The live model overran these fields even after a schema retry.
-        # Both chunk reading and reduction must spell out the output contract.
+    def test_pdf_prompts_require_structure_without_arbitrary_narrative_limits(self):
         from radar.prompts.catalog import pdf_reading_prompt, pdf_reduction_prompt
 
         for loader in (pdf_reading_prompt, pdf_reduction_prompt):
             with self.subTest(prompt=loader.__name__):
                 instructions = loader().instructions
-                for contract in (
-                    "summary: at most 600 characters",
-                    "methods: at most 300 characters",
-                    "results: at most 300 characters",
-                    "limitations: at most 300 characters",
-                    "finding: at most 180 characters",
-                ):
-                    self.assertIn(contract, instructions)
-                self.assertIn("characters, not words", instructions)
+                self.assertIn("no per-field character limits", instructions)
+                self.assertNotIn("2500", instructions)
+                self.assertNotIn("300 characters", instructions)
+                self.assertNotIn("within their bounds", instructions)
                 self.assertIn("excerpt_id", instructions)
                 self.assertIn("evidence must be an array", instructions)
 
 
 class TestReaderValidation(unittest.TestCase):
+    def test_detailed_notes_survive_chunk_reading_and_reduction_without_content_caps(self):
+        from radar.agent.pdf_reading import read_pdf
+
+        expected = {"summary": ("Detailed summary. " * 70).strip(),
+                    "methods": ("Method assumptions and identification. " * 20).strip(),
+                    "results": ("Reported results and uncertainty. " * 20).strip(),
+                    "limitations": ("Limitations and counterexamples. " * 20).strip()}
+        finding = ("Interpretation of this verified source excerpt. " * 10).strip()
+        calls = []
+
+        def respond(messages, info):
+            prompt = user_prompt(messages)
+            calls.append(prompt)
+            registry = evidence_registry(prompt)
+            payload = {**expected, "evidence": [{"excerpt_id": registry[0]["excerpt_id"],
+                                                "finding": finding}]}
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
+
+        reading = read_pdf(make_doc(texts=("A source passage. " * 400,)), FunctionModel(respond))
+        self.assertEqual(len(reading.chunks), 2)
+        self.assertEqual(len(calls), 3)
+        for notes in [chunk.notes for chunk in reading.chunks] + [reading.notes]:
+            self.assertEqual(notes.model_dump(exclude={"evidence"}), expected)
+            self.assertEqual(notes.evidence[0].finding, finding)
+            self.assertGreater(len(notes.model_dump_json()), 2500)
+
     def test_code_owned_ids_resolve_exact_source_quotes_on_multiple_and_late_pages(self):
         from radar.agent.pdf_reading import read_pdf
 
@@ -202,9 +221,8 @@ class TestReaderValidation(unittest.TestCase):
             self.assertLessEqual(len(entry["quote"]), 100)
             self.assertIn(entry["quote"], doc.pages[entry["page"] - 1].text)
 
-    def test_resolved_serialized_note_bound_retries_before_accepting_output(self):
+    def test_escaped_source_quotes_do_not_impose_a_serialized_note_cap(self):
         from radar.agent.pdf_reading import read_pdf
-        from radar.provider.strata import StrataError
 
         calls = []
         def respond(messages, info):
@@ -217,9 +235,10 @@ class TestReaderValidation(unittest.TestCase):
             self.assertLessEqual(len(json.dumps(payload, separators=(",", ":"))), 2500)
             return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
 
-        with self.assertRaises(StrataError):
-            read_pdf(make_doc(texts=("\\" * 100, "\\" * 100)), FunctionModel(respond))
-        self.assertEqual(len(calls), 3)
+        reading = read_pdf(make_doc(texts=("\\" * 100, "\\" * 100)), FunctionModel(respond))
+        self.assertGreater(len(reading.notes.model_dump_json()), 2500)
+        self.assertEqual(reading.notes.evidence[0].quote, "\\" * 100)
+        self.assertEqual(len(calls), 1)
 
     def test_schema_repair_can_be_followed_by_quote_repair(self):
         from radar.agent.pdf_reading import read_pdf
@@ -230,7 +249,7 @@ class TestReaderValidation(unittest.TestCase):
             replies.append(messages)
             payload = referenced_notes(user_prompt(messages))
             if len(replies) == 1:
-                payload["methods"] = "m" * 301
+                payload["methods"] = []
             elif len(replies) == 2:
                 payload["evidence"][0]["excerpt_id"] = 15
             return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
