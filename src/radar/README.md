@@ -124,8 +124,8 @@ algorithm or inline instruction fallback.
   never scientific quality) is returned to Qwen before follow-ups. Plans,
   rationales, feedback and bounded prior findings are stored in SQLite.
   First-boot planner failure stops before OpenAlex; a compatible saved initial
-  plan may be reused with an explicit stale-plan note. Refinement failure keeps
-  the first wave and records the failed wave.
+  plan may be reused with an explicit stale-plan note. Refinement-planning
+  failure keeps the first wave with disclosure; failed retrieval waves are recorded.
 - Legacy v1 flat `queries` remain readable with their original six-request
   cap and shared date window; their former `semantic` label is normalized to
   `keyword` because those templates never performed embedding search.
