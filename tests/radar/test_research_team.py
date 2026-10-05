@@ -1,6 +1,8 @@
 """Bounded specialist workflow through real PydanticAI and typed YAML."""
 
 import unittest
+
+from tests.radar.discovery_support import planner_model
 import asyncio
 import time
 import tempfile
@@ -56,8 +58,8 @@ class TestSpecialistPrompts(unittest.TestCase):
         source = DictTransport({})
         with mock.patch("radar.agent.research_team.specialist_prompt",
                         side_effect=ConfigurationError("invalid specialist YAML")):
-            result = run(PipelineRequest(mode="analyze", source_override=source))
-            collected = run(PipelineRequest(mode="collect", source_override=DictTransport({})))
+            result = run(PipelineRequest(planner_model_override=planner_model(), mode="analyze", source_override=source))
+            collected = run(PipelineRequest(planner_model_override=planner_model(), mode="collect", source_override=DictTransport({})))
         self.assertEqual(result.exit_code, 4)
         self.assertEqual(source.calls, [])
         self.assertEqual(collected.exit_code, 0)
@@ -361,7 +363,7 @@ class TestResearchTeam(unittest.TestCase):
             from pdf_support import empty_notes_model, make_loader, make_pdf_document
             pool = works()
             docs = {w.openalex_id: make_pdf_document(w.openalex_id) for w in pool}
-            result = run(PipelineRequest(mode="analyze", from_snapshot=snapshot,
+            result = run(PipelineRequest(planner_model_override=planner_model(), mode="analyze", from_snapshot=snapshot,
                                         triage_scorer=score, model_override=FunctionModel(respond),
                                         document_loader=make_loader(docs),
                                         document_model_override=empty_notes_model()))
@@ -403,7 +405,7 @@ class TestResearchTeam(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             snapshot = refresh_pool(pool, tmp)["snapshot"]
             with mock.patch("radar.agent.research_team.opportunity_analysis_prompt", return_value=spec):
-                result = run(PipelineRequest(mode="analyze", from_snapshot=snapshot,
+                result = run(PipelineRequest(planner_model_override=planner_model(), mode="analyze", from_snapshot=snapshot,
                                             triage_scorer=score, model_override=model))
         # Full-PDF mode never uses the abstract prompt budget: without an
         # explicit document loader there are no readings, so analysis fails

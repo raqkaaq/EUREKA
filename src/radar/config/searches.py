@@ -1,4 +1,17 @@
-"""Expand a learning agenda into bounded retrieval, without screening papers."""
+"""Adaptive discovery policy plus explicit-only legacy query planning.
+
+The packaged ``searches.yaml`` is a version-3 :class:`DiscoveryPolicy`:
+learning goals (hypotheses with scope) plus query/page budgets, the
+planner deadline and the token cap. It holds no query strings; the model
+planner chooses actual questions, wording, retrieval methods, dates and
+followups.
+
+``search_policy`` (alias ``search_config``) loads that typed policy.
+``build_query_plan`` retains the legacy v1/v2 template renderer ONLY for
+callers that supply an explicit old :class:`SearchConfig`; there are no
+implicit package templates. Normal pipeline/tests migrate to the adaptive
+planner (see :mod:`radar.agent.discovery_planning`).
+"""
 
 from __future__ import annotations
 
@@ -10,11 +23,17 @@ from radar.config.interests import RadarProfile
 from radar.config.runtime import MAX_QUERIES, MAX_TERM_CHARS
 from radar.config.yaml import ConfigurationError, load_yaml
 from radar.schema.configuration import SearchConfig
+from radar.schema.discovery import DiscoveryPolicy
 from radar.schema.papers import PlannedQuery, QueryPlan
 
 
-def search_config() -> SearchConfig:
-    return load_yaml("radar.config", "searches.yaml", SearchConfig)
+def search_policy() -> DiscoveryPolicy:
+    return load_yaml("radar.config", "searches.yaml", DiscoveryPolicy)
+
+
+def search_config() -> DiscoveryPolicy:
+    """Legacy loader name; returns the typed v3 discovery policy."""
+    return search_policy()
 
 
 def _phrase(term: str) -> str:
@@ -29,14 +48,26 @@ def build_query_plan(
     configuration: SearchConfig | None = None,
     today: dt.date | None = None,
 ) -> QueryPlan:
-    """Render historical/fresh research branches (or legacy v1 templates).
+    """Render legacy v1/v2 templates from an explicitly supplied config.
 
-    Invalid/oversized terms fail rather than truncating Boolean syntax. Empty
-    domain branches are omitted; exact duplicate requests are deduplicated.
-    Configuration cannot raise the code-owned request/page/pool caps.
+    ``configuration`` is required: implicit package templates were removed
+    with the v3 adaptive policy, so a missing config fails instead of
+    rendering stale defaults. Configuration cannot raise the code-owned
+    request/page/pool caps. Invalid/oversized terms fail rather than
+    truncating Boolean syntax; exact duplicates are deduplicated.
     """
+    if configuration is None:
+        raise ConfigurationError(
+            "searches.yaml: legacy planning needs an explicit SearchConfig; "
+            "use the adaptive discovery planner for the packaged v3 policy"
+        )
+    if isinstance(configuration, DiscoveryPolicy):
+        raise ConfigurationError(
+            "searches.yaml: v3 discovery policies need the adaptive planner, "
+            "not legacy template rendering"
+        )
     profile = RadarProfile.model_validate(profile.model_dump())
-    config = configuration if configuration is not None else search_config()
+    config = configuration
     bound = max(1, min(int(max_queries), 6 if config.version == 1 else MAX_QUERIES))
     date = (
         (today or dt.date.today()) - dt.timedelta(days=profile.lookback_days)

@@ -5,6 +5,8 @@ External HTTP/model boundaries are substituted; no services or .env reads.
 
 from __future__ import annotations
 
+from tests.radar.discovery_support import planner_model
+
 import json
 import datetime as dt
 import os
@@ -20,7 +22,7 @@ from radar.output import triage as _out_triage
 from radar.pipeline import PipelineRequest, run as _run_pipeline
 from radar.schema.opportunities import RadarDraft
 from radar.schema.papers import CollectedWork
-from radar.config.searches import build_query_plan
+from tests.radar.discovery_support import test_query_plan as build_query_plan
 from radar.source.openalex import DictTransport
 from radar.config.interests import default_profile
 from radar.storage import triage as _triage_store
@@ -124,7 +126,7 @@ class TestClefConfigRequired(unittest.TestCase):
             calls.append(True)
             raise AssertionError("No investigation should run below the importance threshold")
 
-        result = _run_pipeline(PipelineRequest(
+        result = _run_pipeline(PipelineRequest(planner_model_override=planner_model(),
             mode="analyze", max_candidates=2,
             source_override=DictTransport(_pages(2)), triage_scorer=score,
             model_override=FunctionModel(forbidden)))
@@ -136,7 +138,7 @@ class TestClefConfigRequired(unittest.TestCase):
 
     def test_both_endpoints_unconfigured_is_exit4_with_zero_model_calls(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            result = _run_pipeline(PipelineRequest(
+            result = _run_pipeline(PipelineRequest(planner_model_override=planner_model(),
                 mode="analyze", max_candidates=2,
                 source_override=DictTransport(_pages(6))))
         self.assertEqual(result.exit_code, 4)
@@ -144,7 +146,7 @@ class TestClefConfigRequired(unittest.TestCase):
 
     def test_missing_endpoint_checked_even_with_model_override(self):
         with mock.patch.dict(os.environ, {}, clear=True):
-            result = _run_pipeline(PipelineRequest(
+            result = _run_pipeline(PipelineRequest(planner_model_override=planner_model(),
                 mode="analyze", max_candidates=2,
                 source_override=DictTransport(_pages(6)),
                 model_override=_fixed_model()))
@@ -152,7 +154,7 @@ class TestClefConfigRequired(unittest.TestCase):
 
     def test_bad_clef_path_redacted_in_pipeline_stderr(self):
         secret_path = "/v1/secret-token-abc-xyz"
-        result = _run_pipeline(PipelineRequest(
+        result = _run_pipeline(PipelineRequest(planner_model_override=planner_model(),
             mode="analyze", max_candidates=1,
             clef_base_url=f"http://127.0.0.1:11434{secret_path}",
             source_override=DictTransport(_pages(1)),
@@ -169,13 +171,13 @@ class TestClefConfigRequired(unittest.TestCase):
 
     def test_bad_clef_timeouts_are_usage_errors(self):
         with mock.patch.dict(os.environ, {"CLEF_BASE_URL": "http://127.0.0.1:9"}):
-            bad_request = _run_pipeline(PipelineRequest(
+            bad_request = _run_pipeline(PipelineRequest(planner_model_override=planner_model(),
                 mode="analyze", max_candidates=1, clef_timeout_s=0,
                 source_override=DictTransport(_pages(1)),
                 model_override=_fixed_model(),
                 triage_scorer=lambda pool, profile: _batch([])))
             self.assertEqual(bad_request.exit_code, 4)
-            bad_overall = _run_pipeline(PipelineRequest(
+            bad_overall = _run_pipeline(PipelineRequest(planner_model_override=planner_model(),
                 mode="analyze", max_candidates=1, triage_timeout_s=301,
                 source_override=DictTransport(_pages(1)),
                 model_override=_fixed_model(),
@@ -187,7 +189,7 @@ class TestCollectOnlyIgnoresClef(unittest.TestCase):
     def test_collect_only_needs_no_clef_config(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CLEF_BASE_URL", None)
-            result = _run_pipeline(PipelineRequest(
+            result = _run_pipeline(PipelineRequest(planner_model_override=planner_model(),
                 mode="collect", max_candidates=2,
                 clef_timeout_s=-1, triage_timeout_s=-1,
                 source_override=DictTransport(_pages(6))))
@@ -262,7 +264,7 @@ class TestMandatoryRoutingIntegration(unittest.TestCase):
             snap = _write_snapshot(tmp, works)
             from pdf_support import empty_notes_model, make_loader, make_pdf_document
             docs = {w.openalex_id: make_pdf_document(w.openalex_id) for w in works}
-            result = _run_pipeline(PipelineRequest(
+            result = _run_pipeline(PipelineRequest(planner_model_override=planner_model(),
                 mode="analyze", max_candidates=3, from_snapshot=snap,
                 model_override=_fixed_model(), triage_scorer=_scorer,
                 document_loader=make_loader(docs),
@@ -292,7 +294,7 @@ class TestMandatoryRoutingIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             snap = _write_snapshot(tmp, [_work("https://openalex.org/W0")])
             before = _read_bytes(snap)
-            result = _run_pipeline(PipelineRequest(
+            result = _run_pipeline(PipelineRequest(planner_model_override=planner_model(),
                 mode="analyze", max_candidates=1, from_snapshot=snap,
                 model_override=FunctionModel(_model),
                 triage_model_override=_failed_routing_model(),
@@ -314,7 +316,7 @@ class TestMandatoryRoutingIntegration(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             snap = _write_snapshot(tmp, [_work("https://openalex.org/W0")])
             before = _read_bytes(snap)
-            result = _run_pipeline(PipelineRequest(
+            result = _run_pipeline(PipelineRequest(planner_model_override=planner_model(),
                 mode="analyze", max_candidates=1, from_snapshot=snap,
                 model_override=FunctionModel(_model),
                 triage_model_override=_failed_routing_model(),

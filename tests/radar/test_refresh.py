@@ -6,6 +6,8 @@ Public seam: ``radar.storage.snapshots`` (``refresh_pool``, ``compute_delta``,
 
 from __future__ import annotations
 
+from tests.radar.discovery_support import planner_model
+
 import json
 import unittest
 
@@ -206,7 +208,7 @@ class TestRefreshFailures(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             _refresh.refresh_pool(_pool(2), tmp)
             before = _read_snapshot(tmp)
-            result = run(PipelineRequest(
+            result = run(PipelineRequest(planner_model_override=planner_model(),
                 mode="collect", max_candidates=2, refresh_dir=tmp,
                 source_override=_Down()))
             self.assertNotEqual(result.exit_code, 0)

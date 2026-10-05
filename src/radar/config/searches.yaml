@@ -1,81 +1,34 @@
-version: 2
-# Retrieval intent is not evidence: System1 still screens every collected paper.
-# Four questions x three roles x 15 results = <=180 rows before deduplication.
-# Only frontier searches use the profile lookback. Historical branches are
-# relevance-ranked, not citation-ranked: popularity is not methodological rigor.
-learning_questions:
+version: 3
+# Adaptive discovery policy: learning goals are hypotheses, not truth or
+# mastery claims. The model planner chooses actual questions, wording,
+# retrieval methods, dates and followups within the budgets below.
+# No query strings live here: role reservations describe retrieval purpose,
+# never fixed queries. Initial wave <= 6 queries, followup wave <= 6
+# queries, each query <= 15 results. Planner deadline 120s, output cap 3000
+# tokens. Broad AI/ML center with behavioral/economic cross-domain lenses.
+learning_goals:
   - id: learning_and_generalization
     question: >-
       Which mechanisms explain generalization and emergent capabilities,
       and which apparent advances are artifacts of data, scale or evaluation?
-    searches:
-      - role: foundation
-        kind: keyword
-        terms: '({keywords}) AND ("inductive bias" OR "statistical learning theory" OR "representation learning")'
-      - role: frontier
-        kind: semantic
-        terms: >-
-          For {keywords}, what mechanisms explain generalization, transfer and
-          emergent capabilities? Seek theoretical predictions linked to controlled
-          experiments, comparisons separating architecture, data and compute,
-          and evidence about when scaling fails rather than benchmark gains alone.
-      - role: counterevidence
-        kind: keyword
-        terms: '({keywords}) AND ("data contamination" OR "shortcut learning" OR "spurious correlations" OR "failed replication")'
+    scope: broad
   - id: uncertainty_and_identification
     question: >-
       When can AI systems support reliable inference under limited data,
       distribution shift and unobserved confounding?
-    searches:
-      - role: foundation
-        kind: keyword
-        terms: '({keywords}) AND ("causal inference" OR "off-policy evaluation" OR "uncertainty quantification")'
-      - role: frontier
-        kind: semantic
-        terms: >-
-          For {keywords}, investigate reliable prediction and efficient learning
-          with limited observations, distribution shift or hidden confounding.
-          Seek identifiability conditions, calibration guarantees, off-policy
-          evaluation, sample efficiency and falsifiable tests of causal assumptions.
-      - role: counterevidence
-        kind: keyword
-        terms: '({keywords}) AND ("non-identifiability" OR "miscalibration" OR "distribution shift" OR "causal misspecification")'
+    scope: broad
   - id: objectives_and_incentives
     scope: cross_domain
     question: >-
       How do optimization targets and strategic incentives shape AI behavior,
       and when do economic mechanisms transfer to alignment or evaluation?
-    searches:
-      - role: foundation
-        kind: keyword
-        terms: '("artificial intelligence" OR {keywords}) AND ("principal agent" OR "mechanism design" OR "reward shaping")'
-      - role: frontier
-        kind: semantic
-        terms: >-
-          Connect {keywords} to {domains}: how do proxy objectives, incentives,
-          strategic adaptation and information asymmetry affect learning agents
-          and human-AI systems? Seek formal mechanisms and empirical identification
-          of reward gaming, alignment tradeoffs or incentive-compatible evaluation.
-      - role: counterevidence
-        kind: keyword
-        terms: '("artificial intelligence" OR {keywords}) AND ("reward hacking" OR "Goodhart" OR "specification gaming" OR "strategic manipulation")'
   - id: measurement_and_human_ai
     scope: cross_domain
     question: >-
       What do AI evaluations measure, and which causal mechanisms explain
       changes in human learning, decisions and economic productivity?
-    searches:
-      - role: foundation
-        kind: keyword
-        terms: '("artificial intelligence" OR "machine learning") AND (psychometrics OR "construct validity" OR "automation bias" OR "technology adoption")'
-      - role: frontier
-        kind: semantic
-        terms: >-
-          Connect {keywords} with {domains}. Investigate construct validity and
-          psychometric measurement of AI capabilities, and causal evidence on
-          human-AI learning, reliance, decision quality, productivity and labor
-          effects. Seek experimental designs, heterogeneous effects and mechanisms
-          distinguishing task performance from durable learning or economic benefit.
-      - role: counterevidence
-        kind: keyword
-        terms: '("artificial intelligence" OR "generative AI") AND ("skill degradation" OR "automation bias" OR "productivity paradox" OR "measurement bias")'
+initial_queries: 6
+followup_queries: 6
+results_per_query: 15
+planning_timeout_s: 120
+planner_max_tokens: 3000

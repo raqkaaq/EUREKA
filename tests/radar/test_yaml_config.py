@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from tests.radar.discovery_support import planner_model
+
 import datetime as dt
 import unittest
 from unittest import mock
 
 from radar.config.yaml import ConfigurationError, parse_yaml
 from radar.schema.configuration import AgentPrompt, AnalysisPrompt, ScreeningConfig, SearchConfig
+from radar.schema.discovery import DiscoveryPolicy
 
 
 SCREENING = '''
@@ -78,7 +81,7 @@ class TestTypedYaml(unittest.TestCase):
             opportunity_analysis_prompt, paper_triage_prompt, screening_questions,
         )
 
-        self.assertIsInstance(search_config(), SearchConfig)
+        self.assertIsInstance(search_config(), DiscoveryPolicy)
         self.assertIsInstance(opportunity_analysis_prompt(), AnalysisPrompt)
         self.assertIsInstance(paper_triage_prompt(), AgentPrompt)
         self.assertIsInstance(screening_questions(), ScreeningConfig)
@@ -96,19 +99,26 @@ class TestTypedYaml(unittest.TestCase):
 
 
 class TestConfiguredSearches(unittest.TestCase):
-    def test_default_plan_has_broad_and_cross_domain_searches(self):
-        from radar.config.interests import default_profile
-        from radar.config.searches import build_query_plan
+    def test_default_policy_has_learning_goals_and_bounded_adaptive_waves(self):
+        from radar.config.searches import search_config
 
-        plan = build_query_plan(default_profile())
-        self.assertEqual(len(plan.queries), 12)
-        self.assertIn("machine learning", plan.queries[0].terms)
-        intersections = [query for query in plan.queries if " AND " in query.terms]
-        self.assertEqual(len(intersections), 8)
-        self.assertTrue(any("behavioral economics" in q.terms for q in plan.queries))
-        frontier = [query for query in plan.queries if query.role == "frontier"]
-        self.assertEqual(len(frontier), 4)
-        self.assertNotIn("behavioral", frontier[0].terms)
+        policy = search_config()
+        self.assertEqual(policy.version, 3)
+        self.assertEqual(len(policy.learning_goals), 4)
+        self.assertEqual({goal.scope for goal in policy.learning_goals},
+                         {"broad", "cross_domain"})
+        self.assertEqual((policy.initial_queries, policy.followup_queries), (6, 6))
+        self.assertEqual(policy.results_per_query, 15)
+        self.assertFalse(hasattr(policy, "queries"))
+        self.assertFalse(hasattr(policy, "learning_questions"))
+
+    def test_implicit_legacy_default_requires_an_adaptive_planner(self):
+        from radar.config.interests import default_profile
+        from radar.config.searches import build_query_plan, search_config
+
+        for configuration in (None, search_config()):
+            with self.subTest(configuration=configuration), self.assertRaises(ConfigurationError):
+                build_query_plan(default_profile(), configuration=configuration)
 
     def test_config_changes_actual_queries_and_preserves_profile_dates_and_caps(self):
         from radar.config.interests import RadarProfile
@@ -136,9 +146,21 @@ queries:
         from radar.config.interests import RadarProfile
         from radar.config.searches import build_query_plan
 
-        plan = build_query_plan(RadarProfile(keywords=["diffusion"], domains=[]))
+        config = parse_yaml('''
+version: 1
+queries:
+  - name: broad
+    kind: semantic
+    terms: '{keywords}'
+  - name: bridge
+    kind: semantic
+    scope: cross_domain
+    terms: '{keywords} AND {domains}'
+''', SearchConfig)
+        plan = build_query_plan(RadarProfile(keywords=["diffusion"], domains=[]),
+                                configuration=config)
         self.assertEqual([query.kind for query in plan.queries],
-                         ["semantic", "semantic", "keyword", "keyword", "keyword", "keyword"])
+                         ["keyword"])
         self.assertIn("diffusion", plan.queries[0].terms)
         self.assertTrue(all("behavioral" not in query.terms and "generative AI" not in query.terms
                             for query in plan.queries))
@@ -192,8 +214,15 @@ queries:
         from radar.config.interests import RadarProfile
         from radar.config.searches import build_query_plan
 
+        config = parse_yaml('''
+version: 1
+queries:
+  - name: broad
+    kind: semantic
+    terms: '{keywords}'
+''', SearchConfig)
         with self.assertRaises(ConfigurationError):
-            build_query_plan(RadarProfile(keywords=["x" * 301]))
+            build_query_plan(RadarProfile(keywords=["x" * 301]), configuration=config)
 
 
 class TestYamlAgentInstructions(unittest.TestCase):
@@ -285,7 +314,7 @@ class TestConfigurationPreflight(unittest.TestCase):
         source = DictTransport({})
         with mock.patch("radar.prompts.catalog.paper_triage_prompt", side_effect=ConfigurationError(
                 "paper_triage.yaml: invalid configuration")):
-            result = run(PipelineRequest(mode="analyze", source_override=source))
+            result = run(PipelineRequest(planner_model_override=planner_model(), mode="analyze", source_override=source))
         self.assertEqual(result.exit_code, 4)
         self.assertEqual(source.calls, [])
         self.assertIn("paper_triage.yaml", " ".join(result.stderr_notes))
@@ -295,7 +324,7 @@ class TestConfigurationPreflight(unittest.TestCase):
         from radar.source.openalex import DictTransport
 
         with mock.patch("radar.prompts.catalog.paper_triage_prompt", side_effect=ConfigurationError()):
-            result = run(PipelineRequest(mode="collect", source_override=DictTransport({})))
+            result = run(PipelineRequest(planner_model_override=planner_model(), mode="collect", source_override=DictTransport({})))
         self.assertEqual(result.exit_code, 0)
 
 

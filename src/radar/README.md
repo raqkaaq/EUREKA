@@ -22,8 +22,8 @@ src/radar/
     interests.py       interest profile (AI/ML core + behavioral/economic lenses)
     runtime.py         all numeric bounds (service-free)
     documents.py       PDF download/parser/chunk/reading hard bounds
-    searches.yaml      research questions and historical/frontier/challenge retrieval
-    searches.py        profile/template expansion, bounded query plan
+    searches.yaml      typed learning agenda, policy and planner budgets
+    searches.py        typed policy loading (no prescribed query strings)
     qwen_screening.yaml  small-batch fallback concurrency and deadline policy
     triage.py          packaged, typed Qwen screening policy loader
     yaml.py            safe YAML parsing and typed package-resource loading
@@ -48,6 +48,7 @@ src/radar/
     clef.py            LAN CLEF/SystemOne screening client (native HTTPX,
                        batch triage, deadlines, fail-fast)
   agent/
+    discovery_planning.py PydanticAI Qwen planning and validation of adaptive waves
     pdf_reading.py     PydanticAI chunk reading and hierarchical note reduction
     research_team.py   common evidence cohort, specialists, shared deadline,
                        bounded contributions, synthesis and client cleanup
@@ -78,7 +79,8 @@ src/radar/
     triage.py          triage coverage summaries (considered/scored/unknown/failed)
   schema/
     documents.py       PDF source, pages, notes, verified coverage and outcomes
-    papers.py          paper/plan contracts (CollectedWork and friends)
+    papers.py          paper/query contracts (CollectedWork and friends)
+    discovery.py       learning goals, generated intents, feedback and memory
     opportunities.py   analysis/briefing contracts (RadarDraft and friends)
     triage.py          shared SystemOneResponse, Qwen batch correlation,
                        TriageBatch/TriageResult and strict probabilities
@@ -97,34 +99,33 @@ questions, and the agents' instructions. Python owns expansion, transport,
 output schemas and hard safety limits; there is no second hardcoded search
 algorithm or inline instruction fallback.
 
-- `config/searches.yaml` v2: a learning agenda, with a stable question ID,
-  explanatory research question, scope and three retrieval roles per question.
-  **Foundation** retrieves historical context; **frontier** retrieves recent
-  work; **counterevidence** seeks failure modes and competing explanations.
-  A role records retrieval intent, not a verified characterization of a paper.
-  Default questions cover generalization, uncertainty/causal identification,
-  strategic objectives/incentives, and measurement/human-AI effects.
-  Search defines the pool; System1 decides what merits investigation; Qwen
-  investigates the selected evidence cohort and composes the synthesis.
+- `config/searches.yaml` v3: a typed learning agenda and hard ceilings, not a
+  list of searches. Qwen chooses the concrete research questions, query
+  wording, OpenAlex method, dates and follow-ups. Role reservations (foundation,
+  frontier, counterevidence, exploration, cross-domain) ensure broad coverage
+  without prescribing query strings. Search defines a candidate pool; CLEF
+  System1 decides importance; Qwen investigates every shortlisted PDF and
+  composes the learning dossier.
 - `semantic` sends natural-language questions through OpenAlex's documented
   `search.semantic`; `keyword` sends Boolean expressions through `search`;
   `recent` is newest-first keyword retrieval. Semantic searches are limited
   to 2000 characters and paced at one request/second. Keyword expressions
   retain the 300-character bound. Limits are checked, never silently truncated.
-  Only frontier branches use `--lookback-days`; historical branches have no
-  freshness filter. The live semantic API rejects day-level filters: use its
+  Qwen chooses date cutoffs using `--lookback-days`; historical searches may
+  omit a freshness filter. The live semantic API rejects day-level filters: use its
   supported publication-year range, then enforce the exact lower date locally.
   Semantic frontier rows with unknown/invalid dates cannot establish freshness
   and are skipped; historical branches can still discover those works. This
   may underfill a frontier page; no unseen pages are implied. Results retain `(question_id, role)` provenance through
   deduplication and SQLite persistence. No new paper source is introduced.
-- `{keywords}` and `{domains}` are plain comma-separated phrases in semantic
-  questions and escaped/quoted OR expressions in keyword queries. An empty
-  domain profile skips only cross-domain questions. The planner interleaves
-  questions by role, capped at 12 requests. Defaults request 15 rows per
-  branch (at most 180 before dedup), below the global 200-work cap so later
-  branches cannot be crowded out by earlier ones. Custom larger pages can
-  reach that global cap early. CLI `--keywords` overrides profile terms.
+- Planner output is validated at the pipeline boundary: at most six initial
+  and six follow-up logical queries, at most 15 rows per query, and at most 200
+  deduplicated works. Retrieval feedback (yield and metadata availability,
+  never scientific quality) is returned to Qwen before follow-ups. Plans,
+  rationales, feedback and bounded prior findings are stored in SQLite.
+  First-boot planner failure stops before OpenAlex; a compatible saved initial
+  plan may be reused with an explicit stale-plan note. Refinement failure keeps
+  the first wave and records the failed wave.
 - Legacy v1 flat `queries` remain readable with their original six-request
   cap and shared date window; their former `semantic` label is normalized to
   `keyword` because those templates never performed embedding search.
@@ -162,7 +163,7 @@ algorithm or inline instruction fallback.
   interface, separate from untrusted user/paper data. Combined instructions
   and user messages retain the existing prompt budget and complete-block policy.
 
-Documents require `version: 1` (search agendas use `version: 2`), are safely
+Documents require `version: 1` (search policy uses `version: 3`), are safely
 parsed and validated into immutable Pydantic models, and are loaded from
 package resources rather than the working directory. Both root packages
 and the YAML resources are included in built distributions. Unknown/duplicate
@@ -172,8 +173,10 @@ exit 4), before source/model calls. No environment interpolation or credentials
 belong in these files. Defaults are cached per process: restart a long-running
 process after edits; a new CLI refresh loads the edits automatically.
 
-Metadata collection does not need agent prompts or inference. This slice
-adds no autonomous search tool loop; bounded LLM exploration remains separate.
+Cached/import/report/rebuild modes do not call the planner. Live collection
+uses PydanticAI for one bounded plan per wave; OpenAlex execution remains a
+deterministic, OpenAlex-only source adapter rather than an unrestricted tool
+loop.
 
 ## Specialized research team
 
@@ -569,7 +572,7 @@ python -m radar --from-snapshot data/radar/snapshot.json
 
 ## Discovery, quota, and paper counts
 
-- OpenAlex requests ≤ 6/plan, ≤ 50/page, ≤ 200 total pool cap, timeout
+- OpenAlex requests ≤ 6/initial wave + ≤ 6/follow-up wave, ≤ 15/page, ≤ 200 total pool cap, timeout
   ≤ 30 s. An `OPENALEX_API_KEY` is optional, but a free personal key
   avoids the exhausted shared anonymous pool; without one, confirmed
   daily-budget 429s fail fast with an actionable error instead of
@@ -583,8 +586,8 @@ python -m radar --from-snapshot data/radar/snapshot.json
   **scored**, **unknown** (missing abstracts, oversize, deadlines), and
   **failed**, with model/rubric provenance on the coverage line.
   Metadata-only runs honestly report `llm_selected/llm_analyzed` as zero.
-- Discovery is a bounded OpenAlex sample (lookback window applies to
-  every query): counts describe the snapshot only, never all of OpenAlex.
+- Discovery is a bounded Qwen-planned OpenAlex sample (dates are chosen and
+  validated per query): counts describe the snapshot only, never all of OpenAlex.
   Cross-domain discovery is broad AI/ML plus behavioral/economic lenses.
   Abstracts/metadata only; no PDFs are downloaded, no fulltext, no
   extra services.

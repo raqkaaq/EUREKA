@@ -5,6 +5,8 @@ from contextlib import closing
 import sqlite3
 import tempfile
 import unittest
+
+from tests.radar.discovery_support import planner_model
 from unittest import mock
 
 from radar.schema.papers import CollectedWork
@@ -154,7 +156,7 @@ class TestDatabasePipeline(unittest.TestCase):
                 initial = store.begin_run("collect", "fixture")
                 store.save_pool(initial, pool)
                 store.finish_run(initial, 0)
-            result = run(PipelineRequest(mode="analyze", from_database=True,
+            result = run(PipelineRequest(planner_model_override=planner_model(), mode="analyze", from_database=True,
                 storage_dir=directory, triage_model_override=answers_model(routing, first_batch_fails),
                 model_override=synth_model(synthesis)))
             self.assertEqual(result.exit_code, 3)
@@ -177,7 +179,7 @@ class TestDatabasePipeline(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory, mock.patch(
                 'radar.storage.graph_projection.FalkorGraph', GraphBoundary):
-            result = run(PipelineRequest(mode='collect', storage_dir=directory,
+            result = run(PipelineRequest(planner_model_override=planner_model(), mode='collect', storage_dir=directory,
                                          max_candidates=1, source_override=FakeSource()))
             self.assertEqual(result.exit_code, 0, result.stderr_notes)
             self.assertEqual(len(json.loads(result.stdout)['works']), 1)
@@ -192,7 +194,7 @@ class TestDatabasePipeline(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             with mock.patch('radar.storage.graph_projection.FalkorGraph', side_effect=FalkorError('SECRET')):
-                result = run(PipelineRequest(mode='collect', storage_dir=directory, source_override=FakeSource()))
+                result = run(PipelineRequest(planner_model_override=planner_model(), mode='collect', storage_dir=directory, source_override=FakeSource()))
             self.assertEqual(result.exit_code, 3)
             self.assertIn('--rebuild-graph', result.stderr_notes[0])
             self.assertNotIn('SECRET', result.stderr_notes[0])
@@ -202,7 +204,7 @@ class TestDatabasePipeline(unittest.TestCase):
                 self.assertEqual(store.connection.execute('SELECT exit_code FROM runs').fetchone()[0], 3)
             with mock.patch('radar.storage.graph_projection.FalkorGraph', GraphBoundary), mock.patch(
                     'radar.pipeline._collect_live', side_effect=AssertionError('no discovery')):
-                repaired = run(PipelineRequest(storage_dir=directory, rebuild_graph=True))
+                repaired = run(PipelineRequest(planner_model_override=planner_model(), storage_dir=directory, rebuild_graph=True))
             self.assertEqual(repaired.exit_code, 0, repaired.stderr_notes)
             with SQLiteStore(directory) as store:
                 self.assertTrue(store.graph_state()['ready'])
@@ -216,10 +218,10 @@ class TestDatabasePipeline(unittest.TestCase):
                 'radar.storage.graph_projection.FalkorGraph', GraphBoundary), mock.patch(
                 'radar.storage.snapshots.refresh_pool', side_effect=AssertionError('no JSON')), mock.patch(
                 'radar.storage.triage.write_sidecar', side_effect=AssertionError('no JSON')):
-            initial = run(PipelineRequest(mode='collect', storage_dir=directory, source_override=FakeSource()))
+            initial = run(PipelineRequest(planner_model_override=planner_model(), mode='collect', storage_dir=directory, source_override=FakeSource()))
             self.assertEqual(initial.exit_code, 0)
             with mock.patch('radar.pipeline._collect_live', side_effect=AssertionError('no discovery')):
-                cached = run(PipelineRequest(mode='collect', storage_dir=directory, from_database=True))
+                cached = run(PipelineRequest(planner_model_override=planner_model(), mode='collect', storage_dir=directory, from_database=True))
             self.assertEqual(cached.exit_code, 0, cached.stderr_notes)
             self.assertEqual({p.name for p in Path(directory).iterdir()}, {'radar.sqlite3', 'graph.rdb'})
 
@@ -235,7 +237,7 @@ class TestDatabasePipeline(unittest.TestCase):
             original = snapshot.read_bytes()
             with mock.patch('radar.storage.graph_projection.FalkorGraph', GraphBoundary), mock.patch(
                     'radar.pipeline._collect_live', side_effect=AssertionError('no discovery')):
-                result = run(PipelineRequest(mode='collect', storage_dir=str(Path(directory) / 'db'),
+                result = run(PipelineRequest(planner_model_override=planner_model(), mode='collect', storage_dir=str(Path(directory) / 'db'),
                                              from_snapshot=str(snapshot)))
             self.assertEqual(result.exit_code, 0, result.stderr_notes)
             self.assertEqual(snapshot.read_bytes(), original)
@@ -247,7 +249,7 @@ class TestDatabasePipeline(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / 'not-created'
-            result = run(PipelineRequest(storage_dir=str(target), from_database=True, rebuild_graph=True))
+            result = run(PipelineRequest(planner_model_override=planner_model(), storage_dir=str(target), from_database=True, rebuild_graph=True))
             self.assertEqual(result.exit_code, 4)
             self.assertFalse(target.exists())
 
@@ -275,18 +277,18 @@ class TestDatabasePipeline(unittest.TestCase):
                 'radar.storage.graph_projection.FalkorGraph', GraphBoundary):
             from pdf_support import empty_notes_model, make_loader, make_pdf_document
             from radar.source.openalex import DictTransport as _DT
-            from radar.config.searches import build_query_plan as _plan
+            from tests.radar.discovery_support import test_query_plan as _plan
             from radar.config.interests import default_profile as _prof
             # FakeSource yields W1..W12; pre-build matching PDF doubles.
             _docs = {f"https://openalex.org/W{i}": make_pdf_document(
                 f"https://openalex.org/W{i}") for i in range(1, 13)}
-            successful = run(PipelineRequest(mode='analyze', storage_dir=directory, max_candidates=1,
+            successful = run(PipelineRequest(planner_model_override=planner_model(), mode='analyze', storage_dir=directory, max_candidates=1,
                                              source_override=FakeSource(), triage_scorer=score,
                                              model_override=FunctionModel(respond),
                                              document_loader=make_loader(_docs),
                                              document_model_override=empty_notes_model()))
             self.assertEqual(successful.exit_code, 0, successful.stderr_notes)
-            failed = run(PipelineRequest(mode='analyze', storage_dir=directory, from_database=True,
+            failed = run(PipelineRequest(planner_model_override=planner_model(), mode='analyze', storage_dir=directory, from_database=True,
                                          triage_scorer=score, model_override=FunctionModel(fail),
                                          document_loader=make_loader(_docs),
                                          document_model_override=empty_notes_model()))

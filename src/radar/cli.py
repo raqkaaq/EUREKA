@@ -5,7 +5,7 @@ pipeline result, and exit codes. All behavior lives behind the
 :mod:`radar.pipeline` seam.
 
 - ``uv run python -m radar --collect-only --max-candidates 8`` prints
-  bounded real OpenAlex candidates as JSON (no LLM calls).
+  bounded real OpenAlex candidates as JSON after adaptive search planning.
 - ``uv run python -m radar`` collects, analyzes via the private-network Strata
   endpoint (PydanticAI only), and prints a Markdown report.
 
@@ -41,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--collect-only",
         action="store_true",
-        help="Print bounded OpenAlex candidates as JSON and skip LLM analysis.",
+        help="Plan searches, print bounded OpenAlex candidates as JSON, and skip paper screening/investigation.",
     )
     parser.add_argument(
         "--max-candidates",
