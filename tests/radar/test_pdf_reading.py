@@ -77,8 +77,45 @@ class TestChunking(unittest.TestCase):
         self.assertIsInstance(pdf_reduction_prompt(), AgentPrompt)
         validate_pdf_prompts()
 
+    def test_pdf_prompts_state_schema_character_limits(self):
+        # The live model overran these fields even after a schema retry.
+        # Both chunk reading and reduction must spell out the output contract.
+        from radar.prompts.catalog import pdf_reading_prompt, pdf_reduction_prompt
+
+        for loader in (pdf_reading_prompt, pdf_reduction_prompt):
+            with self.subTest(prompt=loader.__name__):
+                instructions = loader().instructions
+                for contract in (
+                    "summary: at most 600 characters",
+                    "methods: at most 300 characters",
+                    "results: at most 300 characters",
+                    "limitations: at most 300 characters",
+                    "quote: at most 180 characters",
+                    "finding: at most 180 characters",
+                ):
+                    self.assertIn(contract, instructions)
+                self.assertIn("characters, not words", instructions)
+
 
 class TestReaderValidation(unittest.TestCase):
+    def test_schema_repair_can_be_followed_by_quote_repair(self):
+        from radar.agent.pdf_reading import read_pdf
+
+        replies = []
+
+        def respond(messages, info):
+            replies.append(messages)
+            payload = valid_notes().model_dump()
+            if len(replies) == 1:
+                payload["methods"] = "m" * 301
+            elif len(replies) == 2:
+                payload["evidence"][0]["quote"] = "invented quotation"
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
+
+        reading = read_pdf(make_doc(), FunctionModel(respond))
+        self.assertEqual(reading.notes.evidence[0].quote, "hello")
+        self.assertEqual(len(replies), 3)
+
     def test_external_cancellation_is_not_swallowed(self):
         from radar.agent.pdf_reading import read_documents_async
 
@@ -232,7 +269,7 @@ class TestReaderValidation(unittest.TestCase):
 
         with self.assertRaises(StrataError):
             read_pdf(doc, FunctionModel(respond))
-        self.assertEqual(len(calls), 2)  # one validation retry
+        self.assertEqual(len(calls), 3)  # two bounded validation retries
 
     def test_invented_quote_retries_then_fails(self):
         from radar.agent.pdf_reading import read_pdf
@@ -248,7 +285,7 @@ class TestReaderValidation(unittest.TestCase):
 
         with self.assertRaises(StrataError):
             read_pdf(doc, FunctionModel(respond))
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
 
     def test_incomplete_coverage_rejected(self):
         with self.assertRaises(Exception):

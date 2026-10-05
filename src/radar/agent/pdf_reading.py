@@ -39,8 +39,10 @@ if TYPE_CHECKING:
 
 PDF_PROMPT_BOUND_CHARS = 12_000
 PDF_REQUEST_TIMEOUT_S = 60.0
-PDF_REQUEST_LIMIT = 2
-PDF_RETRIES = 1
+# Repair a schema error and a subsequent evidence error independently, while
+# retaining a hard cap and the enclosing document deadline.
+PDF_REQUEST_LIMIT = 3
+PDF_RETRIES = 2
 
 
 def _normalize(text: str) -> str:

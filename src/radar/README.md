@@ -251,6 +251,10 @@ the final/remainder group, and cannot introduce new quotes. Reader and reducer
 use the same configured Strata model as the final team. `--document-timeout`
 defaults to 900 seconds across all paper readings (maximum 3600); the existing
 `--analysis-timeout` separately bounds the final specialists/synthesis.
+Each chunk or reduction allows at most three requests (two validation retries)
+under the unchanged 60-second request and overall document deadlines. A schema
+repair can therefore be followed by a separate quote repair; persistent invalid
+notes still fail explicitly, with no partial reading or abstract fallback.
 
 All final-team roles receive whole reduced reading notes and verified quotes,
 within a 48,000-character PDF prompt budget. Coverage distinguishes PDFs read
