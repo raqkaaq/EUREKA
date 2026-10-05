@@ -54,6 +54,15 @@ def synth_model(calls):
 
 
 class TestQwenTriage(unittest.TestCase):
+    def test_chat_prompt_specifies_array_envelope_and_numeric_answer_key(self):
+        from radar.prompts.catalog import paper_triage_prompt
+
+        instructions = paper_triage_prompt().instructions
+        self.assertIn('"responses": [', instructions)
+        self.assertIn("responses must be a JSON array", instructions)
+        self.assertIn('"type": "noul", "noul":', instructions)
+        self.assertIn("not a JSON-encoded string", instructions)
+
     def test_model_discovery_obeys_stage_deadline_and_closes_lookup_client(self):
         from radar.agent.paper_triage import screen_works
         from radar.provider import strata
