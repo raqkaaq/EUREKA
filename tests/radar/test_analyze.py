@@ -466,13 +466,11 @@ class TestCliSeams(unittest.TestCase):
             "abstract_inverted_index": {"x": [0]},
             "doi": "", "publication_year": 2026,
             "publication_date": dt.date.today().isoformat(), "cited_by_count": 1}]}}
-        from pdf_support import make_loader, make_pdf_document, valid_notes
+        from pdf_support import make_loader, make_pdf_document, reading_model
         doc = make_pdf_document(
             "https://openalex.org/W0",
             texts=("first page body text here", f"second page {late}"))
-        reader = FunctionModel(lambda messages, info: ModelResponse(parts=[ToolCallPart(
-            info.output_tools[0].name,
-            valid_notes(quote=late, page=2).model_dump())]))
+        reader = reading_model(quote=late, page=2)
 
         def _team(messages, info):
             from radar.prompts.catalog import SPECIALIST_ROLES, specialist_prompt

@@ -245,15 +245,22 @@ Cache reuse checks the PDF hash and re-extracts pages from the immutable bytes.
 
 PydanticAI reads every character of the page-marked text in contiguous
 6,000-character chunks (at most 24). Code owns offsets and page coverage;
-model outputs contain notes only. Quotes must occur in both their actual chunk
-and cited source page. Hierarchical reduction consumes all notes, including
-the final/remainder group, and cannot introduce new quotes. Reader and reducer
+model outputs contain note fields and strict excerpt IDs, never generated
+page/quote pairs. Alongside each unchanged full chunk, code supplies at most
+16 deterministic source excerpts of at most 100 characters, checked against
+both the chunk and real page. These possible anchors do not replace reading
+the full text; they may omit the most relevant passage, and empty evidence is
+permitted. Code resolves selected IDs into the unchanged stored page/quote
+schema. Hierarchical reduction consumes all notes, including the final/remainder
+group, using only existing verified pairs. It packs up to four complete children
+within the unchanged prompt limit, without truncating fields or inventing quotes.
+Reader and reducer
 use the same configured Strata model as the final team. `--document-timeout`
 defaults to 900 seconds across all paper readings (maximum 3600); the existing
 `--analysis-timeout` separately bounds the final specialists/synthesis.
 Each chunk or reduction allows at most three requests (two validation retries)
 under the unchanged 60-second request and overall document deadlines. A schema
-repair can therefore be followed by a separate quote repair; persistent invalid
+repair can therefore be followed by a separate evidence-reference repair; persistent invalid
 notes still fail explicitly, with no partial reading or abstract fallback.
 
 All final-team roles receive whole reduced reading notes and verified quotes,

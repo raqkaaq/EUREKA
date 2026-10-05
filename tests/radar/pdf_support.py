@@ -1,14 +1,16 @@
 """Shared PDF test doubles at the AI/filesystem boundary (tests only).
 
 Loader replaces ``source.pdf.acquire_pdf`` with an explicit callable
-``(work, directory, cached)``. Reading model returns real
-``DocumentNotes`` through PydanticAI ``FunctionModel``. No network,
+``(work, directory, cached)``. Reading model chooses evidence references
+from the supplied registry through PydanticAI ``FunctionModel``. No network,
 no filesystem writes, no production imports.
 """
 
 from __future__ import annotations
 
-from pydantic_ai.messages import ModelResponse, ToolCallPart
+import json
+
+from pydantic_ai.messages import ModelResponse, ToolCallPart, UserPromptPart
 from pydantic_ai.models.function import FunctionModel
 
 from radar.schema.documents import (
@@ -68,11 +70,29 @@ def valid_notes(quote="hello", page=1) -> DocumentNotes:
 
 
 def reading_model(quote="hello", page=1) -> FunctionModel:
-    """DocumentNotes model for the PDF reader seam (chunk + reduction)."""
+    """Choose the requested source excerpt at the chunk/reduction model seam."""
 
     def _impl(messages, info):
+        marker = "--- begin evidence registry ---\n"
+        prompts = [part.content for message in messages for part in message.parts
+                   if isinstance(part, UserPromptPart) and isinstance(part.content, str)
+                   and marker in part.content]
+        if not prompts:
+            raise AssertionError("PDF reader did not supply its source evidence registry")
+        registry = json.loads(prompts[-1].split(marker, 1)[1].split(
+            "\n--- end evidence registry ---", 1)[0])
+        matches = [entry for entry in registry
+                   if entry["page"] == page and quote in entry["quote"]]
+        if not matches:
+            raise AssertionError(
+                f"Requested page {page} excerpt {quote!r} was absent from the evidence registry")
+        excerpt_id = matches[0]["excerpt_id"]
+        if type(excerpt_id) is not int:
+            raise AssertionError("Registry excerpt IDs must be actual integers")
+        payload = valid_notes().model_dump(exclude={"evidence"})
+        payload["evidence"] = [{"excerpt_id": excerpt_id, "finding": "supports claim"}]
         return ModelResponse(parts=[ToolCallPart(
-            info.output_tools[0].name, valid_notes(quote=quote, page=page).model_dump())])
+            info.output_tools[0].name, payload)])
 
     return FunctionModel(_impl)
 
