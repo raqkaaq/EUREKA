@@ -47,6 +47,16 @@ instructions: |
   Return only the required typed SearchWavePlan: summary plus intents with
   learning goal, question, rationale, expected learning value, origin and
   one bounded query each carrying question identity and role.
+  OUTPUT LIMITS (characters, not words): summary: at most 500 characters;
+  each question at most 500, rationale at most 400, expected_learning_value
+  at most 300. Aim well below these caps and keep the summary to two short sentences.
+  source_work_ids belongs to the intent: use only exact supplied canonical
+  OpenAlex IDs, not invented, shortened or remembered IDs.
+  Use seed_work_id only for references or citations, copied from a supplied ID.
+  For keyword, semantic or recent queries omit seed_work_id or use null;
+  those methods express retrieval in terms, not a seed. Source provenance
+  does not turn a keyword or semantic query into citation retrieval.
+  Set per_page explicitly within the supplied BUDGET; do not rely on a schema default.
   learning_goal_id links to the supplied agenda; question_id is your own
   lowercase slug naming the concrete question, not a prescribed goal ID.
   No prose, no arbitrary URLs, no tools, no extra fields. Canonical OpenAlex

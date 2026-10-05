@@ -77,6 +77,15 @@ def _work(work_id: str, abstract: str = "abstract text") -> CollectedWork:
 
 
 class TestPlannerLoader(unittest.TestCase):
+    def test_prompt_separates_source_provenance_from_citation_seeds(self):
+        from radar.prompts.catalog import search_planning_prompt
+
+        instructions = search_planning_prompt().instructions
+        self.assertIn("summary: at most 500 characters", instructions)
+        self.assertIn("seed_work_id only for references or citations", instructions)
+        self.assertIn("source_work_ids belongs to the intent", instructions)
+        self.assertIn("omit seed_work_id or use null", instructions)
+
     def test_search_policy_is_typed_v3_without_query_strings(self):
         from radar.config.searches import search_config, search_policy
 
