@@ -3,6 +3,8 @@ applies only to the final ranked slice. Fake source, no network."""
 
 from __future__ import annotations
 
+from tests.radar.discovery_support import planner_model
+
 import json
 import datetime as dt
 import unittest
@@ -42,13 +44,13 @@ class FakeSource:
 class TestPipelineCollectionBounds(unittest.TestCase):
     def test_small_max_still_executes_whole_plan(self):
         fake = FakeSource()
-        result = run(PipelineRequest(
+        result = run(PipelineRequest(planner_model_override=planner_model(),
             mode="collect", max_candidates=1, source_override=fake))
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(len(fake.calls), 12)
-        self.assertEqual(sum("filter" in p for p in fake.calls), 4)
+        self.assertEqual(sum("filter" in p for p in fake.calls), 2)
         self.assertEqual(sum("search.semantic" in p for p in fake.calls), 4)
-        self.assertTrue(all("sort" not in p for p in fake.calls))
+        self.assertEqual(sum(p.get("sort") == "publication_date:desc" for p in fake.calls), 2)
         # Output bound respected.
         shown = json.loads(result.stdout)
         self.assertEqual(len(shown), 1)

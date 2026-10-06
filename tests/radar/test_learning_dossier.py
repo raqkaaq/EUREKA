@@ -45,7 +45,7 @@ def _dossier_dict(index: int = 0, **overrides):
 
 
 class TestLearningSchema(unittest.TestCase):
-    def test_new_contracts_are_bounded_and_forbid_extra(self):
+    def test_new_contracts_preserve_shape_and_forbid_extra(self):
         from radar.schema.learning import LearningDossierDraft, StudyTask
 
         task = StudyTask(
@@ -62,7 +62,7 @@ class TestLearningSchema(unittest.TestCase):
         with self.assertRaises(ValidationError):
             LearningDossierDraft.model_validate(_dossier_dict(paper_index=True))
         with self.assertRaises(ValidationError):
-            LearningDossierDraft.model_validate(_dossier_dict(core_problem="x" * 501))
+            LearningDossierDraft.model_validate(_dossier_dict(core_problem=""))
         with self.assertRaises(ValidationError):
             LearningDossierDraft.model_validate(
                 _dossier_dict(study_tasks=[_dossier_dict()["study_tasks"][0]] * 3))
@@ -143,6 +143,15 @@ class TestLearningEvidence(unittest.TestCase):
         with self.assertRaises(ValueError):
             attach_evidence(draft, [_work(0)])
 
+    def test_abstract_dossier_cannot_claim_pdf_page_provenance(self):
+        from radar.schema.opportunities import LearningRadarDraft
+        from radar.processing.evidence import attach_evidence
+
+        draft = LearningRadarDraft.model_validate({
+            "learning_dossiers": [_dossier_dict(supporting_pages=[1])]})
+        with self.assertRaises(ValueError):
+            attach_evidence(draft, [_work()])
+
     def test_duplicate_dossier_indices_are_rejected(self):
         from radar.schema.opportunities import LearningRadarDraft
         from radar.processing.evidence import attach_evidence
@@ -193,6 +202,92 @@ class TestCompleteAbstracts(unittest.TestCase):
 
 
 class TestResearchSynthesis(unittest.TestCase):
+    def test_substantive_narratives_survive_final_synthesis_rendering_and_sqlite(self):
+        from radar.agent.research_team import research_candidates
+        from radar.output.markdown import render_markdown
+        from radar.processing.evidence import attach_evidence
+        from radar.prompts.catalog import opportunity_analysis_prompt
+        from radar.storage.sqlite import SQLiteStore
+
+        # Synthetic boundary data checks retention, not scientific quality or
+        # a model's ability to produce an actual postgraduate analysis.
+        reasoning = "Condition on the stated assumptions; distinguish the claim from its interpretation. " * 12
+        task_text = "Compare the assumption-dependent derivation with a counterexample and report the unresolved step. " * 5
+        hypothesis = "Hypothesis: " + "This transfer remains unverified until the contrasting boundary conditions are tested. " * 5
+        opportunity_text = ("This proposed check is not a reported result and requires the specified comparison. " * 30).strip()
+        dossier = _dossier_dict(
+            core_problem=reasoning, reported_contribution=reasoning,
+            reasoning=reasoning, significance=reasoning,
+            assumptions_limits=[task_text], connections=[hypothesis],
+            open_questions=[task_text], study_tasks=[{
+                "kind": "counterexample", "objective": task_text,
+                "success_criterion": task_text, "missing_evidence": task_text}])
+        calls = []
+
+        def respond(messages, info):
+            calls.append(info.instructions)
+            payload = {"opportunities": [], "next_move": "Inspect the assumptions."}
+            if info.instructions == opportunity_analysis_prompt().instructions:
+                payload = {"learning_dossiers": [dossier], "next_move": opportunity_text,
+                           "ignore": [task_text.strip()],
+                           "opportunities": [{"title": "Discriminating check", "wow": opportunity_text,
+                                              "investigate": opportunity_text, "reproduce": opportunity_text,
+                                              "evidence": [0]}]}
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
+
+        result = research_candidates([_work()], model=FunctionModel(respond))
+        self.assertEqual(len(calls), 4)
+        report = attach_evidence(result.draft, list(result.included))
+        self.assertEqual(report.learning_dossiers[0].dossier.model_dump(exclude={"supporting_pages"}), dossier)
+        for field in ("wow", "investigate", "reproduce"):
+            self.assertEqual(getattr(report.opportunities[0].draft, field), opportunity_text)
+        self.assertEqual(report.next_move, opportunity_text)
+        self.assertEqual(report.ignore, [task_text.strip()])
+        markdown = render_markdown(report)
+        for text in (reasoning, task_text, hypothesis, opportunity_text):
+            self.assertIn(text, markdown)
+        with tempfile.TemporaryDirectory() as directory, SQLiteStore(directory) as store:
+            run_id = store.begin_run("analyze", "fixture")
+            store.save_pool(run_id, [_work()])
+            store.save_report(run_id, report, 1)
+            stored = store.projection()[1][0][1]
+            self.assertEqual(stored, report)
+            self.assertEqual(render_markdown(stored), markdown)
+
+    def test_final_synthesis_still_rejects_blank_unlabeled_hypotheses_and_invalid_indices(self):
+        from radar.agent.research_team import research_candidates
+        from radar.prompts.catalog import opportunity_analysis_prompt
+        from radar.provider.strata import StrataError
+
+        invalid = (
+            _dossier_dict(reasoning=" \n "),
+            _dossier_dict(assumptions_limits=[" \n "]),
+            _dossier_dict(connections=["Unlabeled transfer remains unsupported."]),
+            _dossier_dict(study_tasks=[{**_dossier_dict()["study_tasks"][0], "objective": " \n "}]),
+            _dossier_dict(paper_index=True),
+            _dossier_dict(paper_index=99),
+        )
+        for dossier in invalid:
+            with self.subTest(dossier=dossier):
+                def respond(messages, info):
+                    payload = {"opportunities": [], "next_move": "Inspect the assumptions."}
+                    if info.instructions == opportunity_analysis_prompt().instructions:
+                        payload["learning_dossiers"] = [dossier]
+                    return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
+
+                with self.assertRaises(StrataError):
+                    research_candidates([_work()], model=FunctionModel(respond))
+
+    def test_final_prompt_requires_depth_without_arbitrary_narrative_targets(self):
+        from radar.prompts.catalog import opportunity_analysis_prompt
+
+        prompt = opportunity_analysis_prompt()
+        for requirement in ("assumption-dependent reasoning", "reported claims", "interpretations",
+                            "discriminating", "uncertainty", "fictional explanation"):
+            self.assertIn(requirement, prompt.instructions)
+        self.assertNotIn("250-400", prompt.instructions)
+        self.assertNotIn("<=2 sentences", prompt.task_template)
+
     def test_synthesis_accepts_legacy_opportunity_only_draft(self):
         from radar.agent.research_team import research_candidates
 

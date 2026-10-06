@@ -20,9 +20,9 @@ class OpportunityDraft(BaseModel):
     deterministically after the model run via ``evidence`` indices."""
 
     title: str = Field(min_length=1, max_length=300)
-    wow: str = Field(default="", max_length=2000)
-    investigate: str = Field(default="", max_length=2000)
-    reproduce: str = Field(default="", max_length=2000)
+    wow: str = ""
+    investigate: str = ""
+    reproduce: str = ""
     evidence: list[StrictInt] = Field(default_factory=list, max_length=MAX_EVIDENCE_PER_OPP)
 
 
@@ -33,7 +33,7 @@ class RadarDraft(BaseModel):
         default_factory=list, max_length=MAX_OPPORTUNITIES
     )
     ignore: list[str] = Field(default_factory=list, max_length=10)
-    next_move: str = Field(default="", max_length=2000)
+    next_move: str = ""
 
     @field_validator("ignore", mode="before")
     @classmethod

@@ -27,6 +27,7 @@ from radar.provider import strata as freetoken
 from radar.schema.papers import CollectedWork
 from radar.source import openalex
 from radar.storage.snapshots import refresh_pool
+from tests.radar.discovery_support import initial_plan_dict, followup_plan_dict
 
 MODEL = "offline-chat-model"
 BASE = "http://127.0.0.1:1919/v1"
@@ -48,6 +49,11 @@ def user_prompt(body: dict) -> str:
 def is_triage(body: dict) -> bool:
     schema = body["tools"][0]["function"]["parameters"]
     return "responses" in schema["properties"]
+
+
+def is_planning(body: dict) -> bool:
+    schema = body["tools"][0]["function"]["parameters"]
+    return "intents" in schema["properties"]
 
 
 def research_role(body: dict) -> str:
@@ -73,6 +79,17 @@ def completion(body: dict, output: dict) -> httpx2.Response:
 
 
 def valid_output(body: dict) -> dict:
+    if is_planning(body):
+        prompt = user_prompt(body)
+        payload = followup_plan_dict() if "WAVE: followup" in prompt else initial_plan_dict()
+        ids = list(dict.fromkeys(re.findall(r"https://openalex\.org/W\d+", prompt)))
+        for intent in payload["intents"]:
+            if intent["source_work_ids"]:
+                if ids:
+                    intent["source_work_ids"] = [ids[0]]
+                else:
+                    intent.update(origin="agenda", source_work_ids=[])
+        return payload
     if is_triage(body):
         papers = json.loads(user_prompt(body))["papers"]
         return {"responses": [{"work_id": paper["work_id"],
@@ -179,7 +196,7 @@ class TestPipelineChatProtocol(unittest.TestCase):
             self.assertIn(instructions, specialist_instructions)
             token_limit = body.get("max_completion_tokens", body.get("max_tokens"))
             self.assertIsNotNone(token_limit)
-            self.assertLessEqual(token_limit, 1000)
+            self.assertEqual(token_limit, 2000)
         synthesis = user_prompt(analysis[-1])
         for role in SPECIALIST_ROLES:
             self.assertIn(role, synthesis)
@@ -410,10 +427,9 @@ class TestPipelineChatProtocol(unittest.TestCase):
             self.assertEqual(request.method, "GET")
             self.assertEqual(request.url.host, "api.openalex.org")
             self.assertEqual(request.url.path, "/works")
-            if "search.semantic" in request.url.params:
-                self.assertIn("publication_year:", request.url.params["filter"])
-            else:
-                self.assertNotIn("filter", request.url.params)
+            if "filter" in request.url.params:
+                self.assertIn("from_publication_date:", request.url.params["filter"])
+                self.assertEqual(request.url.params["sort"], "publication_date:desc")
             self.assertLessEqual(int(request.url.params["per-page"]), 50)
             source_requests.append(request)
             i = len(source_requests)
@@ -458,11 +474,13 @@ class TestPipelineChatProtocol(unittest.TestCase):
         self.assertTrue(source_client.is_closed)
         self.assertEqual(len(source_requests), 12)
         self.assertEqual(sum(is_triage(body) for body in chat_requests), 6)
-        self.assertEqual(sum(not is_triage(body) for body in chat_requests), 4)
+        self.assertEqual(sum(is_planning(body) for body in chat_requests), 2)
+        self.assertEqual(sum(not is_triage(body) and not is_planning(body)
+                             for body in chat_requests), 4)
         self.assertIn("**Evidence:**", result.stdout)
         self.assertIn("https://openalex.org/W", result.stdout)
 
-    def test_source_http_failure_preserves_previous_snapshot_without_model_calls(self):
+    def test_source_http_failure_preserves_previous_snapshot_without_investigation(self):
         marker = "SOURCE_PRIVATE_BODY_SENTINEL"
         requests = []
 
@@ -470,11 +488,16 @@ class TestPipelineChatProtocol(unittest.TestCase):
             requests.append(request)
             return httpx.Response(500, text=marker)
 
-        def forbidden_chat(request):
-            raise AssertionError("Failed source collection must stop before inference")
+        planning_requests = []
+
+        def planning_only(request):
+            body = json.loads(request.content)
+            self.assertTrue(is_planning(body), "Failed collection must stop before investigation")
+            planning_requests.append(body)
+            return completion(body, valid_output(body))
 
         source_client = httpx.Client(transport=httpx.MockTransport(source_response), trust_env=False)
-        with tempfile.TemporaryDirectory() as tmp, chat_boundary(forbidden_chat) as clients, mock.patch.object(
+        with tempfile.TemporaryDirectory() as tmp, chat_boundary(planning_only) as clients, mock.patch.object(
                 openalex, "default_client", return_value=source_client):
             snapshot = refresh_pool(paper_pool()[1:3], tmp)["snapshot"]
             before = Path(snapshot).read_bytes()
@@ -483,9 +506,11 @@ class TestPipelineChatProtocol(unittest.TestCase):
             self.assertEqual(result.exit_code, 2)
             self.assertEqual(result.stdout, "")
             self.assertEqual(Path(snapshot).read_bytes(), before)
-            self.assertEqual(clients, [])
+            self.assertEqual(len(clients), 1)
+            self.assertTrue(all(client.is_closed for client in clients))
             self.assertNotIn(marker, " ".join(result.stderr_notes))
         self.assertTrue(source_client.is_closed)
+        self.assertEqual(len(planning_requests), 1)
         self.assertEqual(len(requests), 1)
 
     def test_maximum_200_paper_pool_is_completely_routed_over_chat(self):

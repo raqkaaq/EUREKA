@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -49,6 +50,20 @@ def user_prompt(messages):
                 if isinstance(part, UserPromptPart))
 
 
+def evidence_registry(prompt):
+    return json.loads(prompt.split("--- begin evidence registry ---\n", 1)[1].split(
+        "\n--- end evidence registry ---", 1)[0])
+
+
+def referenced_notes(prompt, *, page=None):
+    registry = evidence_registry(prompt)
+    selected = next((row for row in registry if page is None or row["page"] == page), None)
+    payload = valid_notes().model_dump(exclude={"evidence"})
+    payload["evidence"] = ([{"excerpt_id": selected["excerpt_id"], "finding": "supports claim"}]
+                           if selected is not None else [])
+    return payload
+
+
 class TestChunking(unittest.TestCase):
     def test_chunk_covers_every_character_and_page(self):
         from radar.agent.pdf_reading import build_full_text, chunk_document
@@ -77,8 +92,189 @@ class TestChunking(unittest.TestCase):
         self.assertIsInstance(pdf_reduction_prompt(), AgentPrompt)
         validate_pdf_prompts()
 
+    def test_pdf_prompts_require_structure_without_arbitrary_narrative_limits(self):
+        from radar.prompts.catalog import pdf_reading_prompt, pdf_reduction_prompt
+
+        for loader in (pdf_reading_prompt, pdf_reduction_prompt):
+            with self.subTest(prompt=loader.__name__):
+                instructions = loader().instructions
+                self.assertIn("no per-field character limits", instructions)
+                self.assertNotIn("2500", instructions)
+                self.assertNotIn("300 characters", instructions)
+                self.assertNotIn("within their bounds", instructions)
+                self.assertIn("excerpt_id", instructions)
+                self.assertIn("evidence must be an array", instructions)
+
 
 class TestReaderValidation(unittest.TestCase):
+    def test_requested_token_budget_reaches_every_chunk_and_reduction_request(self):
+        from radar.agent.pdf_reading import read_pdf
+
+        for requested in (256, 4096):
+            with self.subTest(requested=requested):
+                seen = []
+
+                def respond(messages, info):
+                    seen.append(info.model_settings["max_tokens"])
+                    return ModelResponse(parts=[ToolCallPart(
+                        info.output_tools[0].name, referenced_notes(user_prompt(messages)))])
+
+                reading = read_pdf(make_doc(texts=("A source passage. " * 400,)),
+                                   FunctionModel(respond), max_tokens=requested)
+                self.assertEqual(len(reading.chunks), 2)
+                self.assertEqual(seen, [requested, requested, requested])
+
+    def test_detailed_notes_survive_chunk_reading_and_reduction_without_content_caps(self):
+        from radar.agent.pdf_reading import read_pdf
+
+        expected = {"summary": ("Detailed summary. " * 70).strip(),
+                    "methods": ("Method assumptions and identification. " * 20).strip(),
+                    "results": ("Reported results and uncertainty. " * 20).strip(),
+                    "limitations": ("Limitations and counterexamples. " * 20).strip()}
+        finding = ("Interpretation of this verified source excerpt. " * 10).strip()
+        calls = []
+
+        def respond(messages, info):
+            prompt = user_prompt(messages)
+            calls.append(prompt)
+            registry = evidence_registry(prompt)
+            payload = {**expected, "evidence": [{"excerpt_id": registry[0]["excerpt_id"],
+                                                "finding": finding}]}
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
+
+        reading = read_pdf(make_doc(texts=("A source passage. " * 400,)), FunctionModel(respond))
+        self.assertEqual(len(reading.chunks), 2)
+        self.assertEqual(len(calls), 3)
+        for notes in [chunk.notes for chunk in reading.chunks] + [reading.notes]:
+            self.assertEqual(notes.model_dump(exclude={"evidence"}), expected)
+            self.assertEqual(notes.evidence[0].finding, finding)
+            self.assertGreater(len(notes.model_dump_json()), 2500)
+
+    def test_code_owned_ids_resolve_exact_source_quotes_on_multiple_and_late_pages(self):
+        from radar.agent.pdf_reading import read_pdf
+
+        texts = ("The early derivation assumes independent observations.",
+                 "The late counterexample refutes the claimed uniform guarantee.")
+        prompts = []
+
+        def respond(messages, info):
+            prompt = user_prompt(messages)
+            prompts.append(prompt)
+            registry = evidence_registry(prompt)
+            self.assertLessEqual(len(registry), 16)
+            self.assertEqual({row["page"] for row in registry}, {1, 2})
+            for row in registry:
+                self.assertLessEqual(len(row["quote"]), 100)
+                self.assertIn(row["quote"], texts[row["page"] - 1])
+            payload = referenced_notes(prompt, page=2)
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
+
+        reading = read_pdf(make_doc(texts=texts), FunctionModel(respond))
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(reading.notes.evidence[0].page, 2)
+        self.assertEqual(reading.notes.evidence[0].quote, texts[1])
+        self.assertEqual(set(reading.notes.model_dump()),
+                         {"summary", "methods", "results", "limitations", "evidence"})
+        self.assertEqual(set(reading.notes.evidence[0].model_dump()), {"page", "quote", "finding"})
+
+    def test_unknown_boolean_string_float_and_duplicate_ids_fail_at_three_requests(self):
+        from radar.agent.pdf_reading import read_pdf
+        from radar.provider.strata import StrataError
+
+        for name, ids in (("unknown", [15]), ("boolean", [True]),
+                          ("string", ["0"]), ("float", [0.0]), ("duplicate", [0, 0])):
+            with self.subTest(case=name):
+                calls = []
+
+                def respond(messages, info):
+                    calls.append(1)
+                    payload = referenced_notes(user_prompt(messages))
+                    payload["evidence"] = [{"excerpt_id": value, "finding": "claim"} for value in ids]
+                    return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
+
+                with self.assertRaises(StrataError):
+                    read_pdf(make_doc(texts=("First real page.", "Second real page.")), FunctionModel(respond))
+                self.assertEqual(len(calls), 3)
+
+    def test_empty_registry_and_optional_empty_evidence_preserve_complete_reading(self):
+        from radar.agent.pdf_reading import read_pdf
+
+        registries = []
+        def respond(messages, info):
+            prompt = user_prompt(messages)
+            registries.append(evidence_registry(prompt))
+            payload = referenced_notes(prompt)
+            payload["evidence"] = []
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
+
+        doc = make_doc(texts=(" " * 6000 + "A real source assertion.",))
+        reading = read_pdf(doc, FunctionModel(respond))
+        self.assertEqual(registries[0], [])
+        self.assertTrue(any(registries))
+        self.assertEqual(len(reading.chunks), 2)
+        self.assertEqual(reading.chunks[0].notes.evidence, [])
+        self.assertEqual(reading.notes.evidence, [])
+        self.assertEqual(reading.chunks[-1].end, reading.text_chars)
+
+    def test_registry_is_deterministic_bounded_and_keeps_the_last_of_many_pages(self):
+        from radar.agent.pdf_reading import read_pdf
+
+        doc = make_doc(texts=tuple(f"Page {number} has its own real argument." for number in range(1, 81)))
+        registries = []
+        def respond(messages, info):
+            prompt = user_prompt(messages)
+            registries.append(evidence_registry(prompt))
+            payload = referenced_notes(prompt, page=80)
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
+
+        first = read_pdf(doc, FunctionModel(respond))
+        second = read_pdf(doc, FunctionModel(respond))
+        self.assertEqual(first, second)
+        self.assertEqual(registries[0], registries[1])
+        self.assertEqual(len(registries[0]), 16)
+        self.assertEqual(first.notes.evidence[0].page, 80)
+        self.assertEqual(first.notes.evidence[0].quote, doc.pages[-1].text)
+        for entry in registries[0]:
+            self.assertLessEqual(len(entry["quote"]), 100)
+            self.assertIn(entry["quote"], doc.pages[entry["page"] - 1].text)
+
+    def test_escaped_source_quotes_do_not_impose_a_serialized_note_cap(self):
+        from radar.agent.pdf_reading import read_pdf
+
+        calls = []
+        def respond(messages, info):
+            calls.append(1)
+            registry = evidence_registry(user_prompt(messages))
+            payload = {"summary": "s" * 600, "methods": "m" * 300,
+                       "results": "r" * 300, "limitations": "l" * 300,
+                       "evidence": [{"excerpt_id": entry["excerpt_id"], "finding": "\\" * 180}
+                                    for entry in registry]}
+            self.assertLessEqual(len(json.dumps(payload, separators=(",", ":"))), 2500)
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
+
+        reading = read_pdf(make_doc(texts=("\\" * 100, "\\" * 100)), FunctionModel(respond))
+        self.assertGreater(len(reading.notes.model_dump_json()), 2500)
+        self.assertEqual(reading.notes.evidence[0].quote, "\\" * 100)
+        self.assertEqual(len(calls), 1)
+
+    def test_schema_repair_can_be_followed_by_quote_repair(self):
+        from radar.agent.pdf_reading import read_pdf
+
+        replies = []
+
+        def respond(messages, info):
+            replies.append(messages)
+            payload = referenced_notes(user_prompt(messages))
+            if len(replies) == 1:
+                payload["methods"] = []
+            elif len(replies) == 2:
+                payload["evidence"][0]["excerpt_id"] = 15
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
+
+        reading = read_pdf(make_doc(), FunctionModel(respond))
+        self.assertEqual(reading.notes.evidence[0].quote, "hello world paper text")
+        self.assertEqual(len(replies), 3)
+
     def test_external_cancellation_is_not_swallowed(self):
         from radar.agent.pdf_reading import read_documents_async
 
@@ -113,15 +309,12 @@ class TestReaderValidation(unittest.TestCase):
             seen.append(prompt)
             from radar.prompts.catalog import pdf_reading_prompt
             if info.instructions == pdf_reading_prompt().instructions:
-                # quote must be an exact substring of the supplied chunk
-                quote = late if late in prompt else "first page body"
                 return ModelResponse(parts=[ToolCallPart(
                     info.output_tools[0].name,
-                    valid_notes(quote=quote, page=2 if late in prompt else 1).model_dump())])
+                    referenced_notes(prompt, page=2 if late in prompt else 1))])
             # reduction (single chunk -> no reduction expected, but handle)
-            child = valid_notes(quote="first page body", page=1)
             return ModelResponse(parts=[ToolCallPart(
-                info.output_tools[0].name, child.model_dump())])
+                info.output_tools[0].name, referenced_notes(prompt))])
 
         reading = read_pdf(doc, FunctionModel(respond))
         self.assertIsInstance(reading, PDFReading)
@@ -142,23 +335,10 @@ class TestReaderValidation(unittest.TestCase):
             prompt = user_prompt(messages)
             if info.instructions == pdf_reading_prompt().instructions:
                 prompts.append(prompt)
-                # echo a real substring of this chunk as the quote
-                chunk_body = prompt.split("--- begin chunk")[1]
-                # find a stable token present in this chunk
-                token = "x-A" if "x-A" in prompt else ("y-B" if "y-B" in prompt else "z-C")
-                page = 1 if "x-A" in prompt else (2 if "y-B" in prompt else 3)
-                # locate pages listed in prompt header for safety
                 return ModelResponse(parts=[ToolCallPart(
-                    info.output_tools[0].name,
-                    valid_notes(quote=token, page=page).model_dump())])
+                    info.output_tools[0].name, referenced_notes(prompt))])
             if info.instructions == pdf_reduction_prompt().instructions:
-                # reducer: reuse first child evidence verbatim
-                import json as _json
-                payload = prompt.split("--- begin child notes ---")[1].split("--- end child notes ---")[0]
-                children = _json.loads(payload)
-                first = children[0]["evidence"][0]
-                merged = valid_notes(quote=first["quote"], page=first["page"])
-                return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, merged.model_dump())])
+                return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, referenced_notes(prompt))])
             raise AssertionError("unexpected agent")
 
         reading = read_pdf(doc, FunctionModel(respond))
@@ -173,6 +353,13 @@ class TestReaderValidation(unittest.TestCase):
         for chunk in reading.chunks:
             covered.update(chunk.pages)
         self.assertEqual(covered, {1, 2, 3})
+        bodies = []
+        for index, prompt in enumerate(prompts):
+            bodies.append(prompt.split(f"--- begin chunk {index} ---\n", 1)[1].split(
+                f"\n--- end chunk {index} ---", 1)[0])
+            self.assertLessEqual(len(evidence_registry(prompt)), 16)
+        full_text, _ = chunk_document(doc)
+        self.assertEqual("".join(bodies), full_text)
 
     def test_all_notes_consumed_in_reduction(self):
         from radar.agent.pdf_reading import chunk_document, read_pdf
@@ -192,19 +379,17 @@ class TestReaderValidation(unittest.TestCase):
                 index = int(prompt.split("CHUNK ", 1)[1].split(" ", 1)[0])
                 marker = f"leaf-{index}"
                 leaf_markers.append(marker)
-                token = "segment-0" if "segment-0" in prompt else "segment"
-                # page is always 1 here (single page doc)
+                payload = referenced_notes(prompt)
+                payload["summary"] = marker
                 return ModelResponse(parts=[ToolCallPart(
-                    info.output_tools[0].name,
-                    valid_notes(quote=token, page=1).model_copy(update={"summary": marker}).model_dump())])
+                    info.output_tools[0].name, payload)])
             reduction_payloads.append(prompt)
             import json as _json
             payload = prompt.split("--- begin child notes ---")[1].split("--- end child notes ---")[0]
             children = _json.loads(payload)
-            first = children[0]["evidence"][0]
-            merged = valid_notes(quote=first["quote"], page=first["page"])
-            merged = merged.model_copy(update={"summary": "|".join(child["summary"] for child in children)})
-            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, merged.model_dump())])
+            merged = referenced_notes(prompt)
+            merged["summary"] = "|".join(child["summary"] for child in children)
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, merged)])
 
         reading = read_pdf(doc, FunctionModel(respond))
         self.assertIsInstance(reading.notes, DocumentNotes)
@@ -214,6 +399,54 @@ class TestReaderValidation(unittest.TestCase):
             self.assertEqual(set(reading.notes.summary.split("|")), set(leaf_markers))
             self.assertEqual(len(reading.notes.summary.split("|")), len(spans))
             self.assertEqual(len(reading.chunks), len(spans))
+
+    def test_near_max_notes_pack_complete_reduction_groups_within_prompt_bound(self):
+        from radar.agent.pdf_reading import PDF_PROMPT_BOUND_CHARS, read_pdf
+        from radar.prompts.catalog import pdf_reading_prompt, pdf_reduction_prompt
+
+        body = ("\\" * 100 + '"' * 100) * 29 + "\\" * 189
+        doc = make_doc(texts=(body,) * 4)
+        reductions = []
+
+        def respond(messages, info):
+            prompt = user_prompt(messages)
+            self.assertLessEqual(len(info.instructions) + len(prompt), PDF_PROMPT_BOUND_CHARS)
+            registry = evidence_registry(prompt)
+            if info.instructions == pdf_reading_prompt().instructions:
+                index = int(prompt.split("CHUNK ", 1)[1].split(" ", 1)[0])
+                entries = [item for item in registry if item["page"] == index + 1][:2]
+                self.assertEqual(len(entries), 2)
+                fields = dict(summary=f"leaf-{index}|" + "s" * 590,
+                              methods="m" * 300, results="r" * 300, limitations="l" * 300)
+                evidence = [PageEvidence(page=item["page"], quote=item["quote"], finding="\\" * 180)
+                            for item in entries]
+                while True:
+                    try:
+                        stored = DocumentNotes(**fields, evidence=evidence)
+                        if len(stored.model_dump_json()) <= 2480:
+                            break
+                    except ValueError:
+                        pass
+                    fields["summary"] = fields["summary"][:-1]
+                self.assertGreaterEqual(len(stored.model_dump_json()), 2470)
+                payload = {**fields, "evidence": [{"excerpt_id": item["excerpt_id"], "finding": "\\" * 180}
+                                                 for item in entries]}
+            else:
+                self.assertEqual(info.instructions, pdf_reduction_prompt().instructions)
+                children = json.loads(prompt.split("--- begin child notes ---\n", 1)[1].split(
+                    "\n--- end child notes ---", 1)[0])
+                reductions.append(children)
+                self.assertGreaterEqual(len(children), 2)
+                payload = referenced_notes(prompt)
+                payload["summary"] = ",".join(child["summary"].split("|", 1)[0] for child in children)
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
+
+        reading = read_pdf(doc, FunctionModel(respond))
+        self.assertEqual(len(reading.chunks), 4)
+        self.assertEqual(reading.notes.summary.split(","), [f"leaf-{i}" for i in range(4)])
+        self.assertLess(len(reductions[0]), 4)
+        child_pairs = {(item.page, item.quote) for chunk in reading.chunks for item in chunk.notes.evidence}
+        self.assertTrue(all((item.page, item.quote) in child_pairs for item in reading.notes.evidence))
 
     def test_invented_page_retries_then_fails(self):
         from radar.agent.pdf_reading import read_pdf
@@ -232,7 +465,7 @@ class TestReaderValidation(unittest.TestCase):
 
         with self.assertRaises(StrataError):
             read_pdf(doc, FunctionModel(respond))
-        self.assertEqual(len(calls), 2)  # one validation retry
+        self.assertEqual(len(calls), 3)  # two bounded validation retries
 
     def test_invented_quote_retries_then_fails(self):
         from radar.agent.pdf_reading import read_pdf
@@ -248,7 +481,7 @@ class TestReaderValidation(unittest.TestCase):
 
         with self.assertRaises(StrataError):
             read_pdf(doc, FunctionModel(respond))
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
 
     def test_incomplete_coverage_rejected(self):
         with self.assertRaises(Exception):
@@ -273,11 +506,12 @@ class TestDocumentsBatch(unittest.TestCase):
         def respond(messages, info):
             prompt = user_prompt(messages)
             if "bad body" in prompt:
-                evil = valid_notes(quote="invented nowhere", page=1)
-                return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, evil.model_dump())])
+                evil = referenced_notes(prompt)
+                evil["evidence"][0]["excerpt_id"] = 15
+                return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, evil)])
             return ModelResponse(parts=[ToolCallPart(
                 info.output_tools[0].name,
-                valid_notes(quote="good paper body text", page=1).model_dump())])
+                referenced_notes(prompt))])
 
         readings, failures = read_documents([good, bad], FunctionModel(respond))
         self.assertEqual(len(readings), 1)
@@ -322,7 +556,7 @@ class TestResearchTeamPdf(unittest.TestCase):
         self.assertEqual(len(synthesis_calls), 2)
         self.assertEqual(result.draft.learning_dossiers[0].supporting_pages, [1])
 
-    def _pdf_double(self, quote="good paper body text", page=1):
+    def _pdf_double(self, page=1):
         from radar.prompts.catalog import (
             SPECIALIST_ROLES, opportunity_analysis_prompt, pdf_reading_prompt,
             pdf_reduction_prompt, specialist_prompt)
@@ -337,11 +571,11 @@ class TestResearchTeamPdf(unittest.TestCase):
             if info.instructions == reader:
                 calls["reading"] += 1
                 return ModelResponse(parts=[ToolCallPart(
-                    info.output_tools[0].name, valid_notes(quote=quote, page=page).model_dump())])
+                    info.output_tools[0].name, referenced_notes(user_prompt(messages), page=page))])
             if info.instructions == reducer:
                 calls["reading"] += 1
                 return ModelResponse(parts=[ToolCallPart(
-                    info.output_tools[0].name, valid_notes(quote=quote, page=page).model_dump())])
+                    info.output_tools[0].name, referenced_notes(user_prompt(messages), page=page))])
             if info.instructions in roles:
                 calls["roles"].append(roles[info.instructions])
                 draft = RadarDraft(opportunities=[OpportunityDraft(
@@ -377,8 +611,9 @@ class TestResearchTeamPdf(unittest.TestCase):
         def respond(messages, info):
             from radar.prompts.catalog import pdf_reading_prompt
             if info.instructions == pdf_reading_prompt().instructions:
-                bad = valid_notes(quote="invented nowhere", page=1)
-                return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, bad.model_dump())])
+                bad = referenced_notes(user_prompt(messages))
+                bad["evidence"][0]["excerpt_id"] = 15
+                return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, bad)])
             synth_calls.append(info.instructions)
             raise AssertionError("synthesis must not run when all readings fail")
 

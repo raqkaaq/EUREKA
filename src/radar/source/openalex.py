@@ -17,13 +17,14 @@ from typing import Any, Protocol
 
 import httpx as _httpx
 
+from collections.abc import Sequence as _Sequence
+
 from radar.config.runtime import (
     DEFAULT_RETRY_AFTER_S,
     DEFAULT_TIMEOUT_S,
     LONG_QUOTA_RESET_S,
     MAX_429_RETRIES,
     MAX_ABSTRACT_CHARS,
-    MAX_PER_PAGE,
     MAX_QUERIES,
     MAX_RETRY_AFTER_S,
     MAX_TERM_CHARS,
@@ -35,6 +36,7 @@ from radar.config.runtime import (
 )
 from radar.processing.link_validation import is_openalex_work_link
 from radar.schema.papers import (
+    CITATION_KINDS,
     CollectedWork,
     DiscoveryMatch,
     LocationInfo,
@@ -87,12 +89,66 @@ def default_client() -> _httpx.Client:
     return _httpx.Client(trust_env=False, follow_redirects=False)
 
 
+def _get_stored_semantic_completion(transport: object) -> float | None:
+    """Last semantic completion for this transport instance, else None.
+
+    Reads the owned ``_last_semantic_completion`` attribute when present.
+    Duck-typed doubles without the attribute (or with ``__slots__`` that
+    reject it) simply yield None; callers keep a local fallback so
+    within-run pacing still holds.
+    """
+    try:
+        value = getattr(transport, "_last_semantic_completion", None)
+    except Exception:
+        return None
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        result = float(value)
+        if _math.isfinite(result):
+            return result
+    return None
+
+
+def _store_semantic_completion(transport: object, value: float) -> None:
+    """Persist pacing state on the transport instance when possible."""
+    try:
+        setattr(transport, "_last_semantic_completion", float(value))
+    except Exception:
+        # ``__slots__`` doubles or read-only proxies: within-run pacing
+        # still holds via the executor-local timestamp; only cross-wave
+        # reuse via this instance is unavailable. Wrap with
+        # :class:`SemanticPacingAdapter` in that case (see below).
+        pass
+
+
+class SemanticPacingAdapter:
+    """Small adapter holding 1/s semantic pacing for slot-constrained transports.
+
+    Reuse the same adapter instance across waves (it forwards ``get_json``
+    to the wrapped transport). Normal code reuses the same
+    :class:`RetryingTransport` across waves instead; this adapter is only
+    needed when the underlying transport uses ``__slots__`` and cannot
+    store ``_last_semantic_completion`` itself.
+    """
+
+    def __init__(self, inner: OpenAlexTransport):
+        self._inner = inner
+        self._last_semantic_completion: float | None = None
+
+    def get_json(self, url, params, headers, timeout):
+        return self._inner.get_json(url, params, headers, timeout)
+
+
 class HttpxTransport:
     """Default httpx transport with strict timeouts and redacted errors."""
 
     def __init__(self, client: _httpx.Client | None = None):
         self._client = client if client is not None else default_client()
         self._owned = client is None
+        self._last_semantic_completion: float | None = None
 
     def close(self) -> None:
         """Close the owned client; safe to call for injected clients too."""
@@ -162,6 +218,7 @@ class RetryingTransport:
     def __init__(self, inner: OpenAlexTransport, max_retries: int = MAX_429_RETRIES):
         self._inner = inner
         self._max_retries = max(0, min(int(max_retries), 5))
+        self._last_semantic_completion: float | None = None
 
     def get_json(self, url, params, headers, timeout):
         attempts = 0
@@ -341,16 +398,22 @@ def _quota_error_from_parts(
 
 
 class DictTransport:
-    """Test helper: serve canned responses keyed by search terms."""
+    """Test helper: serve canned responses keyed by search terms or filters."""
 
     def __init__(self, pages: dict[str, dict[str, Any]]):
         self.pages = pages
         self.calls: list[dict[str, Any]] = []
+        self._last_semantic_completion: float | None = None
 
     def get_json(self, url, params, headers, timeout):
         _check_timeout(timeout)
         self.calls.append({"url": url, "params": dict(params)})
-        key = params.get("search", params.get("search.semantic", ""))
+        if "search" in params:
+            key = params.get("search", "")
+        elif "search.semantic" in params:
+            key = params.get("search.semantic", "")
+        else:
+            key = params.get("filter", "")
         payload = self.pages.get(key, {"results": []})
         if not isinstance(payload, dict):
             raise ValueError("canned payload must be an object")
@@ -392,6 +455,28 @@ def _safe_str(value: Any, limit: int = 2000) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _revalidate_query(planned: PlannedQuery | dict[str, Any]) -> PlannedQuery:
+    """Revalidate a query so model_construct/mutated models cannot bypass."""
+    if isinstance(planned, PlannedQuery):
+        return PlannedQuery.model_validate(planned.model_dump())
+    return PlannedQuery.model_validate(planned)
+
+
+def _revalidate_plan(plan: QueryPlan | dict[str, Any]) -> QueryPlan:
+    """Revalidate a plan so model_construct/mutated models cannot bypass."""
+    if isinstance(plan, QueryPlan):
+        return QueryPlan.model_validate(plan.model_dump())
+    return QueryPlan.model_validate(plan)
+
+
+def _seed_short_id(seed_work_id: str) -> str:
+    """Short OpenAlex ID (``W123``) from a canonical work URL."""
+    short = seed_work_id.rsplit("/", 1)[-1].strip()
+    if not short.startswith("W") or not short[1:].isdigit():
+        raise ValueError("seed_work_id must be canonical https://openalex.org/W<digits>")
+    return short
+
+
 def build_request(
     planned: PlannedQuery,
     api_key: str | None = None,
@@ -402,30 +487,47 @@ def build_request(
 
     - `search.semantic` carries natural-language research questions.
       `search` carries Boolean keyword/recent searches. Never send both.
+    - Citation kinds use the same ``/works`` endpoint with a directional
+      filter only: ``references`` -> ``filter=cited_by:<WID>`` (outgoing
+      referenced works); ``citations`` -> ``filter=cites:<WID>``
+      (incoming citing works). No ``search`` key is sent for citations.
+      An optional ``from_publication_date`` is comma-combined.
     - Date filters apply only when requested; historical agenda branches
-      have none. Only newest-first keyword queries send an explicit sort.
-    - `per-page` capped at 50; `select` bounds payload; `mailto` polite pool.
+      have none. Only newest-first queries send an explicit sort.
+    - `per-page` is strictly validated (1..50); `select` bounds payload;
+      `mailto` polite pool. No caller-controlled URL or filter fields:
+      the URL is always :data:`BASE_URL` and filters are constructed here.
     """
+    planned = _revalidate_query(planned)
     timeout = _check_timeout(timeout)
-    per_page = max(1, min(int(planned.per_page), MAX_PER_PAGE))
-    search_key = "search.semantic" if planned.kind == "semantic" else "search"
-    limit = MAX_SEMANTIC_CHARS if planned.kind == "semantic" else MAX_TERM_CHARS
-    terms = planned.terms.strip()
-    if not terms or len(terms) > limit:
-        raise ValueError("planned query is empty or exceeds its character bound")
+    per_page = int(planned.per_page)
     params: dict[str, str] = {
-        search_key: terms,
         "per-page": str(per_page),
         "select": SELECT_FIELDS,
     }
-    if planned.from_date:
-        params["filter"] = (f"publication_year:{planned.from_date[:4]}-"
-                            if planned.kind == "semantic" else
-                            f"from_publication_date:{planned.from_date}")
-    if planned.kind == "recent":
-        if not planned.from_date:
-            raise ValueError("recent query requires from_date")
-        params["sort"] = "publication_date:desc"
+    if planned.kind in CITATION_KINDS:
+        assert planned.seed_work_id is not None
+        short = _seed_short_id(planned.seed_work_id)
+        direction = "cited_by" if planned.kind == "references" else "cites"
+        filt = f"{direction}:{short}"
+        if planned.from_date:
+            filt += f",from_publication_date:{planned.from_date}"
+        params["filter"] = filt
+    else:
+        search_key = "search.semantic" if planned.kind == "semantic" else "search"
+        limit = MAX_SEMANTIC_CHARS if planned.kind == "semantic" else MAX_TERM_CHARS
+        terms = planned.terms.strip()
+        if not terms or len(terms) > limit:
+            raise ValueError("planned query is empty or exceeds its character bound")
+        params[search_key] = terms
+        if planned.from_date:
+            params["filter"] = (f"publication_year:{planned.from_date[:4]}-"
+                                if planned.kind == "semantic" else
+                                f"from_publication_date:{planned.from_date}")
+        if planned.kind == "recent":
+            if not planned.from_date:
+                raise ValueError("recent query requires from_date")
+            params["sort"] = "publication_date:desc"
     key = get_api_key(api_key)
     if key:
         params["api_key"] = key
@@ -553,6 +655,202 @@ def normalize_work(
 # ---------------------------------------------------------------------------
 
 
+def _matched_label(planned: PlannedQuery) -> str:
+    """Provenance label for a query: terms, or seed for citation kinds."""
+    if planned.kind in CITATION_KINDS:
+        return (planned.seed_work_id or "").strip()
+    return planned.terms
+
+
+def _merge_provenance(target: CollectedWork, source: CollectedWork) -> None:
+    """Dedup: merge provenance deterministically, keep first text."""
+    for q in source.matched_queries:
+        if q and q not in target.matched_queries:
+            if len(target.matched_queries) < MAX_QUERIES:
+                target.matched_queries.append(q)
+    for k in source.query_kinds:
+        if k and k not in target.query_kinds:
+            if len(target.query_kinds) < MAX_QUERIES:
+                target.query_kinds.append(k)
+    for match in source.discovery_matches:
+        if match not in target.discovery_matches:
+            if len(target.discovery_matches) < MAX_QUERIES:
+                target.discovery_matches.append(match)
+
+
+def collect_with_feedback(
+    plan: QueryPlan,
+    transport: OpenAlexTransport,
+    *,
+    existing: _Sequence[CollectedWork] = (),
+    known_work_ids: _Sequence[str] = (),
+    api_key: str | None = None,
+    mailto: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT_S,
+    max_total: int = MAX_TOTAL_WORKS,
+) -> Any:
+    """Execute a bounded plan and report observed per-query retrieval.
+
+    Shares one global per-run pool through ``existing``: caller passes the
+    previous wave's works so dedup/provenance spans waves. ``known_work_ids``
+    is the persistent library (not quality-filtered). Counts are observed
+    metadata availability, never scientific quality:
+
+    - ``returned``: bounded raw page length (``results[:per_page]``).
+    - ``accepted``: distinct normalized/date-valid IDs for this query.
+    - ``new_to_run``: accepted IDs absent from ``existing`` and earlier
+      queries this run.
+    - ``new_to_library``: accepted IDs absent from ``known_work_ids``.
+    - ``with_abstract``/``with_pdf``: normalized availability among the
+      accepted distinct IDs.
+    - ``status``: ``ok``, ``malformed`` (invalid envelope), or
+      ``skipped_budget`` (unexecuted because the pool cap was reached).
+
+    At most 12 queries execute per call; upstream validates that one source
+    round uses at most 6. Works are unscored (``score`` stays ``0.0``);
+    density/citation counts never imply importance.
+
+    Pacing: OpenAlex's semantic endpoint permits one request/second. State
+    is stored per transport instance (``_last_semantic_completion`` owned by
+    :class:`HttpxTransport`, :class:`RetryingTransport`,
+    :class:`DictTransport`). Reuse the same transport instance — normally
+    the same :class:`RetryingTransport` — across waves so pacing holds.
+    If a custom transport uses ``__slots__`` and cannot store the
+    attribute, wrap it once in :class:`SemanticPacingAdapter` and reuse
+    that adapter. No global pacing state is kept.
+    """
+    from radar.schema.discovery import QueryFeedback, RetrievalResult
+
+    plan = _revalidate_plan(plan)
+    if not plan.queries:
+        raise ValueError("query plan must contain at least one query")
+    timeout = _check_timeout(timeout)
+    max_total = max(1, min(int(max_total), MAX_TOTAL_WORKS))
+    by_id: dict[str, CollectedWork] = {}
+    for item in existing:
+        copy = CollectedWork.model_validate(
+            item.model_dump() if isinstance(item, CollectedWork) else item
+        )
+        if copy.openalex_id not in by_id:
+            by_id[copy.openalex_id] = copy
+    known_set = {str(wid) for wid in known_work_ids}
+    seen_run: set[str] = set(by_id.keys())
+    last_semantic_completion = _get_stored_semantic_completion(transport)
+    feedback: list[Any] = []
+    queries = plan.queries[:MAX_QUERIES]
+    for index, planned in enumerate(queries):
+        if len(by_id) >= max_total:
+            for remaining in queries[index:]:
+                feedback.append(
+                    QueryFeedback(
+                        query=remaining,
+                        returned=0,
+                        accepted=0,
+                        new_to_run=0,
+                        new_to_library=0,
+                        with_abstract=0,
+                        with_pdf=0,
+                        status="skipped_budget",
+                    )
+                )
+            break
+        url, params, headers, _ = build_request(
+            planned, api_key=api_key, mailto=mailto, timeout=timeout
+        )
+        if planned.kind == "semantic":
+            now = _time.monotonic()
+            if last_semantic_completion is not None:
+                _time.sleep(max(0.0, 1.0 - (now - last_semantic_completion)))
+        payload = transport.get_json(url, params, headers, timeout)
+        if planned.kind == "semantic":
+            last_semantic_completion = _time.monotonic()
+            _store_semantic_completion(transport, last_semantic_completion)
+        if not isinstance(payload, dict):
+            feedback.append(
+                QueryFeedback(
+                    query=planned,
+                    returned=0,
+                    accepted=0,
+                    new_to_run=0,
+                    new_to_library=0,
+                    with_abstract=0,
+                    with_pdf=0,
+                    status="malformed",
+                )
+            )
+            continue
+        results = payload.get("results")
+        if not isinstance(results, list):
+            feedback.append(
+                QueryFeedback(
+                    query=planned,
+                    returned=0,
+                    accepted=0,
+                    new_to_run=0,
+                    new_to_library=0,
+                    with_abstract=0,
+                    with_pdf=0,
+                    status="malformed",
+                )
+            )
+            continue
+        raw_page = results[: int(planned.per_page)]
+        returned = len(raw_page)
+        per_query: dict[str, CollectedWork] = {}
+        label = _matched_label(planned)
+        for raw in raw_page:
+            work = normalize_work(raw, label, planned.kind)
+            if work is None:
+                continue
+            if planned.kind == "semantic" and planned.from_date:
+                # Semantic API rejects day-level date filters. Fetch its
+                # supported year range, then enforce the exact lower bound.
+                if not work.publication_date or work.publication_date < planned.from_date:
+                    continue
+            if planned.question_id is not None:
+                work.discovery_matches = [
+                    DiscoveryMatch(
+                        question_id=planned.question_id, role=planned.role
+                    )
+                ]
+            if work.openalex_id not in per_query:
+                per_query[work.openalex_id] = work
+        accepted = len(per_query)
+        with_abstract = sum(1 for w in per_query.values() if w.abstract.strip())
+        with_pdf = sum(
+            1 for w in per_query.values() if any(loc.pdf_url for loc in w.locations)
+        )
+        new_to_run = sum(1 for wid in per_query if wid not in seen_run)
+        new_to_library = sum(1 for wid in per_query if wid not in known_set)
+        for wid, work in per_query.items():
+            target = by_id.get(wid)
+            if target is None:
+                if len(by_id) < max_total:
+                    by_id[wid] = work
+                else:
+                    # Pool cap reached mid-page: counts already reflect the
+                    # observed page; only the stored pool is bounded.
+                    pass
+            else:
+                _merge_provenance(target, work)
+        seen_run.update(per_query.keys())
+        feedback.append(
+            QueryFeedback(
+                query=planned,
+                returned=returned,
+                accepted=accepted,
+                new_to_run=new_to_run,
+                new_to_library=new_to_library,
+                with_abstract=with_abstract,
+                with_pdf=with_pdf,
+                status="ok",
+            )
+        )
+    return RetrievalResult(
+        works=list(by_id.values())[:max_total], feedback=feedback
+    )
+
+
 def collect(
     plan: QueryPlan,
     transport: OpenAlexTransport,
@@ -569,61 +867,20 @@ def collect(
     callers rank via :mod:`radar.processing.ranking` and apply the
     user-facing ``--max-candidates`` bound as a final slice so later query
     branches still contribute when the output bound is small.
+
+    Delegates to :func:`collect_with_feedback` with an empty pool so both
+    entry points share one executor, pacing, and provenance policy.
+    Reuse the same transport instance across waves for cross-wave 1/s
+    semantic pacing (see :func:`collect_with_feedback`).
     """
-    if not plan.queries:
-        raise ValueError("query plan must contain at least one query")
-    timeout = _check_timeout(timeout)
-    max_total = max(1, min(int(max_total), MAX_TOTAL_WORKS))
-    by_id: dict[str, CollectedWork] = {}
-    last_semantic_completion: float | None = None
-    for planned in plan.queries[:MAX_QUERIES]:
-        url, params, headers, _ = build_request(
-            planned, api_key=api_key, mailto=mailto, timeout=timeout
-        )
-        # OpenAlex's semantic endpoint permits one request/second. Keep this
-        # policy at the source boundary, including injected transports.
-        if planned.kind == "semantic":
-            now = _time.monotonic()
-            if last_semantic_completion is not None:
-                _time.sleep(max(0.0, 1.0 - (now - last_semantic_completion)))
-        payload = transport.get_json(url, params, headers, timeout)
-        if planned.kind == "semantic":
-            # Completion, not the first attempt: RetryingTransport may have
-            # issued a later attempt. Its retries already wait at least 1s.
-            last_semantic_completion = _time.monotonic()
-        if not isinstance(payload, dict):
-            continue  # malformed envelope -> skip page, keep others
-        results = payload.get("results")
-        if not isinstance(results, list):
-            continue
-        for raw in results[:int(params["per-page"])]:
-            work = normalize_work(raw, planned.terms, planned.kind)
-            if work is None:
-                continue
-            if planned.kind == "semantic" and planned.from_date:
-                # Semantic API rejects day-level date filters. Fetch its
-                # supported year range, then enforce the exact lower bound.
-                if not work.publication_date or work.publication_date < planned.from_date:
-                    continue
-            if planned.question_id is not None:
-                work.discovery_matches = [DiscoveryMatch(
-                    question_id=planned.question_id, role=planned.role)]
-            existing = by_id.get(work.openalex_id)
-            if existing is None:
-                by_id[work.openalex_id] = work
-            else:
-                # Dedup: merge provenance deterministically, keep first text.
-                for q in work.matched_queries:
-                    if q and q not in existing.matched_queries:
-                        existing.matched_queries.append(q)
-                for k in work.query_kinds:
-                    if k and k not in existing.query_kinds:
-                        existing.query_kinds.append(k)
-                for match in work.discovery_matches:
-                    if match not in existing.discovery_matches:
-                        existing.discovery_matches.append(match)
-            if len(by_id) >= max_total:
-                break
-        if len(by_id) >= max_total:
-            break
-    return list(by_id.values())[:max_total]
+    result = collect_with_feedback(
+        plan,
+        transport,
+        existing=(),
+        known_work_ids=(),
+        api_key=api_key,
+        mailto=mailto,
+        timeout=timeout,
+        max_total=max_total,
+    )
+    return list(result.works)

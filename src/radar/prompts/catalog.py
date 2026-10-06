@@ -39,6 +39,10 @@ def pdf_reduction_prompt() -> AgentPrompt:
     return load_yaml("radar.prompts", "pdf_reduction.yaml", AgentPrompt)
 
 
+def search_planning_prompt() -> AgentPrompt:
+    return load_yaml("radar.prompts", "search_planning.yaml", AgentPrompt)
+
+
 def validate_pdf_prompts() -> None:
     """PDF-only preflight: reader/reducer YAMLs load typed with safe wording."""
     for loader in (pdf_reading_prompt, pdf_reduction_prompt):

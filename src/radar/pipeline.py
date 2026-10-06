@@ -32,6 +32,7 @@ from radar.processing.evidence import attach_evidence
 from radar.provider import strata as _strata
 from radar.schema.papers import CollectedWork
 from radar.schema.documents import PDFDocument, DocumentFailure
+from radar.schema.discovery import DiscoveryMemory, SearchWaveRecord
 
 if TYPE_CHECKING:
     from pydantic_ai.models import Model as _Model
@@ -87,6 +88,7 @@ class PipelineRequest:
     # Injected doubles (tests only; production leaves all None).
     source_override: Any | None = None
     model_override: Any | None = None
+    planner_model_override: Any | None = None
     triage_model_override: Any | None = None
     clef_transport: Any | None = None
     triage_scorer: (
@@ -105,6 +107,12 @@ class PipelineResult:
     exit_code: int
     stdout: str = ""
     stderr_notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _CollectionOutcome:
+    works: list[CollectedWork]
+    notes: tuple[str, ...] = ()
 
 
 def run(request: PipelineRequest) -> PipelineResult:
@@ -197,7 +205,7 @@ def _validate_request(request: PipelineRequest) -> None:
     except ValueError as exc:
         raise PipelineUsageError(str(exc)) from exc
     # Validate editable policy before any source, provider or storage I/O.
-    from radar.config.searches import build_query_plan
+    from radar.config.searches import search_config
     from radar.config.triage import qwen_screening_policy
     from radar.prompts.catalog import (
         opportunity_analysis_prompt, paper_triage_prompt, screening_questions,
@@ -206,7 +214,10 @@ def _validate_request(request: PipelineRequest) -> None:
 
     try:
         if request.from_snapshot is None and not (request.from_database or request.rebuild_graph):
-            build_query_plan(_active_profile(request))
+            search_config()
+            _active_profile(request)
+            from radar.prompts.catalog import search_planning_prompt
+            search_planning_prompt()
         if request.mode == "analyze" and not request.rebuild_graph:
             screening_questions()
             qwen_screening_policy()
@@ -251,7 +262,9 @@ def _run_database(request: PipelineRequest) -> PipelineResult:
                     collected_at = str(metadata['collected_at_utc'])
                     notes = (_out_md.staleness_note(collected_at),)
                 else:
-                    pool = _ranking.rank_works(_wrap_collection(request), _keywords(request))
+                    collection = _wrap_collection(request, storage=store, stored_run=run_id)
+                    pool = _ranking.rank_works(collection.works, _keywords(request))
+                    notes += collection.notes
                 summary = store.save_pool(run_id, pool, collected_at=collected_at)
                 if request.mode == "collect":
                     selected = _ranking.select_topn(pool, request.max_candidates)
@@ -267,7 +280,7 @@ def _run_database(request: PipelineRequest) -> PipelineResult:
                     return PipelineResult(0, _out_json.refresh_envelope(summary), result.stderr_notes)
                 return PipelineResult(result.exit_code, result.stdout, result.stderr_notes + (
                     f"storage: SQLite run={run_id}; Falkor projection ready",))
-            except (PipelineUsageError, PipelineSourceError, PipelineAnalysisError, StorageError, _sqlite3.Error) as exc:
+            except (PipelineUsageError, PipelineSourceError, PipelineAnalysisError, PipelineStorageError, StorageError, _sqlite3.Error) as exc:
                 code = 4 if isinstance(exc, PipelineUsageError) else 2 if isinstance(exc, PipelineSourceError) else 3
                 store.finish_run(run_id, code, type(exc).__name__)
                 raise
@@ -280,34 +293,122 @@ def _keywords(request: PipelineRequest) -> list[str]:
     return list(_active_profile(request).keywords)
 
 
-def _collect_live(request: PipelineRequest) -> list[CollectedWork]:
-    from radar.config.searches import build_query_plan
+def _plan_searches(request, profile, memory, policy, **kwargs):
+    """One bounded planning call; create/close its Strata client in one loop."""
+    import asyncio
+    from radar.agent.discovery_planning import plan_searches_async
+
+    async def plan():
+        session = None
+        try:
+            async with asyncio.timeout(policy.planning_timeout_s):
+                model = request.planner_model_override
+                if model is None:
+                    config = await _strata.StrataConfig.resolve_async(base_url=request.base_url, model=request.model)
+                    session = _strata.build_session(config)
+                    model = session.model
+                return await plan_searches_async(
+                    profile, memory, model=model, policy=policy,
+                    disable_thinking=_strata.resolve_disable_thinking(request.disable_thinking), **kwargs)
+        finally:
+            if session is not None:
+                await session.http_client.aclose()
+    try:
+        return asyncio.run(plan())
+    except Exception:
+        raise _strata.StrataError("Adaptive search planning failed; check the configured Strata endpoint/model.") from None
+
+
+def _collect_live(request: PipelineRequest, *, storage=None, stored_run=None) -> _CollectionOutcome:
+    from radar.config.searches import search_config
+    from radar.agent.discovery_planning import planning_fingerprints, validate_search_plan
     from radar.source.openalex import (
         HttpxTransport,
         RetryingTransport,
-        collect,
+        collect_with_feedback,
     )
-
     profile = _active_profile(request)
-    plan = build_query_plan(profile, max_queries=MAX_QUERIES)
-    if request.source_override is not None:
-        return collect(
-            plan, RetryingTransport(request.source_override),
-            timeout=request.timeout_s, max_total=MAX_TOTAL_WORKS,
-        )
-    base = HttpxTransport()
+    policy = search_config()
+    memory = storage.discovery_memory() if storage is not None else DiscoveryMemory()
+    known_ids = storage.known_work_ids() if storage is not None else set()
+    profile_hash, policy_hash = planning_fingerprints(profile, policy)
+    notes: list[str] = []
+    cached = False
     try:
-        return collect(
-            plan, RetryingTransport(base),
-            timeout=request.timeout_s, max_total=MAX_TOTAL_WORKS,
-        )
+        first = _plan_searches(request, profile, memory, policy)
+    except _strata.StrataError:
+        saved = storage.cached_search_plan(profile_hash, policy_hash) if storage is not None else None
+        if saved is None:
+            raise PipelineAnalysisError("Adaptive search planning failed and no compatible saved plan exists; no OpenAlex queries executed.") from None
+        required = [wid for intent in saved.record.plan.intents for wid in intent.source_work_ids]
+        required += [intent.query.seed_work_id for intent in saved.record.plan.intents if intent.query.seed_work_id]
+        if any(wid not in known_ids for wid in required):
+            raise PipelineAnalysisError("Saved search plan references unavailable source papers; no queries executed.") from None
+        cache_memory = memory.model_copy(update={"known_work_ids": list(dict.fromkeys(required + memory.known_work_ids))[:100]})
+        try:
+            first = validate_search_plan(saved.record.plan, profile, cache_memory, policy=policy)
+        except ValueError:
+            raise PipelineAnalysisError("Saved search plan is no longer valid; no OpenAlex queries executed.") from None
+        cached = True
+        notes.append(f"discovery: planner unavailable; reusing cached initial plan from {saved.started_at} (run={saved.run_id}); stale plan, refinement skipped.")
+    if storage is not None and stored_run is not None:
+        storage.save_search_wave(stored_run, SearchWaveRecord(
+            wave=1, profile_hash=profile_hash, policy_hash=policy_hash,
+            origin="cached" if cached else "generated", plan=first))
+    base = HttpxTransport() if request.source_override is None else None
+    transport = RetryingTransport(request.source_override if base is None else base)
+    try:
+        try:
+            initial = collect_with_feedback(first.query_plan, transport, known_work_ids=known_ids,
+                                            timeout=request.timeout_s, max_total=MAX_TOTAL_WORKS)
+        except Exception:
+            if storage is not None and stored_run is not None:
+                storage.save_search_failure(stored_run, 1)
+            raise
+        if storage is not None and stored_run is not None:
+            storage.save_search_feedback(stored_run, 1, initial.feedback)
+        combined = initial
+        queries = len(first.intents)
+        if not cached and len(initial.works) < MAX_TOTAL_WORKS:
+            try:
+                followup = _plan_searches(request, profile, memory, policy,
+                                         feedback=initial.feedback, retrieved=initial.works, previous_plan=first)
+            except _strata.StrataError:
+                notes.append("discovery: refinement planning failed; retaining initial retrieval without static fallback.")
+            else:
+                if len(first.intents) + len(followup.intents) > MAX_QUERIES:
+                    raise PipelineAnalysisError("Adaptive discovery exceeded its total query budget.")
+                if storage is not None and stored_run is not None:
+                    storage.save_search_wave(stored_run, SearchWaveRecord(
+                        wave=2, profile_hash=profile_hash, policy_hash=policy_hash, plan=followup))
+                try:
+                    combined = collect_with_feedback(followup.query_plan, transport, existing=initial.works,
+                                                     known_work_ids=known_ids, timeout=request.timeout_s,
+                                                     max_total=MAX_TOTAL_WORKS)
+                except Exception:
+                    if storage is not None and stored_run is not None:
+                        storage.save_search_failure(stored_run, 2)
+                    notes.append("discovery: followup retrieval failed; retaining initial retrieval; partial followup observations unavailable.")
+                else:
+                    queries += len(followup.intents)
+                    if storage is not None and stored_run is not None:
+                        storage.save_search_feedback(stored_run, 2, combined.feedback)
+        notes.append(f"discovery: completed-wave queries={queries}; unique papers={len(combined.works)}; retrieval intent is not scientific importance or mastery.")
+        return _CollectionOutcome(combined.works, tuple(notes))
     finally:
-        base.close()
+        if base is not None:
+            base.close()
 
 
-def _wrap_collection(request: PipelineRequest) -> list[CollectedWork]:
+def _wrap_collection(request: PipelineRequest, *, storage=None, stored_run=None) -> _CollectionOutcome:
+    from radar.storage.sqlite import StorageError
     try:
-        return _collect_live(request)
+        return _collect_live(request, storage=storage, stored_run=stored_run)
+    except (PipelineAnalysisError, PipelineStorageError):
+        raise
+    except (StorageError, _sqlite3.Error) as exc:
+        message = str(exc) if isinstance(exc, StorageError) else f"Database operation failed ({type(exc).__name__})."
+        raise PipelineStorageError(message) from exc
     except ValueError as exc:
         raise PipelineUsageError(str(exc)) from exc
     except Exception as exc:
@@ -335,18 +436,19 @@ def _run_live(request: PipelineRequest) -> PipelineResult:
     from radar.output import json as _out_json
     from radar.storage import snapshots as _snapshots
 
-    pool = _ranking.rank_works(_wrap_collection(request), _keywords(request))
+    collection = _wrap_collection(request)
+    pool = _ranking.rank_works(collection.works, _keywords(request))
     refresh_collected_at: str | None = None
     if request.refresh_dir:
         summary = _refresh_full_pool(pool, request.refresh_dir)
         refresh_collected_at = str(summary["collected_at_utc"])
         if request.mode == "collect":
-            return PipelineResult(0, _out_json.refresh_envelope(summary))
+            return PipelineResult(0, _out_json.refresh_envelope(summary), collection.notes)
     if request.mode == "collect":
         top = pool[: request.max_candidates]
-        return PipelineResult(0, _out_json.collect_envelope(top))
+        return PipelineResult(0, _out_json.collect_envelope(top), collection.notes)
     return _analyze_pool(
-        request, pool_full=pool, refresh_collected_at=refresh_collected_at,
+        request, pool_full=pool, refresh_collected_at=refresh_collected_at, prefix_notes=collection.notes,
     )
 
 

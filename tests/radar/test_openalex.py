@@ -9,13 +9,14 @@ import unittest
 from pydantic import ValidationError
 
 from radar.config.interests import RadarProfile
-from radar.config.searches import build_query_plan
 from radar.processing.ranking import cheap_score, rank_works
 from radar.schema.papers import PlannedQuery, QueryPlan
 from radar.source.openalex import (
+    BASE_URL,
     DictTransport,
     build_request,
     collect,
+    collect_with_feedback,
     normalize_work,
     reconstruct_abstract,
 )
@@ -55,16 +56,18 @@ def _work(
 
 
 class TestQueryPlan(unittest.TestCase):
-    def test_build_plan_ok(self):
-        plan = build_query_plan(
-            RadarProfile(keywords=["diffusion models", "protein design"])
+    def test_explicit_plan_ok(self):
+        plan = QueryPlan(
+            queries=[
+                PlannedQuery(kind="semantic", terms="diffusion models"),
+                PlannedQuery(kind="keyword", terms="protein design"),
+                PlannedQuery(kind="recent", terms="ml", from_date="2025-01-01"),
+            ]
         )
-        self.assertGreaterEqual(len(plan.queries), 2)
+        self.assertEqual(len(plan.queries), 3)
         kinds = {q.kind for q in plan.queries}
         self.assertIn("semantic", kinds)
         self.assertIn("keyword", kinds)
-        recent = [q for q in plan.queries if q.role == "frontier"][0]
-        self.assertIsNotNone(recent.from_date)
 
     def test_invalid_empty_profile_rejected(self):
         with self.assertRaises((ValidationError, ValueError)):
@@ -76,7 +79,7 @@ class TestQueryPlan(unittest.TestCase):
         with self.assertRaises((ValidationError, ValueError)):
             PlannedQuery(kind="semantic", terms="   ")
         with self.assertRaises(ValueError):
-            build_query_plan(RadarProfile.model_construct(keywords=[]))
+            QueryPlan.model_validate({"queries": [], "profile_summary": ""})
 
     def test_empty_plan_collect_raises(self):
         plan = QueryPlan.model_construct(queries=[])
@@ -84,12 +87,117 @@ class TestQueryPlan(unittest.TestCase):
             collect(plan, DictTransport({}))
 
 
+class TestPlannedQueryContracts(unittest.TestCase):
+    def test_citation_terms_default_empty_allowed(self):
+        q = PlannedQuery(kind="citations", seed_work_id="https://openalex.org/W123")
+        self.assertEqual(q.terms, "")
+        q2 = PlannedQuery(
+            kind="references", terms="", seed_work_id="https://openalex.org/W1"
+        )
+        self.assertEqual(q2.terms, "")
+
+    def test_empty_terms_rejected_for_noncitation(self):
+        with self.assertRaises(ValidationError):
+            PlannedQuery(kind="keyword", terms="")
+        with self.assertRaises(ValidationError):
+            PlannedQuery(kind="semantic", terms="   ")
+        with self.assertRaises(ValidationError):
+            PlannedQuery(kind="recent", terms="", from_date="2025-01-01")
+
+    def test_seed_mandatory_for_citations_forbidden_otherwise(self):
+        with self.assertRaises(ValidationError):
+            PlannedQuery(kind="citations")
+        with self.assertRaises(ValidationError):
+            PlannedQuery(kind="references", terms="x")
+        with self.assertRaises(ValidationError):
+            PlannedQuery(
+                kind="keyword", terms="x",
+                seed_work_id="https://openalex.org/W1",
+            )
+        with self.assertRaises(ValidationError):
+            PlannedQuery(
+                kind="semantic", terms="x",
+                seed_work_id="https://openalex.org/W1",
+            )
+
+    def test_seed_must_be_canonical(self):
+        with self.assertRaises(ValidationError):
+            PlannedQuery(kind="citations", seed_work_id="https://example.com/W1")
+        with self.assertRaises(ValidationError):
+            PlannedQuery(kind="citations", seed_work_id="W123")
+        with self.assertRaises(ValidationError):
+            PlannedQuery(
+                kind="citations", seed_work_id="https://openalex.org/W123?x=1"
+            )
+        with self.assertRaises(ValidationError):
+            PlannedQuery(
+                kind="citations", seed_work_id="https://openalex.org/S123"
+            )
+
+    def test_per_page_strict(self):
+        with self.assertRaises(ValidationError):
+            PlannedQuery(kind="keyword", terms="x", per_page=True)  # type: ignore
+        with self.assertRaises(ValidationError):
+            PlannedQuery(kind="keyword", terms="x", per_page=5.0)  # type: ignore
+        with self.assertRaises(ValidationError):
+            PlannedQuery(kind="keyword", terms="x", per_page="25")  # type: ignore
+        with self.assertRaises(ValidationError):
+            PlannedQuery(kind="keyword", terms="x", per_page=99)
+        with self.assertRaises(ValidationError):
+            PlannedQuery(kind="keyword", terms="x", per_page=0)
+        ok = PlannedQuery(kind="keyword", terms="x", per_page=50)
+        self.assertEqual(ok.per_page, 50)
+
+    def test_extra_forbidden(self):
+        with self.assertRaises(ValidationError):
+            PlannedQuery.model_validate(
+                {"kind": "keyword", "terms": "x", "url": "https://evil.example"}
+            )
+        with self.assertRaises(ValidationError):
+            QueryPlan.model_validate(
+                {"queries": [{"kind": "keyword", "terms": "x"}],
+                 "profile_summary": "", "url": "https://evil.example"}
+            )
+
+    def test_recent_requires_date(self):
+        with self.assertRaises(ValidationError):
+            PlannedQuery(kind="recent", terms="ml")
+        ok = PlannedQuery(kind="recent", terms="ml", from_date="2025-01-01")
+        self.assertEqual(ok.from_date, "2025-01-01")
+
+    def test_roles_preserve_old_and_add_new(self):
+        for role in ("foundation", "frontier", "counterevidence",
+                     "cross_domain", "exploration"):
+            q = PlannedQuery(
+                kind="keyword", terms="x", question_id="q1", role=role  # type: ignore
+            )
+            self.assertEqual(q.role, role)
+        with self.assertRaises(ValidationError):
+            PlannedQuery(kind="keyword", terms="x", question_id="q1", role="other")  # type: ignore
+
+    def test_source_revalidates_bypass(self):
+        bypass = PlannedQuery.model_construct(
+            kind="semantic", terms="diffusion models", per_page=99
+        )
+        with self.assertRaises(ValidationError):
+            build_request(bypass)
+        with self.assertRaises(ValidationError):
+            collect(QueryPlan.model_construct(queries=[bypass]), DictTransport({}))
+        mutated = PlannedQuery(kind="keyword", terms="alpha")
+        mutated.terms = ""  # type: ignore
+        with self.assertRaises(ValidationError):
+            build_request(mutated)
+        recent_bypass = PlannedQuery.model_construct(kind="recent", terms="ml")
+        with self.assertRaises(ValidationError):
+            build_request(recent_bypass)
+
+
 class TestRequestConstruction(unittest.TestCase):
     def test_semantic_request_constraints(self):
         _, params, headers, timeout = build_request(
-            PlannedQuery.model_construct(kind="semantic", terms="diffusion models", per_page=99)
+            PlannedQuery(kind="semantic", terms="diffusion models", per_page=50)
         )
-        self.assertEqual(params["per-page"], "50")  # capped
+        self.assertEqual(params["per-page"], "50")
         # No `sort` for semantic queries: OpenAlex relevance ranking is the
         # default when `search` is present (`sort=relevance` is rejected
         # with 400 by the live API — regression guard).
@@ -98,6 +206,13 @@ class TestRequestConstruction(unittest.TestCase):
         self.assertIn("select", params)
         self.assertIn("User-Agent", headers)
         self.assertLessEqual(timeout, 30.0)
+
+    def test_invalid_per_page_rejected_not_capped(self):
+        bypass = PlannedQuery.model_construct(
+            kind="semantic", terms="diffusion models", per_page=99
+        )
+        with self.assertRaises(ValidationError):
+            build_request(bypass)
 
     def test_recent_request_has_date_filter(self):
         _, params, _, _ = build_request(
@@ -117,6 +232,60 @@ class TestRequestConstruction(unittest.TestCase):
             build_request(
                 PlannedQuery(kind="semantic", terms="ml"), timeout=999
             )
+
+
+class TestCitationRequests(unittest.TestCase):
+    def test_references_direction(self):
+        url, params, _, _ = build_request(
+            PlannedQuery(
+                kind="references", seed_work_id="https://openalex.org/W123"
+            )
+        )
+        self.assertEqual(url, BASE_URL)
+        self.assertEqual(url, "https://api.openalex.org/works")
+        self.assertEqual(params["filter"], "cited_by:W123")
+        self.assertNotIn("search", params)
+        self.assertNotIn("search.semantic", params)
+        self.assertNotIn("sort", params)
+
+    def test_citations_direction(self):
+        url, params, _, _ = build_request(
+            PlannedQuery(
+                kind="citations", seed_work_id="https://openalex.org/W999"
+            )
+        )
+        self.assertEqual(url, BASE_URL)
+        self.assertEqual(params["filter"], "cites:W999")
+        self.assertNotIn("search", params)
+        self.assertNotIn("search.semantic", params)
+
+    def test_citation_from_date_combined(self):
+        _, params, _, _ = build_request(
+            PlannedQuery(
+                kind="citations",
+                seed_work_id="https://openalex.org/W5",
+                from_date="2024-03-01",
+            )
+        )
+        self.assertEqual(
+            params["filter"], "cites:W5,from_publication_date:2024-03-01"
+        )
+
+    def test_citation_no_injected_seed_or_arbitrary_fields(self):
+        url, params, _, _ = build_request(
+            PlannedQuery(
+                kind="references", seed_work_id="https://openalex.org/W7"
+            )
+        )
+        self.assertEqual(url, "https://api.openalex.org/works")
+        # Seed appears only inside the constructed filter, never as its own
+        # param and never as a caller-controlled URL.
+        self.assertNotIn("seed_work_id", params)
+        self.assertNotIn("seed", params)
+        self.assertNotIn("url", params)
+        for value in params.values():
+            self.assertNotIn("https://openalex.org/W7", value.replace("cited_by:W7", ""))
+            self.assertNotIn("https://", value.replace("select", "") if "select" not in value else "")
 
 
 class TestAbstractAndNormalize(unittest.TestCase):
@@ -167,9 +336,14 @@ class TestAbstractAndNormalize(unittest.TestCase):
 
 class TestCollect(unittest.TestCase):
     def test_collect_normal_results(self):
-        plan = build_query_plan(RadarProfile(keywords=["diffusion"]))
-        terms = [q.terms for q in plan.queries]
-        pages = {t: {"results": [_work()]} for t in terms}
+        plan = QueryPlan(
+            queries=[
+                PlannedQuery(kind="semantic", terms="diffusion"),
+                PlannedQuery(kind="keyword", terms="diffusion models"),
+            ]
+        )
+        pages = {"diffusion": {"results": [_work()]},
+                 "diffusion models": {"results": [_work()]}}
         works = rank_works(collect(plan, DictTransport(pages)), ["diffusion"])
         self.assertEqual(len(works), 1)
         self.assertGreaterEqual(works[0].score, 0.0)
@@ -208,6 +382,22 @@ class TestCollect(unittest.TestCase):
         works = rank_works(collect(plan, DictTransport(pages)), ["diffusion"])
         self.assertEqual(len(works), 1)
 
+    def test_collect_delegates_to_feedback_executor(self):
+        plan = QueryPlan(
+            queries=[PlannedQuery(kind="keyword", terms="alpha")]
+        )
+        pages = {"alpha": {"results": [_work()]}}
+        t1 = DictTransport(dict(pages))
+        t2 = DictTransport(dict(pages))
+        works = collect(plan, t1)
+        result = collect_with_feedback(plan, t2)
+        self.assertEqual([w.openalex_id for w in works],
+                         [w.openalex_id for w in result.works])
+        self.assertEqual(len(result.feedback), 1)
+        self.assertEqual(result.feedback[0].status, "ok")
+        for w in works:
+            self.assertEqual(w.score, 0.0)
+
     def test_prescore_deterministic(self):
         work = normalize_work(_work(), "q")
         assert work is not None
@@ -219,30 +409,22 @@ class TestCollect(unittest.TestCase):
 
 
 class TestLookbackAndBounds(unittest.TestCase):
-    def test_semantic_queries_carry_lookback_filter(self):
-        import datetime as _dt
-
-        profile = RadarProfile(
-            keywords=["diffusion models", "protein design"], lookback_days=90
+    def test_semantic_year_filter_and_exact_local_date(self):
+        query = PlannedQuery(
+            kind="semantic", terms="causal learning", from_date="2026-07-06"
         )
-        plan = build_query_plan(profile)
-        expected = (_dt.date.today() - _dt.timedelta(days=90)).isoformat()
-        self.assertGreaterEqual(len(plan.queries), 2)
-        for q in plan.queries:
-            self.assertEqual(q.from_date, expected if q.role == "frontier" else None)
-        for q in plan.queries:
-            _, params, _, _ = build_request(q)
-            if q.role == "frontier":
-                self.assertEqual(params["filter"], f"publication_year:{expected[:4]}-")
-            else:
-                self.assertNotIn("filter", params)
-            self.assertNotIn("sort", params)
+        _, params, _, _ = build_request(query)
+        self.assertEqual(params["filter"], "publication_year:2026-")
+        rows = [{"id": f"https://openalex.org/W{i}", "publication_date": date}
+                for i, date in enumerate(("2026-07-05", "2026-07-06", "2026-08-10", None,
+                                          "invalid", "2026-W28-1"))]
+        papers = collect(QueryPlan(queries=[query]), DictTransport({query.terms: {"results": rows}}))
+        self.assertEqual([p.openalex_id for p in papers],
+                         ["https://openalex.org/W1", "https://openalex.org/W2"])
 
     def test_later_query_branches_contribute_with_small_output_max(self):
         # First branch: low-scoring filler; last branch: keyword hit that
         # must win the ranked top slice even when the output bound is tiny.
-        # With the old bug (pool cap == output max) only the first query
-        # would ever execute, so the late-branch work could never surface.
         scoring_kw = "qubit-lattice-zzz"
         plan = QueryPlan(
             queries=[

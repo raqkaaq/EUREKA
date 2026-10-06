@@ -22,8 +22,8 @@ src/radar/
     interests.py       interest profile (AI/ML core + behavioral/economic lenses)
     runtime.py         all numeric bounds (service-free)
     documents.py       PDF download/parser/chunk/reading hard bounds
-    searches.yaml      research questions and historical/frontier/challenge retrieval
-    searches.py        profile/template expansion, bounded query plan
+    searches.yaml      typed learning agenda, policy and planner budgets
+    searches.py        typed policy loading (no prescribed query strings)
     qwen_screening.yaml  small-batch fallback concurrency and deadline policy
     triage.py          packaged, typed Qwen screening policy loader
     yaml.py            safe YAML parsing and typed package-resource loading
@@ -48,6 +48,7 @@ src/radar/
     clef.py            LAN CLEF/SystemOne screening client (native HTTPX,
                        batch triage, deadlines, fail-fast)
   agent/
+    discovery_planning.py PydanticAI Qwen planning and validation of adaptive waves
     pdf_reading.py     PydanticAI chunk reading and hierarchical note reduction
     research_team.py   common evidence cohort, specialists, shared deadline,
                        bounded contributions, synthesis and client cleanup
@@ -78,7 +79,8 @@ src/radar/
     triage.py          triage coverage summaries (considered/scored/unknown/failed)
   schema/
     documents.py       PDF source, pages, notes, verified coverage and outcomes
-    papers.py          paper/plan contracts (CollectedWork and friends)
+    papers.py          paper/query contracts (CollectedWork and friends)
+    discovery.py       learning goals, generated intents, feedback and memory
     opportunities.py   analysis/briefing contracts (RadarDraft and friends)
     triage.py          shared SystemOneResponse, Qwen batch correlation,
                        TriageBatch/TriageResult and strict probabilities
@@ -97,34 +99,33 @@ questions, and the agents' instructions. Python owns expansion, transport,
 output schemas and hard safety limits; there is no second hardcoded search
 algorithm or inline instruction fallback.
 
-- `config/searches.yaml` v2: a learning agenda, with a stable question ID,
-  explanatory research question, scope and three retrieval roles per question.
-  **Foundation** retrieves historical context; **frontier** retrieves recent
-  work; **counterevidence** seeks failure modes and competing explanations.
-  A role records retrieval intent, not a verified characterization of a paper.
-  Default questions cover generalization, uncertainty/causal identification,
-  strategic objectives/incentives, and measurement/human-AI effects.
-  Search defines the pool; System1 decides what merits investigation; Qwen
-  investigates the selected evidence cohort and composes the synthesis.
+- `config/searches.yaml` v3: a typed learning agenda and hard ceilings, not a
+  list of searches. Qwen chooses the concrete research questions, query
+  wording, OpenAlex method, dates and follow-ups. Role reservations (foundation,
+  frontier, counterevidence, exploration, cross-domain) ensure broad coverage
+  without prescribing query strings. Search defines a candidate pool; CLEF
+  System1 decides importance; Qwen investigates every shortlisted PDF and
+  composes the learning dossier.
 - `semantic` sends natural-language questions through OpenAlex's documented
   `search.semantic`; `keyword` sends Boolean expressions through `search`;
   `recent` is newest-first keyword retrieval. Semantic searches are limited
   to 2000 characters and paced at one request/second. Keyword expressions
   retain the 300-character bound. Limits are checked, never silently truncated.
-  Only frontier branches use `--lookback-days`; historical branches have no
-  freshness filter. The live semantic API rejects day-level filters: use its
+  Qwen chooses date cutoffs using `--lookback-days`; historical searches may
+  omit a freshness filter. The live semantic API rejects day-level filters: use its
   supported publication-year range, then enforce the exact lower date locally.
   Semantic frontier rows with unknown/invalid dates cannot establish freshness
   and are skipped; historical branches can still discover those works. This
   may underfill a frontier page; no unseen pages are implied. Results retain `(question_id, role)` provenance through
   deduplication and SQLite persistence. No new paper source is introduced.
-- `{keywords}` and `{domains}` are plain comma-separated phrases in semantic
-  questions and escaped/quoted OR expressions in keyword queries. An empty
-  domain profile skips only cross-domain questions. The planner interleaves
-  questions by role, capped at 12 requests. Defaults request 15 rows per
-  branch (at most 180 before dedup), below the global 200-work cap so later
-  branches cannot be crowded out by earlier ones. Custom larger pages can
-  reach that global cap early. CLI `--keywords` overrides profile terms.
+- Planner output is validated at the pipeline boundary: at most six initial
+  and six follow-up logical queries, at most 15 rows per query, and at most 200
+  deduplicated works. Retrieval feedback (yield and metadata availability,
+  never scientific quality) is returned to Qwen before follow-ups. Plans,
+  rationales, feedback and bounded prior findings are stored in SQLite.
+  First-boot planner failure stops before OpenAlex; a compatible saved initial
+  plan may be reused with an explicit stale-plan note. Refinement-planning
+  failure keeps the first wave with disclosure; failed retrieval waves are recorded.
 - Legacy v1 flat `queries` remain readable with their original six-request
   cap and shared date window; their former `semantic` label is normalized to
   `keyword` because those templates never performed embedding search.
@@ -162,7 +163,7 @@ algorithm or inline instruction fallback.
   interface, separate from untrusted user/paper data. Combined instructions
   and user messages retain the existing prompt budget and complete-block policy.
 
-Documents require `version: 1` (search agendas use `version: 2`), are safely
+Documents require `version: 1` (search policy uses `version: 3`), are safely
 parsed and validated into immutable Pydantic models, and are loaded from
 package resources rather than the working directory. Both root packages
 and the YAML resources are included in built distributions. Unknown/duplicate
@@ -172,8 +173,10 @@ exit 4), before source/model calls. No environment interpolation or credentials
 belong in these files. Defaults are cached per process: restart a long-running
 process after edits; a new CLI refresh loads the edits automatically.
 
-Metadata collection does not need agent prompts or inference. This slice
-adds no autonomous search tool loop; bounded LLM exploration remains separate.
+Cached/import/report/rebuild modes do not call the planner. Live collection
+uses PydanticAI for one bounded plan per wave; OpenAlex execution remains a
+deterministic, OpenAlex-only source adapter rather than an unrestricted tool
+loop.
 
 ## Specialized research team
 
@@ -193,9 +196,10 @@ they are not independent models or additional scientific sources.
   uncertainty, deduplicate and propose at most two falsifiable opportunities.
   Agreement between agents is not scientific corroboration.
 
-Each specialist returns a typed `RadarDraft`: at most one opportunity and
-1500 serialized characters (prompt guidance targets about 1100 characters to
-leave headroom under the hard cap). `ResearchResult` retains role-attributed reports,
+Each specialist returns a typed `RadarDraft`: at most one opportunity, with
+no arbitrary narrative character or serialized-contribution cap. Prompts ask
+for substantive reasoning rather than a fixed sentence count.
+`ResearchResult` retains role-attributed reports,
 the final draft/prompt and actual included papers for in-process callers.
 The CLI renders the final report and names the roles in coverage notes;
 specialist reports are not separately persisted. They remain untrusted
@@ -204,10 +208,10 @@ hypotheses, never source evidence or instructions.
 At most two specialists run concurrently. Each stage permits two PydanticAI
 requests including one validation retry, so analysis normally uses four
 requests and at most eight; provider/SDK transport retries are disabled.
-Specialist output caps are 1000 tokens (or the smaller CLI cap), and synthesis
-retains the CLI cap. Model reasoning consumes the same token budget and can
-exhaust it before producing a structured answer. The 1500-character validation
-cap does not increase that token budget. The generic thinking-disable option
+PDF reading, reduction, specialists and synthesis honor the validated
+`--max-tokens` request unchanged (default 2000, supported range 128..8000),
+without a hidden 1000-token clamp. Model reasoning consumes the same token
+budget and can exhaust it before producing a structured answer. The generic thinking-disable option
 remains opt-in; the verified local Strata instance uses `STRATA_DISABLE_THINKING=1`
 to reserve output tokens for answers. One
 `--analysis-timeout` covers all specialist and
@@ -215,11 +219,16 @@ synthesis calls. Failure cancels outstanding work, closes the owned session
 and produces no partial-success report.
 
 Legacy abstract-only programmatic calls see complete candidate blocks and indices. Selection
-reserves 5000 characters for intermediate context (three reports plus wrappers
-fit), within the combined 12,000-character instruction/user-message budget. Richer prompts can reduce
+conservatively reserves 5000 characters for intermediate context when choosing
+the initial cohort, within the combined 12,000-character instruction/user-message
+budget. This reservation is not a separate report/context acceptance cap.
+Synthesis includes every complete specialist contribution and exactly the
+source cohort seen by the specialists. If their combined input cannot fit the
+actual whole-prompt budget, it fails explicitly before synthesis rather than
+shortening reports or silently dropping source papers. Richer source prompts can reduce
 the actual analyzed shortlist; coverage reports that cohort, not the requested
-size or all discovered papers. Evidence indices, opportunity counts and
-contribution sizes are validated in code with bounded retries. No agent has
+size or all discovered papers. Evidence indices and opportunity counts are
+validated in code with bounded retries. No agent has
 research tools; abstracts alone cannot establish quality,
 causality, global novelty, replication or deployment safety. Specialization
 adds inference cost/latency; metadata-only refreshes remain model-free.
@@ -242,12 +251,32 @@ Cache reuse checks the PDF hash and re-extracts pages from the immutable bytes.
 
 PydanticAI reads every character of the page-marked text in contiguous
 6,000-character chunks (at most 24). Code owns offsets and page coverage;
-model outputs contain notes only. Quotes must occur in both their actual chunk
-and cited source page. Hierarchical reduction consumes all notes, including
-the final/remainder group, and cannot introduce new quotes. Reader and reducer
+model outputs contain note fields and strict excerpt IDs, never generated
+page/quote pairs. Alongside each unchanged full chunk, code supplies at most
+16 deterministic source excerpts of at most 100 characters, checked against
+both the chunk and real page. These possible anchors do not replace reading
+the full text; they may omit the most relevant passage, and empty evidence is
+permitted. Code resolves selected IDs into the unchanged stored page/quote
+schema. Hierarchical reduction consumes all notes, including the final/remainder
+group, using only existing verified pairs. It packs up to four complete children
+within the unchanged prompt limit, without truncating fields or inventing quotes.
+Reader and reducer
 use the same configured Strata model as the final team. `--document-timeout`
 defaults to 900 seconds across all paper readings (maximum 3600); the existing
 `--analysis-timeout` separately bounds the final specialists/synthesis.
+Each chunk or reduction allows at most three requests (two validation retries)
+under the unchanged 60-second request and overall document deadlines. A schema
+repair can therefore be followed by a separate evidence-reference repair; persistent invalid
+notes still fail explicitly, with no partial reading or abstract fallback.
+
+Narrative notes (`summary`, `methods`, `results`, `limitations` and evidence
+`finding`) have no per-field character limit or aggregate serialized-note cap.
+They remain required, typed and nonblank. Detailed notes are preserved in
+SQLite and, when included, search memory without shortening their contents.
+Generation token budgets, complete-input prompt budgets and deadlines are
+separate execution controls; they are not validation limits on a field's
+scientific detail. If intact notes cannot fit a reduction prompt, reading fails
+explicitly rather than silently truncating them.
 
 All final-team roles receive whole reduced reading notes and verified quotes,
 within a 48,000-character PDF prompt budget. Coverage distinguishes PDFs read
@@ -271,11 +300,25 @@ study-worthy paper (`schema/learning.py`: `LearningDossierDraft` with
 `significance` as interpretation, bounded `assumptions_limits`,
 zero to three `connections` each prefixed `Hypothesis:`, at most two typed `study_tasks`
 with `objective`/`success_criterion`/`missing_evidence`, and at most three
-`open_questions`; compact caps ~300-500 chars, `extra="forbid"`). Only the
+`open_questions`; narrative fields/items have no character caps,
+`extra="forbid"`). Required content, source indices/pages and hypothesis labels
+remain validated. Detailed output survives rendering and SQLite without silent
+`next_move` or `ignore` text truncation. Only the
 final synthesis uses `LearningRadarDraft` (a `RadarDraft` subclass holding at
 most one dossier); specialists still return plain `RadarDraft` exactly as
 before, and legacy opportunity-only drafts validate with an empty dossier
 list. Old stored reports read back with default empty `learning_dossiers`.
+
+Learning quality is a separate acceptance question from format and retention.
+For a real-paper live dossier, inspect whether it identifies an assumption-dependent
+mechanism or inference, separates reported findings from interpretation, retains
+counterevidence and uncertainty, and proposes a discriminating reconstruction,
+counterexample or controlled check with an observable success criterion.
+A generic topic summary, invented missing derivation, ungrounded cross-domain
+analogy or agreement between agents does not pass this check. Offline tests
+verify these instruction contracts, provenance safeguards and preservation of
+detailed results; substituted model replies do not demonstrate scientific quality
+or learner understanding. Real local-model evaluation remains pending while Qwen is offline.
 
 Legacy abstract-only research-team calls (without `documents`) see the same
 intact full normalized abstracts via opt-in `complete_abstracts=True` on the
@@ -507,6 +550,12 @@ papers per batch and one active batch. These are provisional settings, not
 live-validated throughput claims. The hard bounds remain 24 papers, two
 active batches, 64 KiB input and 4096 output tokens. Each batch permits at
 most two agent requests including validation retry, within its own deadline;
+after an invalid multi-paper response exhausts those attempts, each original
+paper is retried as a singleton with the same input/questions and validation,
+at most two requests per singleton, within the same overall stage deadline.
+Singleton failures cannot recurse into more retries; service errors/timeouts
+do not trigger isolation retries. Successful singleton judgments are retained;
+unresolved failures still block synthesis, never become low importance scores.
 SDK network retries are disabled. A failed batch no longer cancels unrelated
 batches: successful judgments survive in the final persisted batch. Safe
 typed failure categories distinguish connection/read/request timeouts,
@@ -569,7 +618,7 @@ python -m radar --from-snapshot data/radar/snapshot.json
 
 ## Discovery, quota, and paper counts
 
-- OpenAlex requests ≤ 6/plan, ≤ 50/page, ≤ 200 total pool cap, timeout
+- OpenAlex requests ≤ 6/initial wave + ≤ 6/follow-up wave, ≤ 15/page, ≤ 200 total pool cap, timeout
   ≤ 30 s. An `OPENALEX_API_KEY` is optional, but a free personal key
   avoids the exhausted shared anonymous pool; without one, confirmed
   daily-budget 429s fail fast with an actionable error instead of
@@ -583,8 +632,8 @@ python -m radar --from-snapshot data/radar/snapshot.json
   **scored**, **unknown** (missing abstracts, oversize, deadlines), and
   **failed**, with model/rubric provenance on the coverage line.
   Metadata-only runs honestly report `llm_selected/llm_analyzed` as zero.
-- Discovery is a bounded OpenAlex sample (lookback window applies to
-  every query): counts describe the snapshot only, never all of OpenAlex.
+- Discovery is a bounded Qwen-planned OpenAlex sample (dates are chosen and
+  validated per query): counts describe the snapshot only, never all of OpenAlex.
   Cross-domain discovery is broad AI/ML plus behavioral/economic lenses.
   Abstracts/metadata only; no PDFs are downloaded, no fulltext, no
   extra services.

@@ -194,6 +194,7 @@ async def screen_works_async(
                             settings["extra_body"] = strata.thinking_extra_body()
 
                         async def score(chunk: list[CollectedWork]):
+                            failure = None
                             async with semaphore:
                                 try:
                                     async with asyncio.timeout(per_request):
@@ -214,10 +215,21 @@ async def screen_works_async(
                                             failure_kind=ScreeningFailureKind.REQUEST_TIMEOUT)
                                 except Exception as exc:
                                     kind = _classify_failure(exc)
+                                    failure = kind
                                     for work in chunk:
                                         results[work.openalex_id] = TriageResult(
                                             work_id=work.openalex_id, status="failed",
                                             failure_kind=kind)
+                            # A malformed envelope can poison a whole batch.
+                            # Retry each original input independently once at
+                            # this planning level; singleton calls retain the
+                            # same two-request validation cap and stage deadline.
+                            # Release the semaphore first to avoid nested waits.
+                            if failure == ScreeningFailureKind.INVALID_RESPONSE and len(chunk) > 1:
+                                for work in chunk:
+                                    results.pop(work.openalex_id, None)
+                                for work in chunk:
+                                    await score([work])
 
                         async with asyncio.TaskGroup() as group:
                             for chunk in batches:

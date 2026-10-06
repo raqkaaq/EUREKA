@@ -4,6 +4,8 @@ TestModel/FunctionModel doubles; stdout captured, never mocked."""
 
 from __future__ import annotations
 
+from tests.radar.discovery_support import planner_model
+
 import asyncio
 import contextlib
 import io
@@ -218,7 +220,7 @@ class TestCachedSnapshot(unittest.TestCase):
             from pdf_support import empty_notes_model, make_loader, make_pdf_document
             docs = {"https://openalex.org/W1": make_pdf_document(
                 "https://openalex.org/W1")}
-            result = _run_pipeline(PipelineRequest(
+            result = _run_pipeline(PipelineRequest(planner_model_override=planner_model(),
                 mode="analyze", max_candidates=1, from_snapshot=path,
                 model_override=_fixed_draft_model(),
                 triage_scorer=lambda pool, profile: _scored_batch(pool),
@@ -235,7 +237,7 @@ class TestCachedSnapshot(unittest.TestCase):
             from pdf_support import empty_notes_model, make_loader, make_pdf_document
             docs = {f"https://openalex.org/W{i}": make_pdf_document(
                 f"https://openalex.org/W{i}") for i in range(5)}
-            result = _run_pipeline(PipelineRequest(
+            result = _run_pipeline(PipelineRequest(planner_model_override=planner_model(),
                 mode="analyze", max_candidates=2, from_snapshot=path,
                 model_override=_fixed_draft_model(),
                 triage_scorer=lambda pool, profile: _scored_batch(pool),

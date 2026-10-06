@@ -19,6 +19,9 @@ from radar.schema.opportunities import RadarReport
 from radar.schema.papers import CollectedWork
 from radar.schema.triage import TriageBatch
 from radar.schema.documents import PDFDocument, PDFSource, PDFReading, DocumentFailure, DocumentRecord
+from radar.schema.discovery import (
+    CachedSearchPlan, DiscoveryMemory, QueryFeedback, SavedFinding, SearchWaveRecord,
+)
 from radar.storage.snapshots import DISCLOSURE, compute_delta, coverage_of
 
 
@@ -59,6 +62,11 @@ CREATE TABLE IF NOT EXISTS paper_documents (
 CREATE TABLE IF NOT EXISTS run_documents (
     run_id TEXT NOT NULL REFERENCES runs(id), work_id TEXT NOT NULL REFERENCES papers(openalex_id),
     payload TEXT NOT NULL, PRIMARY KEY(run_id,work_id)
+);
+CREATE TABLE IF NOT EXISTS run_searches (
+    run_id TEXT NOT NULL REFERENCES runs(id), wave INTEGER NOT NULL CHECK(wave IN (1,2)),
+    profile_hash TEXT NOT NULL, policy_hash TEXT NOT NULL, payload TEXT NOT NULL,
+    PRIMARY KEY(run_id,wave)
 );
 INSERT OR IGNORE INTO state VALUES ('revision', 0), ('graph_revision', -1);
 PRAGMA user_version = 1;
@@ -140,6 +148,129 @@ class SQLiteStore:
         with self._db:
             self._db.execute("UPDATE runs SET finished_at=?,exit_code=?,failure_category=? WHERE id=?",
                              (_now(), exit_code, failure_category, run_id))
+
+    def _unfinished_run(self, run_id: str) -> None:
+        row = self._db.execute("SELECT finished_at FROM runs WHERE id=?", (run_id,)).fetchone()
+        if row is None or row[0] is not None:
+            raise StorageError("Search history requires an existing unfinished run.")
+
+    def save_search_wave(self, run_id: str, record: SearchWaveRecord) -> None:
+        record = SearchWaveRecord.model_validate(record.model_dump())
+        self._unfinished_run(run_id)
+        if self._db.execute("SELECT 1 FROM run_searches WHERE run_id=? AND wave=?", (run_id, record.wave)).fetchone():
+            raise StorageError("Generated search plans cannot be rewritten.")
+        with self._db:
+            self._db.execute("INSERT INTO run_searches VALUES (?,?,?,?,?)",
+                             (run_id, record.wave, record.profile_hash, record.policy_hash, record.model_dump_json()))
+
+    def search_waves(self, run_id: str) -> list[SearchWaveRecord]:
+        try:
+            return [SearchWaveRecord.model_validate_json(row[0]) for row in self._db.execute(
+                "SELECT payload FROM run_searches WHERE run_id=? ORDER BY wave", (run_id,))]
+        except ValueError as exc:
+            raise StorageError("Stored search history is invalid; database preserved.") from exc
+
+    def save_search_feedback(self, run_id: str, wave: int, feedback: list[QueryFeedback]) -> None:
+        self._unfinished_run(run_id)
+        records = {r.wave: r for r in self.search_waves(run_id)}
+        record = records.get(wave)
+        if record is None:
+            raise StorageError("Retrieval feedback requires a generated search plan.")
+        feedback = [QueryFeedback.model_validate(f.model_dump()) for f in feedback]
+        if [f.query for f in feedback] != record.plan.query_plan.queries:
+            raise StorageError("Retrieval feedback must match the planned queries in order.")
+        if record.feedback or record.retrieval_failure:
+            raise StorageError("Observed retrieval history cannot be rewritten.")
+        updated = SearchWaveRecord.model_validate(record.model_copy(update={"feedback": feedback}).model_dump())
+        with self._db:
+            self._db.execute("UPDATE run_searches SET payload=? WHERE run_id=? AND wave=?",
+                             (updated.model_dump_json(), run_id, wave))
+
+    def save_search_failure(self, run_id: str, wave: int) -> None:
+        """Record a failed wave without inventing per-query observations."""
+        self._unfinished_run(run_id)
+        record = next((r for r in self.search_waves(run_id) if r.wave == wave), None)
+        if record is None or record.feedback or record.retrieval_failure:
+            raise StorageError("Failed retrieval requires an unobserved generated wave.")
+        updated = record.model_copy(update={"retrieval_failure": "source_error"})
+        with self._db:
+            self._db.execute("UPDATE run_searches SET payload=? WHERE run_id=? AND wave=?",
+                             (updated.model_dump_json(), run_id, wave))
+
+    def cached_search_plan(self, profile_hash: str, policy_hash: str) -> CachedSearchPlan | None:
+        for payload, run_id, started_at in self._db.execute(
+            "SELECT s.payload,s.run_id,r.started_at FROM run_searches s JOIN runs r ON r.id=s.run_id "
+            "WHERE s.wave=1 AND s.profile_hash=? AND s.policy_hash=? ORDER BY s.rowid DESC",
+            (profile_hash, policy_hash)):
+            try:
+                record = SearchWaveRecord.model_validate_json(payload)
+            except ValueError as exc:
+                raise StorageError("Cached search plan is invalid; database preserved.") from exc
+            if record.profile_hash != profile_hash or record.policy_hash != policy_hash:
+                raise StorageError("Cached search fingerprints are inconsistent; database preserved.")
+            if record.origin == "generated":
+                return CachedSearchPlan(run_id=run_id, started_at=started_at, record=record)
+        return None
+
+    def known_work_ids(self) -> set[str]:
+        """Catalogue membership for exact novelty counts; never all sent to an LLM."""
+        return {row[0] for row in self._db.execute("SELECT openalex_id FROM papers")}
+
+    def discovery_memory(self) -> DiscoveryMemory:
+        """Bounded intact findings/questions/history, with no mastery inference."""
+        findings: list[SavedFinding] = []
+        seen: set[str] = set()
+        for payload, in self._db.execute("SELECT payload FROM reports ORDER BY rowid DESC LIMIT 6"):
+            try:
+                report = RadarReport.model_validate_json(payload)
+            except ValueError as exc:
+                raise StorageError("Stored findings are invalid; database preserved.") from exc
+            for resolved in report.learning_dossiers:
+                work_id = resolved.source.openalex_id
+                if work_id in seen:
+                    continue
+                dossier = resolved.dossier
+                findings.append(SavedFinding(
+                    work_id=work_id, title=resolved.source.title[:2000],
+                    contribution=dossier.reported_contribution, limits=dossier.assumptions_limits,
+                    open_questions=dossier.open_questions, evidence_level=resolved.evidence_level))
+                seen.add(work_id)
+        # Completed readings survive synthesis failure and remain useful memory.
+        for payload, title in self._db.execute(
+            "SELECT d.payload,p.title FROM run_documents d JOIN papers p ON p.openalex_id=d.work_id "
+            "ORDER BY d.rowid DESC LIMIT 12"):
+            try:
+                record = DocumentRecord.model_validate_json(payload)
+            except ValueError as exc:
+                raise StorageError("Stored reading memory is invalid; database preserved.") from exc
+            if record.status != "read" or record.work_id in seen:
+                continue
+            notes = record.reading.notes
+            findings.append(SavedFinding(work_id=record.work_id, title=title[:2000],
+                                        contribution=notes.summary, limits=[notes.limitations], evidence_level="pdf_text"))
+            seen.add(record.work_id)
+        # Prefer source IDs for findings, then recently inserted catalogue IDs.
+        known = list(dict.fromkeys([f.work_id for f in findings] + [r[0] for r in self._db.execute(
+            "SELECT openalex_id FROM papers ORDER BY rowid DESC LIMIT 100")]))[:100]
+        memory = DiscoveryMemory(known_work_ids=known)
+        for finding in findings:
+            if len(memory.findings) >= 6:
+                break
+            proposed = memory.model_copy(update={"findings": memory.findings + [finding]})
+            if len(proposed.model_dump_json()) <= 10000:
+                memory = proposed
+        for payload, in self._db.execute("SELECT payload FROM run_searches ORDER BY rowid DESC LIMIT 4"):
+            try:
+                record = SearchWaveRecord.model_validate_json(payload)
+            except ValueError as exc:
+                raise StorageError("Stored retrieval memory is invalid; database preserved.") from exc
+            for feedback in record.feedback:
+                if len(memory.prior_feedback) >= 24:
+                    break
+                proposed = memory.model_copy(update={"prior_feedback": memory.prior_feedback + [feedback]})
+                if len(proposed.model_dump_json()) <= 14000:
+                    memory = proposed
+        return DiscoveryMemory.model_validate(memory.model_dump())
 
     def latest_pool(self) -> tuple[list[CollectedWork], dict]:
         row = self._db.execute("SELECT run_id,metadata FROM pools ORDER BY rowid DESC LIMIT 1").fetchone()

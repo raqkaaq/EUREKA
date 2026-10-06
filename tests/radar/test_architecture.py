@@ -105,9 +105,9 @@ class TestServiceFreeLeaves(unittest.TestCase):
             " radar.config.runtime, radar.config.interests, radar.config.searches,"
             " radar.schema.configuration, radar.prompts.catalog;"
             "from radar.config.interests import default_profile;"
-            "from radar.config.searches import build_query_plan;"
+            "from radar.config.searches import search_config;"
             "from radar.prompts.catalog import screening_questions;"
-            "build_query_plan(default_profile()); screening_questions();"
+            "search_config(); default_profile(); screening_questions();"
             "print('service-free-ok')"
         )
         env = dict(os.environ)

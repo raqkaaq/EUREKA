@@ -7,6 +7,8 @@ only — no network, no real inference.
 
 from __future__ import annotations
 
+from tests.radar.discovery_support import planner_model
+
 import asyncio
 import datetime as dt
 import json
@@ -244,7 +246,7 @@ class TestCliSeams(unittest.TestCase):
 
         for bad in (dict(max_candidates=0), dict(max_candidates=26),
                     dict(timeout_s=999.0), dict(lookback_days=0)):
-            result = run(PipelineRequest(mode="collect", **bad))
+            result = run(PipelineRequest(planner_model_override=planner_model(), mode="collect", **bad))
             self.assertEqual(result.exit_code, 4)
 
     def test_work_to_json_keys(self):
@@ -257,7 +259,7 @@ class TestCliSeams(unittest.TestCase):
         import io
 
         from radar.pipeline import PipelineRequest, run
-        from radar.config.searches import build_query_plan
+        from discovery_support import test_query_plan as build_query_plan
         from radar.source.openalex import DictTransport
         from radar.config.interests import default_profile
 
@@ -270,7 +272,7 @@ class TestCliSeams(unittest.TestCase):
             "doi": "", "publication_year": 2026,
             "publication_date": dt.date.today().isoformat(), "cited_by_count": 0,
         } for i in range(3)]}}
-        result = run(PipelineRequest(
+        result = run(PipelineRequest(planner_model_override=planner_model(),
             mode="collect", max_candidates=8, source_override=DictTransport(pages)))
         self.assertEqual(result.exit_code, 0)
         parsed = json.loads(result.stdout)
@@ -290,7 +292,7 @@ class TestCliSeams(unittest.TestCase):
             def get_json(self, url, params, headers, timeout):
                 raise TimeoutError("slow")
 
-        result = run(PipelineRequest(mode="collect", source_override=_Down()))
+        result = run(PipelineRequest(planner_model_override=planner_model(), mode="collect", source_override=_Down()))
         self.assertEqual(result.exit_code, 2)
         self.assertTrue(any("OpenAlex" in note for note in result.stderr_notes))
 
@@ -298,7 +300,7 @@ class TestCliSeams(unittest.TestCase):
         import socket
 
         from radar.pipeline import PipelineRequest, run
-        from radar.config.searches import build_query_plan
+        from discovery_support import test_query_plan as build_query_plan
         from radar.source.openalex import DictTransport
         from radar.config.interests import default_profile
 
@@ -312,7 +314,7 @@ class TestCliSeams(unittest.TestCase):
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))
         ]
         with mock.patch("socket.getaddrinfo", return_value=public_answer):
-            result = run(PipelineRequest(
+            result = run(PipelineRequest(planner_model_override=planner_model(),
                 mode="analyze", max_candidates=1,
                 base_url="https://api.openai.com/v1",
                 source_override=DictTransport(pages),
@@ -328,7 +330,7 @@ class TestCliSeams(unittest.TestCase):
         from pydantic_ai.messages import ModelResponse, ToolCallPart
 
         from radar.pipeline import PipelineRequest, run
-        from radar.config.searches import build_query_plan
+        from discovery_support import test_query_plan as build_query_plan
         from radar.source.openalex import DictTransport
         from radar.config.interests import default_profile
         from pydantic_ai.models.function import FunctionModel
@@ -363,7 +365,7 @@ class TestCliSeams(unittest.TestCase):
         from pdf_support import empty_notes_model, make_loader, make_pdf_document
         docs = {f"https://openalex.org/W{i}": make_pdf_document(
             f"https://openalex.org/W{i}") for i in range(18)}
-        result = run(PipelineRequest(
+        result = run(PipelineRequest(planner_model_override=planner_model(),
             mode="analyze", max_candidates=15,
             source_override=DictTransport(pages),
             model_override=FunctionModel(_impl),
@@ -376,7 +378,7 @@ class TestCliSeams(unittest.TestCase):
     def test_pdf_failure_recorded_without_abstract_fallback(self):
         """One readable PDF synthesizes; one acquisition failure is explicit."""
         from radar.pipeline import PipelineRequest, run
-        from radar.config.searches import build_query_plan
+        from discovery_support import test_query_plan as build_query_plan
         from radar.source.openalex import DictTransport
         from radar.config.interests import default_profile
         from pydantic_ai.models.function import FunctionModel
@@ -401,7 +403,7 @@ class TestCliSeams(unittest.TestCase):
             return ModelResponse(parts=[ToolCallPart(
                 tool_name="final_result", args=draft.model_dump())])
 
-        result = run(PipelineRequest(
+        result = run(PipelineRequest(planner_model_override=planner_model(),
             mode="analyze", max_candidates=2,
             source_override=DictTransport(pages),
             model_override=FunctionModel(_impl),
@@ -421,7 +423,7 @@ class TestCliSeams(unittest.TestCase):
 
     def test_all_pdfs_fail_blocks_synthesis_without_empty_report(self):
         from radar.pipeline import PipelineRequest, run
-        from radar.config.searches import build_query_plan
+        from discovery_support import test_query_plan as build_query_plan
         from radar.source.openalex import DictTransport
         from radar.config.interests import default_profile
         from pydantic_ai.models.function import FunctionModel
@@ -437,7 +439,7 @@ class TestCliSeams(unittest.TestCase):
             raise AssertionError("no synthesis when no PDF readings completed")
 
         from pdf_support import empty_notes_model, make_loader
-        result = run(PipelineRequest(
+        result = run(PipelineRequest(planner_model_override=planner_model(),
             mode="analyze", max_candidates=1,
             source_override=DictTransport(pages),
             model_override=FunctionModel(_forbidden),
@@ -451,7 +453,7 @@ class TestCliSeams(unittest.TestCase):
 
     def test_late_page_provenance_reaches_pdf_report(self):
         from radar.pipeline import PipelineRequest, run
-        from radar.config.searches import build_query_plan
+        from discovery_support import test_query_plan as build_query_plan
         from radar.source.openalex import DictTransport
         from radar.config.interests import default_profile
         from pydantic_ai.models.function import FunctionModel
@@ -464,13 +466,11 @@ class TestCliSeams(unittest.TestCase):
             "abstract_inverted_index": {"x": [0]},
             "doi": "", "publication_year": 2026,
             "publication_date": dt.date.today().isoformat(), "cited_by_count": 1}]}}
-        from pdf_support import make_loader, make_pdf_document, valid_notes
+        from pdf_support import make_loader, make_pdf_document, reading_model
         doc = make_pdf_document(
             "https://openalex.org/W0",
             texts=("first page body text here", f"second page {late}"))
-        reader = FunctionModel(lambda messages, info: ModelResponse(parts=[ToolCallPart(
-            info.output_tools[0].name,
-            valid_notes(quote=late, page=2).model_dump())]))
+        reader = reading_model(quote=late, page=2)
 
         def _team(messages, info):
             from radar.prompts.catalog import SPECIALIST_ROLES, specialist_prompt
@@ -504,7 +504,7 @@ class TestCliSeams(unittest.TestCase):
                 info.output_tools[0].name,
                 team_draft.model_dump() if hasattr(team_draft, "model_dump") else team_draft)])
 
-        result = run(PipelineRequest(
+        result = run(PipelineRequest(planner_model_override=planner_model(),
             mode="analyze", max_candidates=1,
             source_override=DictTransport(pages),
             model_override=FunctionModel(_team),
@@ -522,7 +522,7 @@ class TestCliSeams(unittest.TestCase):
 
     def test_report_generation_failure_is_clear(self):
         from radar.pipeline import PipelineRequest, run
-        from radar.config.searches import build_query_plan
+        from discovery_support import test_query_plan as build_query_plan
         from radar.source.openalex import DictTransport
         from radar.config.interests import default_profile
         from pydantic_ai.models.function import FunctionModel
@@ -546,7 +546,7 @@ class TestCliSeams(unittest.TestCase):
             from pdf_support import empty_notes_model, make_loader, make_pdf_document
             docs = {"https://openalex.org/W0": make_pdf_document(
                 "https://openalex.org/W0")}
-            result = run(PipelineRequest(
+            result = run(PipelineRequest(planner_model_override=planner_model(),
                 mode="analyze", max_candidates=1,
                 source_override=DictTransport(pages),
                 model_override=FunctionModel(_empty),
@@ -562,7 +562,7 @@ class TestCliSeams(unittest.TestCase):
         from radar.pipeline import PipelineRequest, run
 
         for bad in (0, -1, 3601, float("inf")):
-            result = run(PipelineRequest(mode="collect", document_timeout_s=bad))
+            result = run(PipelineRequest(planner_model_override=planner_model(), mode="collect", document_timeout_s=bad))
             self.assertEqual(result.exit_code, 4)
         self.assertEqual(main(["--document-timeout", "0"]), 4)
         self.assertEqual(main(["--document-timeout", "3601"]), 4)

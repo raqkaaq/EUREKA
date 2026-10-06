@@ -19,7 +19,7 @@ from radar.config.runtime import (
     ANALYSIS_MAX_TOKENS, ANALYSIS_REQUEST_LIMIT, ANALYSIS_REQUEST_TIMEOUT_S,
     ANALYSIS_RETRIES, ANALYSIS_TIMEOUT_S, DEFAULT_MAX_CANDIDATES,
     MAX_ANALYSIS_OPPORTUNITIES, MAX_PROMPT_CHARS, SPECIALIST_CONCURRENCY,
-    SPECIALIST_CONTEXT_CHARS, SPECIALIST_MAX_REPORT_CHARS, SPECIALIST_MAX_TOKENS,
+    SPECIALIST_CONTEXT_CHARS,
 )
 from radar.config.yaml import ConfigurationError
 from radar.processing.ranking import bound_candidates
@@ -105,16 +105,6 @@ def _agent(model: Model, spec: AnalysisPrompt, *, specialist: bool):
                 raise ModelRetry("Use only candidate indices in the supplied valid range.")
             if len(set(indices)) != len(indices):
                 raise ModelRetry("Duplicate primary dossier indices are not allowed.")
-        if specialist:
-            size = len(draft.model_dump_json())
-            if size > SPECIALIST_MAX_REPORT_CHARS:
-                raise ModelRetry(
-                    f"Specialist report is {size} chars, above the code-owned cap of "
-                    f"{SPECIALIST_MAX_REPORT_CHARS} chars. Compress to about 1100 chars total: "
-                    "shorten wow/investigate/reproduce to 1-2 sentences each, leave ignore empty "
-                    "when nothing to exclude, keep one brief next_move, do not repeat the same "
-                    "caveat in every field."
-                )
         return draft
 
     return agent
@@ -126,9 +116,38 @@ def _reports_context(reports: tuple[SpecialistContribution, ...]) -> str:
                json.dumps([report.model_dump() for report in reports],
                           ensure_ascii=False, separators=(",", ":")) +
                "\n--- end untrusted specialist data ---")
-    if len(context) > SPECIALIST_CONTEXT_CHARS:
-        raise StrataError("Specialist context exceeded its bound; no report produced.")
     return context
+
+
+def _synthesis_prompt(included: list[CollectedWork], reports: tuple[SpecialistContribution, ...],
+                      readings_by_id: dict[str, object] | None = None) -> str:
+    """Fit intact reports against the already-shared source cohort or fail."""
+    context = _reports_context(reports)
+    spec = opportunity_analysis_prompt()
+    if readings_by_id is None:
+        bound = MAX_PROMPT_CHARS
+    else:
+        from radar.config.documents import PDF_RESEARCH_PROMPT_CHARS
+        bound = PDF_RESEARCH_PROMPT_CHARS
+    overflow = ("Complete specialist reports and the shared source cohort exceed the synthesis prompt budget; "
+                "no synthesis produced.")
+    if len(context) > bound:
+        raise StrataError(overflow)
+    if readings_by_id is None:
+        selected = synthesis.select_for_prompt(
+            included, len(included), prompt_spec=spec,
+            reserved_context_chars=len(context), complete_abstracts=True)
+    else:
+        selected = synthesis.select_for_pdf_prompt(
+            included, readings_by_id, len(included), prompt_spec=spec,
+            reserved_context_chars=len(context))
+    if selected != included:
+        raise StrataError(overflow)
+    if readings_by_id is None:
+        return synthesis.build_prompt(included, len(included), prompt_spec=spec,
+                                      context=context, complete_abstracts=True)
+    return synthesis.build_pdf_prompt(included, readings_by_id, len(included),
+                                      prompt_spec=spec, context=context)
 
 
 def select_pdf_cohort(
@@ -264,18 +283,15 @@ async def research_candidates_async(
                     spec = specialist_prompt(role)
                     prompt = synthesis.build_prompt(included, len(included), prompt_spec=spec,
                                                     complete_abstracts=True)
-                    specialist_settings = dict(settings)
-                    specialist_settings["max_tokens"] = min(max_tokens, SPECIALIST_MAX_TOKENS)
                     result = await _agent(active_model, spec, specialist=True).run(
-                        prompt, deps=len(included), model_settings=specialist_settings,
+                        prompt, deps=len(included), model_settings=settings,
                         usage_limits=UsageLimits(request_limit=ANALYSIS_REQUEST_LIMIT), retries=retries)
                     return SpecialistContribution(role=role, draft=result.output)
 
             async with asyncio.TaskGroup() as group:
                 tasks = [group.create_task(contribute(role)) for role in SPECIALIST_ROLES]
             reports = tuple(task.result() for task in tasks)
-            prompt = synthesis.build_prompt(included, len(included), context=_reports_context(reports),
-                                            complete_abstracts=True)
+            prompt = _synthesis_prompt(included, reports)
             result = await _agent(active_model, opportunity_analysis_prompt(), specialist=False).run(
                 prompt, deps=len(included), model_settings=settings,
                 usage_limits=UsageLimits(request_limit=ANALYSIS_REQUEST_LIMIT), retries=retries)
@@ -312,7 +328,6 @@ async def _research_pdf_async(
     from pydantic_ai.usage import UsageLimits
 
     from radar.agent import pdf_reading as _reading
-    from radar.config.documents import DOCUMENT_MAX_TOKENS
     from radar.prompts.catalog import validate_pdf_prompts
     from radar.schema.documents import DocumentFailure
 
@@ -341,10 +356,9 @@ async def _research_pdf_async(
             pre_failures.append(DocumentFailure(work_id=work_id, category="unrelated"))
             continue
         to_read.append(doc)
-    reading_tokens = min(int(max_tokens), DOCUMENT_MAX_TOKENS)
     reading_model = document_model if document_model is not None else active_model
     readings, read_failures = await _reading.read_documents_async(
-        to_read, reading_model, max_tokens=reading_tokens,
+        to_read, reading_model, max_tokens=max_tokens,
         disable_thinking=disable_thinking, timeout_s=reading_timeout)
     all_failures = tuple(pre_failures) + tuple(read_failures)
     # Stage boundary: retain actual reading outcomes even if a later role fails.
@@ -371,18 +385,15 @@ async def _research_pdf_async(
                 spec = specialist_prompt(role)
                 prompt = synthesis.build_pdf_prompt(
                     included, readings_by_id, len(included), prompt_spec=spec)
-                specialist_settings = dict(settings)
-                specialist_settings["max_tokens"] = min(max_tokens, SPECIALIST_MAX_TOKENS)
                 result = await _agent(active_model, spec, specialist=True).run(
-                    prompt, deps=len(included), model_settings=specialist_settings,
+                    prompt, deps=len(included), model_settings=settings,
                     usage_limits=UsageLimits(request_limit=ANALYSIS_REQUEST_LIMIT), retries=retries)
                 return SpecialistContribution(role=role, draft=result.output)
 
         async with asyncio.TaskGroup() as group:
             tasks = [group.create_task(contribute(role)) for role in SPECIALIST_ROLES]
         reports = tuple(task.result() for task in tasks)
-        prompt = synthesis.build_pdf_prompt(
-            included, readings_by_id, len(included), context=_reports_context(reports))
+        prompt = _synthesis_prompt(included, reports, readings_by_id)
         result = await _pdf_final_agent(
             active_model, opportunity_analysis_prompt(), included, readings_by_id).run(
             prompt, deps=len(included), model_settings=settings,
