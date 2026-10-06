@@ -196,7 +196,7 @@ class TestPipelineChatProtocol(unittest.TestCase):
             self.assertIn(instructions, specialist_instructions)
             token_limit = body.get("max_completion_tokens", body.get("max_tokens"))
             self.assertIsNotNone(token_limit)
-            self.assertLessEqual(token_limit, 1000)
+            self.assertEqual(token_limit, 2000)
         synthesis = user_prompt(analysis[-1])
         for role in SPECIALIST_ROLES:
             self.assertIn(role, synthesis)

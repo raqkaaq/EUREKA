@@ -81,7 +81,7 @@ class TestPlannerLoader(unittest.TestCase):
         from radar.prompts.catalog import search_planning_prompt
 
         instructions = search_planning_prompt().instructions
-        self.assertIn("summary: at most 500 characters", instructions)
+        self.assertIn("no per-field character limits", instructions)
         self.assertIn("seed_work_id only for references or citations", instructions)
         self.assertIn("source_work_ids belongs to the intent", instructions)
         self.assertIn("omit seed_work_id or use null", instructions)
@@ -149,6 +149,27 @@ class TestPlannerLoader(unittest.TestCase):
 
 
 class TestPlannerThroughModel(unittest.TestCase):
+    def test_detailed_search_questions_and_rationales_are_not_rejected_for_length(self):
+        from pydantic_ai.messages import ModelResponse, ToolCallPart
+        from pydantic_ai.models.function import FunctionModel
+        from radar.agent.discovery_planning import plan_searches
+        from tests.radar.discovery_support import initial_plan_dict
+
+        payload = initial_plan_dict()
+        payload["summary"] = ("Discriminate mechanisms from evaluation artifacts. " * 15).strip()
+        detail = payload["intents"][0]
+        detail["question"] = ("Which identifying assumption distinguishes these mechanisms? " * 12).strip()
+        detail["rationale"] = ("Test the boundary condition rather than shared terminology. " * 10).strip()
+        detail["expected_learning_value"] = ("Reconstruct the inference and its failure case. " * 10).strip()
+        def respond(messages, info):
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
+
+        result = plan_searches(default_profile(), _memory(), model=FunctionModel(respond))
+        self.assertEqual(result.summary, payload["summary"])
+        self.assertEqual(result.intents[0].question, detail["question"])
+        self.assertEqual(result.intents[0].rationale, detail["rationale"])
+        self.assertEqual(result.intents[0].expected_learning_value, detail["expected_learning_value"])
+
     def test_citation_queries_do_not_repeat_requests_using_different_descriptions(self):
         from radar.agent.discovery_planning import validate_search_plan
         from tests.radar.discovery_support import initial_plan_dict

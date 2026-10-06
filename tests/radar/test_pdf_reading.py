@@ -107,6 +107,23 @@ class TestChunking(unittest.TestCase):
 
 
 class TestReaderValidation(unittest.TestCase):
+    def test_requested_token_budget_reaches_every_chunk_and_reduction_request(self):
+        from radar.agent.pdf_reading import read_pdf
+
+        for requested in (256, 4096):
+            with self.subTest(requested=requested):
+                seen = []
+
+                def respond(messages, info):
+                    seen.append(info.model_settings["max_tokens"])
+                    return ModelResponse(parts=[ToolCallPart(
+                        info.output_tools[0].name, referenced_notes(user_prompt(messages)))])
+
+                reading = read_pdf(make_doc(texts=("A source passage. " * 400,)),
+                                   FunctionModel(respond), max_tokens=requested)
+                self.assertEqual(len(reading.chunks), 2)
+                self.assertEqual(seen, [requested, requested, requested])
+
     def test_detailed_notes_survive_chunk_reading_and_reduction_without_content_caps(self):
         from radar.agent.pdf_reading import read_pdf
 

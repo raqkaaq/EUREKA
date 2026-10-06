@@ -55,8 +55,7 @@ MAX_ANALYSIS_OPPORTUNITIES = 2
 
 # --- Specialist research team (three bounded contributions + synthesis) ---
 SPECIALIST_CONCURRENCY = 2
-SPECIALIST_MAX_TOKENS = 1000
-SPECIALIST_MAX_REPORT_CHARS = 1500
+# Conservative initial cohort reservation; actual reports use the whole prompt budget.
 SPECIALIST_CONTEXT_CHARS = 5000
 
 # --- Analysis output schema caps ---
@@ -197,8 +196,6 @@ __all__ = [
     "RESPONSE_READ_LIMIT",
     "SPECIALIST_CONCURRENCY",
     "SPECIALIST_CONTEXT_CHARS",
-    "SPECIALIST_MAX_REPORT_CHARS",
-    "SPECIALIST_MAX_TOKENS",
     "validate_analysis_timeout",
     "validate_clef_overall_timeout",
     "validate_clef_request_timeout",

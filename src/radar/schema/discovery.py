@@ -33,16 +33,16 @@ class DiscoveryPolicy(DiscoveryModel):
 
 class SearchIntent(DiscoveryModel):
     learning_goal_id: str = Field(min_length=1, max_length=80)
-    question: str = Field(min_length=1, max_length=500)
-    rationale: str = Field(min_length=1, max_length=400)
-    expected_learning_value: str = Field(min_length=1, max_length=300)
+    question: str = Field(min_length=1)
+    rationale: str = Field(min_length=1)
+    expected_learning_value: str = Field(min_length=1)
     origin: Literal["agenda", "finding", "open_question", "exploration"]
     source_work_ids: list[str] = Field(default_factory=list, max_length=3)
     query: PlannedQuery
 
 
 class SearchWavePlan(DiscoveryModel):
-    summary: str = Field(min_length=1, max_length=500)
+    summary: str = Field(min_length=1)
     intents: list[SearchIntent] = Field(min_length=1, max_length=6)
 
     @property

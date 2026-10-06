@@ -91,7 +91,7 @@ class QueryPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     queries: list[PlannedQuery] = Field(min_length=1, max_length=MAX_QUERIES)
-    profile_summary: str = Field(default="", max_length=500)
+    profile_summary: str = ""
 
 
 class LocationInfo(BaseModel):

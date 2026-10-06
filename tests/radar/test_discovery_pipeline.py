@@ -51,6 +51,29 @@ class NoSource:
 
 
 class TestDiscoveryPipeline(unittest.TestCase):
+    def test_detailed_plan_summary_reaches_collection_and_saved_wave_history(self):
+        from tests.radar.test_database_storage import GraphBoundary
+
+        calls, prompts = [], []
+        summary = ("Investigate competing mechanisms and their assumption-dependent boundary conditions. " * 10).strip()
+        base = adaptive_model(prompts)
+        def respond(messages, info):
+            response = base.function(messages, info)
+            response.parts[0].args["summary"] = summary
+            return response
+
+        with tempfile.TemporaryDirectory() as directory, source_client(calls) as client, mock.patch(
+                "radar.storage.graph_projection.FalkorGraph", GraphBoundary):
+            result = run(PipelineRequest(mode="collect", storage_dir=directory,
+                source_override=HttpxTransport(client), planner_model_override=FunctionModel(respond)))
+            self.assertEqual(result.exit_code, 0, result.stderr_notes)
+            self.assertEqual(len(calls), 12)
+            with SQLiteStore(directory) as store:
+                run_id = store.connection.execute("SELECT id FROM runs").fetchone()[0]
+                waves = store.search_waves(run_id)
+                self.assertEqual([wave.plan.summary for wave in waves], [summary, summary])
+                self.assertTrue(all(wave.plan.query_plan.profile_summary == summary for wave in waves))
+
     def test_planning_uses_real_strata_chat_protocol_and_closes_each_client(self):
         from radar.provider import strata
         chat_requests, clients, calls = [], [], []

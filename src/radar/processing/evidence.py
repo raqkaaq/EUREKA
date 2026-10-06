@@ -92,11 +92,11 @@ def attach_evidence(
                 ))
     elif getattr(draft, "learning_dossiers", None):
         raise ValueError("Unexpected learning dossiers on a non-learning draft.")
-    ignore = [str(x).strip()[:300] for x in draft.ignore if str(x).strip()][:10]
+    ignore = [str(x).strip() for x in draft.ignore if str(x).strip()][:10]
     return RadarReport(
         opportunities=opportunities,
         ignore=ignore,
-        next_move=draft.next_move.strip()[:2000],
+        next_move=draft.next_move.strip(),
         document_readings=document_readings or [],
         document_failures=document_failures or [],
         learning_dossiers=dossiers,

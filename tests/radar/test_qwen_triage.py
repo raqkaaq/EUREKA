@@ -54,6 +54,57 @@ def synth_model(calls):
 
 
 class TestQwenTriage(unittest.TestCase):
+    def test_invalid_multi_paper_batch_recovers_individually_with_unchanged_inputs(self):
+        from radar.agent.paper_triage import screen_works
+
+        pool, calls = works(2), []
+        batch = screen_works(pool, default_profile(), model_id="test-qwen",
+                             model=answers_model(calls, lambda rows: rows[:-1] if len(rows) > 1 else rows))
+        self.assertEqual([result.status for result in batch.results], ["scored", "scored"])
+        self.assertEqual([len(chunk) for chunk in calls], [2, 2, 1, 1])
+        original = {paper["work_id"]: paper["input"] for paper in calls[0]}
+        for isolated in calls[2:]:
+            self.assertEqual(isolated[0]["input"], original[isolated[0]["work_id"]])
+
+    def test_invalid_paper_does_not_poison_its_valid_neighbor_during_recovery(self):
+        from radar.agent.paper_triage import screen_works
+
+        pool, calls = works(2), []
+        def poison(rows):
+            for row in rows:
+                if row["work_id"] == pool[0].openalex_id:
+                    row["answers"]["research_importance"]["noul"] = True
+            return rows
+
+        batch = screen_works(pool, default_profile(), model=answers_model(calls, poison))
+        self.assertEqual([result.status for result in batch.results], ["failed", "scored"])
+        self.assertEqual(batch.results[0].failure_kind, "invalid_response")
+        self.assertIsNone(batch.results[0].research_importance)
+        self.assertEqual([len(chunk) for chunk in calls], [2, 2, 1, 1, 1])
+
+    def test_stage_deadline_cancels_singleton_recovery_and_records_unfinished_ids(self):
+        from radar.agent.paper_triage import screen_works
+
+        calls, settled = [], []
+        async def respond(messages, info):
+            prompt = next(part.content for message in messages for part in message.parts
+                          if isinstance(part, UserPromptPart))
+            papers = json.loads(prompt)["papers"]
+            calls.append(len(papers))
+            if len(papers) == 1:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    settled.append(papers[0]["work_id"])
+            return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {"responses": []})])
+
+        batch = screen_works(works(2), default_profile(), model=FunctionModel(respond),
+                             overall_timeout_s=0.15)
+        self.assertEqual(calls, [2, 2, 1])
+        self.assertEqual(len(settled), 1)
+        self.assertEqual([result.status for result in batch.results], ["deadline", "deadline"])
+        self.assertTrue(all(result.failure_kind == "budget_exhausted" for result in batch.results))
+
     def test_chat_prompt_specifies_array_envelope_and_numeric_answer_key(self):
         from radar.prompts.catalog import paper_triage_prompt
 
@@ -163,15 +214,15 @@ class TestQwenTriage(unittest.TestCase):
 
     def test_missing_duplicate_foreign_ids_and_wrong_model_are_rejected(self):
         from radar.agent.paper_triage import screen_works
-        changes = (lambda rows: rows[:-1], lambda rows: [rows[0]] * len(rows),
+        changes = (lambda rows: rows[:-1], lambda rows: [rows[0]] * max(2, len(rows)),
                    lambda rows: [dict(r, work_id="foreign") for r in rows],
                    lambda rows: [dict(r, model="wrong") for r in rows])
         for change in changes:
             calls = []
             batch = screen_works(works(2), default_profile(), model=answers_model(calls, change))
             self.assertTrue(all(r.status == "failed" for r in batch.results))
-            # Single 2-paper batch; at most 2 validation calls per batch.
-            self.assertEqual(len(calls), 2)
+            # Two failed batch attempts, then two bounded singleton attempts per paper.
+            self.assertEqual(len(calls), 6)
             self.assertTrue(all(r.failure_kind == "invalid_response" for r in batch.results))
 
     def test_one_validation_retry_can_recover(self):
@@ -477,8 +528,9 @@ class TestQwenPipeline(unittest.TestCase):
         result, synthesis = self.pipeline(works(), routing=answers_model(calls, lambda rows: []))
         self.assertEqual(result.exit_code, 3)
         self.assertEqual(synthesis, [])
-        # 3 works -> 2 batches (2+1), each batch retries once.
-        self.assertEqual(len(calls), 4)
+        # Failed pair: two attempts plus two attempts per isolated paper;
+        # the original singleton has two attempts, for eight total.
+        self.assertEqual(len(calls), 8)
 
     def test_collect_only_and_empty_pool_call_no_models(self):
         for pool, options in ((works(), {"mode": "collect"}), ([], {})):

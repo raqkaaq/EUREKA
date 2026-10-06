@@ -17,10 +17,10 @@ from typing import TYPE_CHECKING
 
 from radar.config.documents import (
     DOCUMENT_ANALYSIS_TIMEOUT_S,
-    DOCUMENT_MAX_TOKENS,
     DOCUMENT_REDUCTION_GROUP_SIZE,
     validate_document_timeout,
 )
+from radar.config.runtime import ANALYSIS_MAX_TOKENS
 from radar.prompts.catalog import (
     pdf_reading_prompt,
     pdf_reduction_prompt,
@@ -54,8 +54,7 @@ PDF_RETRIES = 2
 def validate_reading_tokens(value: int) -> int:
     from radar.config.runtime import validate_max_tokens
 
-    tokens = validate_max_tokens(value)
-    return min(tokens, DOCUMENT_MAX_TOKENS)
+    return validate_max_tokens(value)
 
 
 def _run_bounds(
@@ -160,7 +159,7 @@ async def read_pdf_async(
     document: PDFDocument,
     model: Model,
     *,
-    max_tokens: int = DOCUMENT_MAX_TOKENS,
+    max_tokens: int = ANALYSIS_MAX_TOKENS,
     disable_thinking: bool = False,
     timeout_s: float = DOCUMENT_ANALYSIS_TIMEOUT_S,
 ) -> PDFReading:
@@ -268,7 +267,7 @@ async def read_documents_async(
     documents: Sequence[PDFDocument],
     model: Model,
     *,
-    max_tokens: int = DOCUMENT_MAX_TOKENS,
+    max_tokens: int = ANALYSIS_MAX_TOKENS,
     disable_thinking: bool = False,
     timeout_s: float = DOCUMENT_ANALYSIS_TIMEOUT_S,
 ) -> tuple[list[PDFReading], list[DocumentFailure]]:

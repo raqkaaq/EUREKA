@@ -196,9 +196,10 @@ they are not independent models or additional scientific sources.
   uncertainty, deduplicate and propose at most two falsifiable opportunities.
   Agreement between agents is not scientific corroboration.
 
-Each specialist returns a typed `RadarDraft`: at most one opportunity and
-1500 serialized characters (prompt guidance targets about 1100 characters to
-leave headroom under the hard cap). `ResearchResult` retains role-attributed reports,
+Each specialist returns a typed `RadarDraft`: at most one opportunity, with
+no arbitrary narrative character or serialized-contribution cap. Prompts ask
+for substantive reasoning rather than a fixed sentence count.
+`ResearchResult` retains role-attributed reports,
 the final draft/prompt and actual included papers for in-process callers.
 The CLI renders the final report and names the roles in coverage notes;
 specialist reports are not separately persisted. They remain untrusted
@@ -207,10 +208,10 @@ hypotheses, never source evidence or instructions.
 At most two specialists run concurrently. Each stage permits two PydanticAI
 requests including one validation retry, so analysis normally uses four
 requests and at most eight; provider/SDK transport retries are disabled.
-Specialist output caps are 1000 tokens (or the smaller CLI cap), and synthesis
-retains the CLI cap. Model reasoning consumes the same token budget and can
-exhaust it before producing a structured answer. The 1500-character validation
-cap does not increase that token budget. The generic thinking-disable option
+PDF reading, reduction, specialists and synthesis honor the validated
+`--max-tokens` request unchanged (default 2000, supported range 128..8000),
+without a hidden 1000-token clamp. Model reasoning consumes the same token
+budget and can exhaust it before producing a structured answer. The generic thinking-disable option
 remains opt-in; the verified local Strata instance uses `STRATA_DISABLE_THINKING=1`
 to reserve output tokens for answers. One
 `--analysis-timeout` covers all specialist and
@@ -218,11 +219,16 @@ synthesis calls. Failure cancels outstanding work, closes the owned session
 and produces no partial-success report.
 
 Legacy abstract-only programmatic calls see complete candidate blocks and indices. Selection
-reserves 5000 characters for intermediate context (three reports plus wrappers
-fit), within the combined 12,000-character instruction/user-message budget. Richer prompts can reduce
+conservatively reserves 5000 characters for intermediate context when choosing
+the initial cohort, within the combined 12,000-character instruction/user-message
+budget. This reservation is not a separate report/context acceptance cap.
+Synthesis includes every complete specialist contribution and exactly the
+source cohort seen by the specialists. If their combined input cannot fit the
+actual whole-prompt budget, it fails explicitly before synthesis rather than
+shortening reports or silently dropping source papers. Richer source prompts can reduce
 the actual analyzed shortlist; coverage reports that cohort, not the requested
-size or all discovered papers. Evidence indices, opportunity counts and
-contribution sizes are validated in code with bounded retries. No agent has
+size or all discovered papers. Evidence indices and opportunity counts are
+validated in code with bounded retries. No agent has
 research tools; abstracts alone cannot establish quality,
 causality, global novelty, replication or deployment safety. Specialization
 adds inference cost/latency; metadata-only refreshes remain model-free.
@@ -294,11 +300,25 @@ study-worthy paper (`schema/learning.py`: `LearningDossierDraft` with
 `significance` as interpretation, bounded `assumptions_limits`,
 zero to three `connections` each prefixed `Hypothesis:`, at most two typed `study_tasks`
 with `objective`/`success_criterion`/`missing_evidence`, and at most three
-`open_questions`; compact caps ~300-500 chars, `extra="forbid"`). Only the
+`open_questions`; narrative fields/items have no character caps,
+`extra="forbid"`). Required content, source indices/pages and hypothesis labels
+remain validated. Detailed output survives rendering and SQLite without silent
+`next_move` or `ignore` text truncation. Only the
 final synthesis uses `LearningRadarDraft` (a `RadarDraft` subclass holding at
 most one dossier); specialists still return plain `RadarDraft` exactly as
 before, and legacy opportunity-only drafts validate with an empty dossier
 list. Old stored reports read back with default empty `learning_dossiers`.
+
+Learning quality is a separate acceptance question from format and retention.
+For a real-paper live dossier, inspect whether it identifies an assumption-dependent
+mechanism or inference, separates reported findings from interpretation, retains
+counterevidence and uncertainty, and proposes a discriminating reconstruction,
+counterexample or controlled check with an observable success criterion.
+A generic topic summary, invented missing derivation, ungrounded cross-domain
+analogy or agreement between agents does not pass this check. Offline tests
+verify these instruction contracts, provenance safeguards and preservation of
+detailed results; substituted model replies do not demonstrate scientific quality
+or learner understanding. Real local-model evaluation remains pending while Qwen is offline.
 
 Legacy abstract-only research-team calls (without `documents`) see the same
 intact full normalized abstracts via opt-in `complete_abstracts=True` on the
@@ -530,6 +550,12 @@ papers per batch and one active batch. These are provisional settings, not
 live-validated throughput claims. The hard bounds remain 24 papers, two
 active batches, 64 KiB input and 4096 output tokens. Each batch permits at
 most two agent requests including validation retry, within its own deadline;
+after an invalid multi-paper response exhausts those attempts, each original
+paper is retried as a singleton with the same input/questions and validation,
+at most two requests per singleton, within the same overall stage deadline.
+Singleton failures cannot recurse into more retries; service errors/timeouts
+do not trigger isolation retries. Successful singleton judgments are retained;
+unresolved failures still block synthesis, never become low importance scores.
 SDK network retries are disabled. A failed batch no longer cancels unrelated
 batches: successful judgments survive in the final persisted batch. Safe
 typed failure categories distinguish connection/read/request timeouts,

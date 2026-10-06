@@ -47,9 +47,9 @@ instructions: |
   Return only the required typed SearchWavePlan: summary plus intents with
   learning goal, question, rationale, expected learning value, origin and
   one bounded query each carrying question identity and role.
-  OUTPUT LIMITS (characters, not words): summary: at most 500 characters;
-  each question at most 500, rationale at most 400, expected_learning_value
-  at most 300. Aim well below these caps and keep the summary to two short sentences.
+  Narrative fields have no per-field character limits. Explain the concrete
+  assumption, discriminating question, rationale and expected learning payoff
+  with the detail needed, without repetition or generic topic descriptions.
   source_work_ids belongs to the intent: use only exact supplied canonical
   OpenAlex IDs, not invented, shortened or remembered IDs.
   Use seed_work_id only for references or citations, copied from a supplied ID.
