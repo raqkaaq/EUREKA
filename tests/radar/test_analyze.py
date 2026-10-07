@@ -206,7 +206,8 @@ class TestPromptBounds(unittest.TestCase):
         self.assertIn("end untrusted candidate 0 data", prompt.lower())
 
     def test_prompt_and_evidence_share_bounded_set_above_index_11(self):
-        candidates = [_candidate(i) for i in range(15)]
+        candidates = [_candidate(i).model_copy(update={"abstract": "A reported mechanism."})
+                      for i in range(15)]
         prompt = build_prompt(candidates, max_candidates=15)
         self.assertIn("[14]", prompt)
         bounded = bound_candidates(candidates, 15)
@@ -457,7 +458,7 @@ class TestCliSeams(unittest.TestCase):
         from radar.source.openalex import DictTransport
         from radar.config.interests import default_profile
         from pydantic_ai.models.function import FunctionModel
-        from pydantic_ai.messages import ModelResponse, ToolCallPart
+        from pydantic_ai.messages import ModelResponse, ToolCallPart, ToolReturnPart
 
         late = "latepage marker ZETA-42 unique tail content here"
         plan = build_query_plan(default_profile())
@@ -480,11 +481,17 @@ class TestCliSeams(unittest.TestCase):
                     opportunities=[OpportunityDraft(title="H", evidence=[0])],
                     next_move="check")
             else:
+                passages = [part.content for message in messages for part in message.parts
+                            if isinstance(part, ToolReturnPart) and part.tool_name == "read_pdf_passage"]
+                if not passages:
+                    return ModelResponse(parts=[ToolCallPart("read_pdf_passage",
+                        {"paper_index": 0, "page": 2, "offset": 0})])
                 team_draft = {
                     "opportunities": [{"title": "T", "evidence": [0]}],
                     "ignore": [], "next_move": "N",
                     "learning_dossiers": [{
                         "paper_index": 0, "supporting_pages": [2],
+                        "source_passage_ids": [passages[-1]["passage_id"]],
                         "core_problem": "What problem does the paper address?",
                         "reported_contribution": "What the paper reports.",
                         "reasoning": "Key mechanism sketched in full text.",

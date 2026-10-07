@@ -244,12 +244,15 @@ class TestResearchTeam(unittest.TestCase):
                 if pdf:
                     from pdf_support import make_pdf_document
 
+                    draft = RadarDraft(next_move="x" * 3000)
+
                     def read(messages, info):
                         return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {
-                            "summary": "s" * 37000, "methods": "method", "results": "results",
+                            "summary": "s" * 33000, "methods": "method", "results": "results",
                             "limitations": "limits", "evidence": []})])
 
                     options = dict(documents=[make_pdf_document(pool[0].openalex_id)],
+                                   learning_question="Which assumption matters?",
                                    document_model=FunctionModel(read))
                 with self.assertRaises(FreeTokenError) as caught:
                     research_candidates(pool, model=FunctionModel(respond), **options)

@@ -544,10 +544,18 @@ class TestResearchTeamPdf(unittest.TestCase):
         synthesis_calls = []
         def respond(messages, info):
             if info.instructions == opportunity_analysis_prompt().instructions:
+                from pydantic_ai.messages import ToolReturnPart
+
+                passages = [part.content for message in messages for part in message.parts
+                            if isinstance(part, ToolReturnPart) and part.tool_name == "read_pdf_passage"]
+                if not passages:
+                    return ModelResponse(parts=[ToolCallPart("read_pdf_passage", {
+                        "paper_index": 0, "page": 1})])
                 synthesis_calls.append(1)
                 page = 2 if len(synthesis_calls) == 1 else 1
                 return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {
-                    "learning_dossiers": [_dossier_dict(supporting_pages=[page])],
+                    "learning_dossiers": [_dossier_dict(supporting_pages=[page],
+                        source_passage_ids=[passages[-1]["passage_id"]])],
                     "opportunities": [], "ignore": [], "next_move": "Study the argument."})])
             return base_respond(messages, info)
 

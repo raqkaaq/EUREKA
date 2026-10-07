@@ -78,6 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Strata model id override (default: STRATA_MODEL env or local /models).",
     )
     parser.add_argument(
+        "--learning-question",
+        default=None,
+        help="Question for final PDF investigation (default: the packaged learning agenda).",
+    )
+    parser.add_argument(
         "--storage-dir", default=None, metavar="PATH",
         help="SQLite and local Falkor storage directory (default: RADAR_STORAGE_DIR or data/radar).",
     )
@@ -198,6 +203,7 @@ def main(argv: list[str] | None = None) -> int:
         disable_thinking=args.disable_thinking,
         base_url=args.base_url,
         model=args.model,
+        learning_question=args.learning_question,
         clef_base_url=args.clef_base_url,
         clef_model=args.clef_model,
         clef_timeout_s=args.clef_timeout,

@@ -65,13 +65,13 @@ def research_role(body: dict) -> str:
     return "synthesis"
 
 
-def completion(body: dict, output: dict) -> httpx2.Response:
+def completion(body: dict, output: dict, *, tool_name: str = "final_result") -> httpx2.Response:
     return httpx2.Response(200, json={
         "id": "offline-completion", "object": "chat.completion", "created": 1,
         "model": MODEL, "choices": [{"index": 0, "finish_reason": "tool_calls",
             "message": {"role": "assistant", "tool_calls": [{
                 "id": "offline-tool-call", "type": "function", "function": {
-                    "name": body["tools"][0]["function"]["name"],
+                    "name": tool_name,
                     "arguments": json.dumps(output),
                 }}]}}],
         "usage": {"prompt_tokens": 100, "completion_tokens": 100, "total_tokens": 200},
@@ -122,6 +122,38 @@ def chat_boundary(handler):
 
 
 class TestPipelineChatProtocol(unittest.TestCase):
+    def test_question_and_consulted_passage_survive_the_real_chat_tool_protocol(self):
+        from test_pdf_investigation import dossier
+
+        final_requests = []
+        question = "Which assumption limits this result?"
+
+        def chat(request):
+            body = json.loads(request.content)
+            if is_triage(body) or research_role(body) != "synthesis":
+                return completion(body, valid_output(body))
+            final_requests.append(body)
+            names = {tool["function"]["name"] for tool in body["tools"]}
+            self.assertEqual(names, {"read_pdf_passage", "final_result"})
+            self.assertIn(question, user_prompt(body))
+            returns = [json.loads(message["content"]) for message in body["messages"]
+                       if message["role"] == "tool"]
+            if not returns:
+                return completion(body, {"paper_index": 0, "page": 1, "offset": 0},
+                                  tool_name="read_pdf_passage")
+            passage = returns[-1]
+            self.assertEqual(passage["text"], "hello world paper text")
+            self.assertEqual(passage["page"], 1)
+            return completion(body, {"learning_dossiers": [
+                dossier(passage["passage_id"], supporting_pages=[1])]})
+
+        result, _, _ = self.run_cached(paper_pool()[1:3], chat, learning_question=question)
+        self.assertEqual(result.exit_code, 0, result.stderr_notes)
+        self.assertEqual(len(final_requests), 2)
+        self.assertIn(question, result.stdout)
+        self.assertIn("hello world paper text", result.stdout)
+        self.assertIn("characters 0–22", result.stdout)
+
     def run_cached(self, pool, handler, **options):
         with tempfile.TemporaryDirectory() as tmp, chat_boundary(handler) as clients:
             snapshot = refresh_pool(pool, tmp)["snapshot"]

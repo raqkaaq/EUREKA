@@ -91,6 +91,28 @@ class PDFDocument(PDFSource):
         return self
 
 
+class PDFPassage(DocumentModel):
+    """An exact, code-resolved slice consulted during final investigation."""
+
+    passage_id: str
+    work_id: str = Field(pattern=r"^https://openalex\.org/W\d+$")
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    page: StrictInt = Field(ge=1, le=PDF_MAX_PAGES)
+    start: StrictInt = Field(ge=0)
+    end: StrictInt = Field(gt=0)
+    text: str = Field(min_length=1)
+    next_offset: StrictInt | None = None
+
+    @model_validator(mode="after")
+    def _source_span(self) -> PDFPassage:
+        expected = f"{self.work_id.rsplit('/', 1)[-1]}:{self.sha256}:p{self.page}:{self.start}-{self.end}"
+        if self.passage_id != expected or self.end - self.start != len(self.text):
+            raise ValueError("Passage identity and text must match its source span.")
+        if self.next_offset is not None and self.next_offset != self.end:
+            raise ValueError("Passage continuation must begin at its end.")
+        return self
+
+
 class PageEvidence(DocumentModel):
     page: StrictInt = Field(ge=1, le=PDF_MAX_PAGES)
     quote: str = Field(min_length=1, max_length=180)

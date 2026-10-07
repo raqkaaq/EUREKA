@@ -7,9 +7,12 @@ from tests.radar.discovery_support import planner_model
 
 import json
 import datetime as dt
+import contextlib
+import io
 import unittest
+from unittest import mock
 
-from radar.pipeline import PipelineRequest, run
+from radar.pipeline import PipelineRequest, PipelineResult, run
 
 
 def _raw(wid: str, title: str, year: int = 2026) -> dict:
@@ -42,6 +45,27 @@ class FakeSource:
 
 
 class TestPipelineCollectionBounds(unittest.TestCase):
+    def test_cli_passes_complete_learning_question_to_pipeline(self):
+        from radar.cli import main
+
+        question = "  Which assumptions support the mechanism? " + "Explain the boundary conditions. " * 30
+        with mock.patch("radar.cli.run", return_value=PipelineResult(0)) as execute, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["--learning-question", question]), 0)
+        self.assertEqual(execute.call_args.args[0].learning_question, question)
+
+    def test_blank_learning_question_is_rejected_before_source_or_storage_io(self):
+        for question in ("", " \n\t "):
+            for list_reports in (False, True):
+                with self.subTest(question=question, list_reports=list_reports):
+                    source = FakeSource()
+                    with mock.patch("radar.storage.sqlite.SQLiteStore", side_effect=AssertionError("No storage I/O")), mock.patch(
+                            "radar.storage.library.ReportLibrary", side_effect=AssertionError("No library I/O")):
+                        result = run(PipelineRequest(learning_question=question,
+                            source_override=source, storage_dir="unused", list_reports=list_reports))
+                    self.assertEqual(result.exit_code, 4)
+                    self.assertIn("learning-question", " ".join(result.stderr_notes))
+                    self.assertEqual(source.calls, [])
+
     def test_small_max_still_executes_whole_plan(self):
         fake = FakeSource()
         result = run(PipelineRequest(planner_model_override=planner_model(),

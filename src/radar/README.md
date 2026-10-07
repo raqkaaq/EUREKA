@@ -205,9 +205,12 @@ The CLI renders the final report and names the roles in coverage notes;
 specialist reports are not separately persisted. They remain untrusted
 hypotheses, never source evidence or instructions.
 
-At most two specialists run concurrently. Each stage permits two PydanticAI
-requests including one validation retry, so analysis normally uses four
-requests and at most eight; provider/SDK transport retries are disabled.
+At most two specialists run concurrently. Each specialist permits two PydanticAI
+requests including one validation retry. Legacy abstract-only synthesis also
+permits two requests (at most eight team requests). PDF final investigation
+permits eight requests and six local passage reads under the same team deadline
+(at most fourteen team requests, excluding initial PDF reading/reduction).
+Provider/SDK transport retries are disabled.
 PDF reading, reduction, specialists and synthesis honor the validated
 `--max-tokens` request unchanged (default 2000, supported range 128..8000),
 without a hidden 1000-token clamp. Model reasoning consumes the same token
@@ -228,7 +231,7 @@ actual whole-prompt budget, it fails explicitly before synthesis rather than
 shortening reports or silently dropping source papers. Richer source prompts can reduce
 the actual analyzed shortlist; coverage reports that cohort, not the requested
 size or all discovered papers. Evidence indices and opportunity counts are
-validated in code with bounded retries. No agent has
+validated in code with bounded retries. Abstract-only agents have no
 research tools; abstracts alone cannot establish quality,
 causality, global novelty, replication or deployment safety. Specialization
 adds inference cost/latency; metadata-only refreshes remain model-free.
@@ -336,6 +339,8 @@ duplicate primary indices fail the synthesis validator for a bounded retry and
 are never silently dropped; `attach_evidence` raises on an invalid dossier
 source instead of filtering it. Abstract-only dossiers require a supplied abstract;
 PDF dossiers require the matching completed reading and verified page references.
+New PDF investigation dossiers additionally require consulted source passages,
+described below; archived dossiers without those fields remain readable.
 SQLite `save_report` requires the source to belong to this run's pool, fall within
 its analyzed index range, and have a matching stored reading (or a nonblank
 abstract in the immutable pool record for legacy abstract-only reports).
@@ -346,6 +351,48 @@ and projects grounded `LearningDossier` nodes
 existing paper) edges only; no invented scientific ontology. Markdown leads with
 one grounded dossier section (hypotheses labeled, interpretation marked,
 source basis linked); legacy opportunity-only reports render unchanged.
+
+### Question-driven source revisiting
+
+`radar --learning-question "Under which assumptions is this result identified?"`
+focuses final PDF investigation on an explicit question. It does not currently
+override the discovery agenda or System1 rubric. Without an override, the
+typed `config/searches.yaml` learning goals supply an explicitly labeled agenda,
+not a reconstructed retrieval intent or inferred learner state. The exact
+question/agenda is retained in the report and existing SQLite JSON payload.
+
+After complete initial reading and unchanged specialists, final synthesis has
+one PydanticAI function tool: `read_pdf_passage(paper_index, page, offset=0)`.
+It reads only the common cohort's already-extracted PDF objects in memory;
+no file paths, URLs, parsing, downloads, source APIs or shell tools are exposed.
+Each response contains exact page-local text up to the existing 6000-character
+chunk size, a code-owned ID, PDF hash, offsets and `next_offset` for continuation.
+This is a tool transport bound, not a narrative-field limit.
+
+Before producing a new PDF dossier, synthesis must consult source text and cite
+nonempty `source_passage_ids` actually returned for its primary paper. Code
+resolves them into `ResolvedLearningDossier.source_passages`; supporting pages
+must match. Unknown, guessed, unread, duplicate or other-paper citations fail
+with bounded validation repair. Initial `PDFReading` records remain unchanged:
+revisited passages do not become invented initial-reader evidence. SQLite
+checks every cited slice against this run's stored extraction and PDF hash,
+not merely its ID. Markdown includes exact text, page/offset references and IDs.
+
+The final stage permits six successful function calls and eight model requests,
+including final-answer repair. The existing `--analysis-timeout` covers all
+specialists and interactive synthesis; caller `--max-tokens` remains unchanged.
+A before-request guard measures the intact serialized conversation plus the
+current instructions against the existing 48,000-character PDF budget.
+Per-turn instruction trace copies are not counted as repeated provider input.
+No history/source text is truncated to fit. Budget exhaustion or cancellation
+produces no partial-success report; completed initial readings remain stored.
+
+This first slice makes source revisiting possible and auditable. It does not
+provide semantic search, independently verify entailment/proofs, redesign the
+opportunity-shaped specialists, infer mastery, or turn Falkor into a conceptual
+learning graph. Missing detail must stay unresolved rather than become an
+invented explanation. Offline substituted-model tests establish these mechanics;
+postgraduate analytical quality still requires real-paper/local-model evaluation.
 
 ### Reopening saved reports (offline)
 
