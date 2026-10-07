@@ -52,6 +52,7 @@ class LearningDossierDraft(BaseModel):
 
     paper_index: StrictInt = Field(ge=0)
     supporting_pages: list[StrictInt] = Field(default_factory=list, max_length=8)
+    source_passage_ids: list[str] = Field(default_factory=list)
     core_problem: str = Field(min_length=1)
     reported_contribution: str = Field(min_length=1)
     reasoning: str = Field(min_length=1)
@@ -60,6 +61,13 @@ class LearningDossierDraft(BaseModel):
     connections: list[str] = Field(max_length=3)
     study_tasks: list[StudyTask] = Field(min_length=1, max_length=2)
     open_questions: list[str] = Field(min_length=1, max_length=3)
+
+    @field_validator("source_passage_ids")
+    @classmethod
+    def _passage_ids(cls, value: list[str]) -> list[str]:
+        if any(not item.strip() for item in value) or len(set(value)) != len(value):
+            raise ValueError("Source passage IDs must be nonblank and unique.")
+        return value
 
     @field_validator("core_problem", "reported_contribution", "reasoning", "significance")
     @classmethod

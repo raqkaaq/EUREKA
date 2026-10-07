@@ -3,7 +3,8 @@
 All stages see the same complete candidate blocks and index space. Specialists
 produce typed hypotheses; synthesis must ground them in the original papers.
 The workflow owns one overall deadline and closes any supplied owned session.
-No source calls, provider discovery, tool loops, snapshots or rendering here.
+No source calls, provider discovery, snapshots or rendering here. PDF final
+investigation has bounded read-only access to its already-extracted sources.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import json
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from pydantic import StrictInt
 
 from radar.agent import opportunity_analysis as synthesis
 from radar.config.runtime import (
@@ -24,11 +26,12 @@ from radar.config.runtime import (
 from radar.config.yaml import ConfigurationError
 from radar.processing.ranking import bound_candidates
 from radar.prompts.catalog import (
-    SPECIALIST_ROLES, opportunity_analysis_prompt, specialist_prompt,
+    SPECIALIST_ROLES, opportunity_analysis_prompt, specialist_prompt, pdf_investigation_prompt,
 )
 from radar.provider.strata import StrataError
 from radar.schema.configuration import AnalysisPrompt
-from radar.schema.documents import DocumentFailure, PDFReading
+from radar.schema.documents import DocumentFailure, PDFReading, PDFPassage
+from radar.processing.pdf_passages import PDFPassages
 from radar.schema.opportunities import (
     LearningRadarDraft,
     RadarDraft,
@@ -50,12 +53,15 @@ class ResearchResult:
     specialist_reports: tuple[SpecialistContribution, ...] = ()
     document_readings: tuple[PDFReading, ...] = ()
     document_failures: tuple[DocumentFailure, ...] = ()
+    source_passages: tuple[PDFPassage, ...] = ()
+    learning_question: str = ""
 
 
 def validate_research_prompts() -> None:
     """Preflight typed documents, including the final stage's context reserve."""
     for role in SPECIALIST_ROLES:
         specialist_prompt(role)
+    pdf_investigation_prompt()
     spec = opportunity_analysis_prompt()
     task = spec.task_template.format(max_opportunities=MAX_ANALYSIS_OPPORTUNITIES,
                                      valid_range="none (no candidates)")
@@ -120,9 +126,10 @@ def _reports_context(reports: tuple[SpecialistContribution, ...]) -> str:
 
 
 def _synthesis_prompt(included: list[CollectedWork], reports: tuple[SpecialistContribution, ...],
-                      readings_by_id: dict[str, object] | None = None) -> str:
+                      readings_by_id: dict[str, object] | None = None,
+                      learning_context: str = "") -> str:
     """Fit intact reports against the already-shared source cohort or fail."""
-    context = _reports_context(reports)
+    context = learning_context + _reports_context(reports)
     spec = opportunity_analysis_prompt()
     if readings_by_id is None:
         bound = MAX_PROMPT_CHARS
@@ -154,6 +161,7 @@ def select_pdf_cohort(
     candidates: list[CollectedWork],
     readings_by_id: dict[str, object],
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
+    *, learning_context_chars: int = 0,
 ) -> list[CollectedWork]:
     """Common full-text cohort fitting every role and reserved synthesis context."""
     from radar.config.documents import PDF_RESEARCH_PROMPT_CHARS
@@ -164,7 +172,7 @@ def select_pdf_cohort(
     counts = [len(synthesis.select_for_pdf_prompt(
         eligible, readings_by_id, max_candidates,
         prompt_spec=opportunity_analysis_prompt(),
-        reserved_context_chars=SPECIALIST_CONTEXT_CHARS,
+        reserved_context_chars=SPECIALIST_CONTEXT_CHARS + learning_context_chars,
         max_chars=PDF_RESEARCH_PROMPT_CHARS))]
     counts.extend(len(synthesis.select_for_pdf_prompt(
         eligible, readings_by_id, max_candidates,
@@ -175,7 +183,8 @@ def select_pdf_cohort(
 
 
 def validate_pdf_dossier_pages(draft: object, included: list[CollectedWork],
-                               readings_by_id: dict[str, object]) -> object:
+                               readings_by_id: dict[str, object],
+                               passages: PDFPassages | None = None) -> object:
     """Require nonempty source pages within the supplied paper in PDF mode."""
     dossiers = getattr(draft, "learning_dossiers", [])
     if not dossiers:
@@ -196,7 +205,13 @@ def validate_pdf_dossier_pages(draft: object, included: list[CollectedWork],
         reading = readings_by_id.get(work.openalex_id)
         if reading is None:
             raise ValueError("dossier paper has no completed PDF reading")
-        valid = sorted({item.page for item in reading.notes.evidence})
+        if passages is None:
+            valid = sorted({item.page for item in reading.notes.evidence})
+        else:
+            consulted = passages.resolve(dossier.source_passage_ids, work.openalex_id)
+            valid = sorted({item.page for item in consulted})
+            if set(pages or []) != set(valid):
+                raise ValueError("supporting_pages must match the cited consulted passages.")
         if not isinstance(pages, list) or not pages:
             raise ValueError(f"supporting_pages must be nonempty; valid pages: {valid}")
         for page in pages:
@@ -207,11 +222,49 @@ def validate_pdf_dossier_pages(draft: object, included: list[CollectedWork],
 
 
 def _pdf_final_agent(model: Model, spec, included: list[CollectedWork],
-                     readings_by_id: dict[str, object]):
+                     readings_by_id: dict[str, object], passages: PDFPassages):
     from pydantic_ai import Agent, ModelRetry, RunContext
+    from pydantic_ai.capabilities import Hooks
+    from pydantic_ai.messages import ModelMessagesTypeAdapter, ToolReturnPart
+    from radar.config.documents import PDF_RESEARCH_PROMPT_CHARS
+
+    hooks = Hooks()
+    delivered_ids: set[str] = set()
+
+    @hooks.on.before_model_request
+    def intact_history(ctx, request_context):
+        # Measure the actual serialized conversation, including tool replies
+        # and retries. No processor may shorten history to satisfy this guard.
+        # PydanticAI records instructions on each request for tracing, but
+        # Strata Chat sends the current instruction set once, not once per turn.
+        history = ModelMessagesTypeAdapter.dump_json(
+            request_context.messages, exclude={"__all__": {"instructions"}}).decode("utf-8")
+        if len(spec.instructions) + len(history) > PDF_RESEARCH_PROMPT_CHARS:
+            raise StrataError("Complete PDF investigation history exceeds the prompt budget; no report produced.")
+        delivered_ids.update(
+            part.content["passage_id"]
+            for message in request_context.messages for part in message.parts
+            if isinstance(part, ToolReturnPart) and part.tool_name == "read_pdf_passage"
+            and isinstance(part.content, dict) and "passage_id" in part.content)
+        return request_context
 
     agent = Agent(model, output_type=LearningRadarDraft, deps_type=int,
-                  instructions=spec.instructions, retries=ANALYSIS_RETRIES)
+                  instructions=spec.instructions, retries=ANALYSIS_RETRIES,
+                  capabilities=[hooks])
+
+    @agent.tool_plain(sequential=True)
+    def read_pdf_passage(paper_index: StrictInt, page: StrictInt, offset: StrictInt = 0) -> dict:
+        """Read exact untrusted PDF source text, not model notes.
+
+        Args:
+            paper_index: Index of a supplied candidate, never a URL or path.
+            page: One-based PDF page, within that paper's stated page count.
+            offset: Zero-based character offset; use next_offset to continue.
+        """
+        try:
+            return passages.read(paper_index, page, offset).model_dump()
+        except ValueError as exc:
+            raise ModelRetry(str(exc)) from exc
 
     @agent.output_validator
     def _validated(ctx: RunContext[int], draft: RadarDraft) -> RadarDraft:
@@ -226,8 +279,11 @@ def _pdf_final_agent(model: Model, spec, included: list[CollectedWork],
                 raise ModelRetry("Use only candidate indices in the supplied valid range.")
             if len(set(indices)) != len(indices):
                 raise ModelRetry("Duplicate primary dossier indices are not allowed.")
+            if any(pid not in delivered_ids for dossier in draft.learning_dossiers
+                   for pid in dossier.source_passage_ids):
+                raise ModelRetry("Cite only passages returned before this model request; read first, then answer in a later turn.")
             try:
-                validate_pdf_dossier_pages(draft, included, readings_by_id)
+                validate_pdf_dossier_pages(draft, included, readings_by_id, passages)
             except ValueError as exc:
                 raise ModelRetry(str(exc)) from exc
         return draft
@@ -244,9 +300,10 @@ async def research_candidates_async(
     documents: Sequence[object] | None = None,
     document_timeout_s: float = 900.0,
     document_model: Model | None = None,
+    learning_question: str | None = None,
     on_documents_read: Callable[[Sequence[PDFReading], Sequence[DocumentFailure]], None] | None = None,
 ) -> ResearchResult:
-    """Three specialists, then synthesis; at most eight final-team requests.
+    """Three specialists, then synthesis; bounded by stage request limits.
 
     ``documents`` selects full-PDF mode (no abstract fallback), with additional
     bounded chunk-reading/reduction requests under a separate PDF deadline.
@@ -263,7 +320,8 @@ async def research_candidates_async(
                 analysis_timeout_s=analysis_timeout_s, max_tokens=max_tokens,
                 disable_thinking=disable_thinking, session=session,
                 documents=documents, document_timeout_s=document_timeout_s,
-                document_model=document_model, on_documents_read=on_documents_read)
+                document_model=document_model, on_documents_read=on_documents_read,
+                learning_question=learning_question)
         settings, _, retries = synthesis.run_bounds(
             max_tokens=max_tokens, disable_thinking=disable_thinking,
             request_timeout_s=min(ANALYSIS_REQUEST_TIMEOUT_S, float(analysis_timeout_s)),
@@ -323,16 +381,28 @@ async def _research_pdf_async(
     session, documents: Sequence[object], document_timeout_s: float,
     document_model=None,
     on_documents_read=None,
+    learning_question=None,
 ) -> ResearchResult:
-    """PDF mode: read full texts first, then team over readings only."""
+    """Read all text, then investigate notes with exact local source access."""
     from pydantic_ai.usage import UsageLimits
 
     from radar.agent import pdf_reading as _reading
     from radar.prompts.catalog import validate_pdf_prompts
     from radar.schema.documents import DocumentFailure
+    from radar.config.documents import PDF_INVESTIGATION_REQUESTS, PDF_INVESTIGATION_TOOL_CALLS
+    from radar.config.searches import search_policy
 
     validate_research_prompts()
     validate_pdf_prompts()
+    if learning_question is None:
+        learning_question = "\n".join(f"[{goal.id}] {goal.question}" for goal in search_policy().learning_goals)
+        question_origin = "YAML learning agenda; not inferred retrieval intent or learner mastery"
+    else:
+        if not isinstance(learning_question, str) or not learning_question.strip():
+            raise ValueError("Learning question must not be blank.")
+        question_origin = "explicit user learning question"
+    learning_context = (pdf_investigation_prompt().instructions + "\n\n" +
+                        f"LEARNING QUESTION ({question_origin}):\n{learning_question}\n\n")
     reading_timeout = _reading.validate_document_timeout(document_timeout_s)
     settings, _, retries = synthesis.run_bounds(
         max_tokens=max_tokens, disable_thinking=disable_thinking,
@@ -372,7 +442,8 @@ async def _research_pdf_async(
         return ResearchResult(
             RadarDraft(next_move="No PDF readings completed; no synthesis produced."),
             "", (), (), tuple(readings), tuple(all_failures))
-    included = select_pdf_cohort(candidates, readings_by_id, max_candidates)
+    included = select_pdf_cohort(candidates, readings_by_id, max_candidates,
+                                 learning_context_chars=len(learning_context))
     if not included:
         return ResearchResult(
             RadarDraft(next_move="No PDF readings fit the research prompt budget."),
@@ -393,13 +464,16 @@ async def _research_pdf_async(
         async with asyncio.TaskGroup() as group:
             tasks = [group.create_task(contribute(role)) for role in SPECIALIST_ROLES]
         reports = tuple(task.result() for task in tasks)
-        prompt = _synthesis_prompt(included, reports, readings_by_id)
+        prompt = _synthesis_prompt(included, reports, readings_by_id, learning_context)
+        documents_by_id = {document.work_id: document for document in to_read}
+        passages = PDFPassages([documents_by_id[work.openalex_id] for work in included])
         result = await _pdf_final_agent(
-            active_model, opportunity_analysis_prompt(), included, readings_by_id).run(
+            active_model, opportunity_analysis_prompt(), included, readings_by_id, passages).run(
             prompt, deps=len(included), model_settings=settings,
-            usage_limits=UsageLimits(request_limit=ANALYSIS_REQUEST_LIMIT), retries=retries)
+            usage_limits=UsageLimits(request_limit=PDF_INVESTIGATION_REQUESTS,
+                                     tool_calls_limit=PDF_INVESTIGATION_TOOL_CALLS), retries=retries)
         return ResearchResult(result.output, prompt, tuple(included), reports,
-                              tuple(readings), tuple(all_failures))
+                              tuple(readings), tuple(all_failures), passages.served, learning_question)
 
 
 def research_candidates(candidates: list[CollectedWork], **kwargs) -> ResearchResult:

@@ -73,6 +73,7 @@ class PipelineRequest:
     disable_thinking: bool = False
     base_url: str | None = None
     model: str | None = None
+    learning_question: str | None = None
     # Full-pool routing: CLEF preferred, Qwen fallback; collect-only ignores it.
     clef_base_url: str | None = None
     clef_model: str | None = None
@@ -128,6 +129,10 @@ def run(request: PipelineRequest) -> PipelineResult:
 
 
 def _execute(request: PipelineRequest) -> PipelineResult:
+    if request.learning_question is not None and (
+        not isinstance(request.learning_question, str) or not request.learning_question.strip()
+    ):
+        raise PipelineUsageError("--learning-question must not be blank.")
     if request.list_reports or request.report_id is not None:
         return _run_library(request)
     _validate_request(request)
@@ -748,6 +753,7 @@ def _analyze_pool(
             max_candidates=request.max_candidates,
             analysis_timeout_s=request.analysis_timeout_s,
             max_tokens=request.max_tokens,
+            learning_question=request.learning_question,
             disable_thinking=disable_thinking,
             session=session,
             documents=documents,
@@ -770,7 +776,9 @@ def _analyze_pool(
     try:
         report = attach_evidence(
             draft, included,
-            document_readings=readings, document_failures=merged_failures)
+            document_readings=readings, document_failures=merged_failures,
+            learning_question=research.learning_question,
+            source_passages=list(research.source_passages))
         rendered = _out_md.render_markdown(report)
     except Exception as exc:
         raise PipelineAnalysisError(

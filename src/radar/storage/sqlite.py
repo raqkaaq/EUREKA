@@ -424,6 +424,28 @@ class SQLiteStore:
         for resolved in report.learning_dossiers:
             if not 0 <= resolved.source.index < selected:
                 raise StorageError("Learning dossier source must be in the analyzed index range.")
+            if resolved.source_passages:
+                record = outcomes.get(resolved.source.openalex_id)
+                if record is None or record.source is None:
+                    raise StorageError("Report passages require this run's extracted PDF source.")
+                source = self._db.execute(
+                    "SELECT payload FROM paper_documents WHERE work_id=? AND sha256=?",
+                    (record.work_id, record.source.sha256),
+                ).fetchone()
+                try:
+                    document = PDFDocument.model_validate_json(source[0]) if source else None
+                    if document is None:
+                        raise ValueError("Missing stored extraction")
+                    for passage in resolved.source_passages:
+                        if (passage.work_id != document.work_id or passage.sha256 != document.sha256
+                                or not 1 <= passage.page <= len(document.pages)):
+                            raise ValueError("Passage source mismatch")
+                        text = document.pages[passage.page - 1].text
+                        if (not 0 <= passage.start < passage.end <= len(text)
+                                or passage.text != text[passage.start:passage.end]):
+                            raise ValueError("Passage text mismatch")
+                except ValueError as exc:
+                    raise StorageError("Report passage does not match this run's stored PDF extraction.") from exc
             if resolved.evidence_level == "pdf_text":
                 continue  # Validated above against the run's immutable document reading.
             source = self._db.execute(

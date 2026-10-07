@@ -7,6 +7,7 @@ No JSON formatting here: machine-readable envelopes live in
 from __future__ import annotations
 
 import datetime as _dt
+import re
 
 from radar.schema.opportunities import RadarReport
 
@@ -56,6 +57,8 @@ def render_markdown(report: RadarReport) -> str:
     """Lead with grounded learning; preserve opportunity-only report rendering."""
     title = "AI/ML Learning Radar" if report.learning_dossiers else "AI/ML Opportunity Radar"
     lines: list[str] = [f"# {title}", ""]
+    if report.learning_question:
+        lines.extend(["## Learning question / agenda", "", report.learning_question, ""])
     if report.document_readings:
         lines.extend(["## Full PDF text investigation", "",
                       "All extracted text was read in bounded sections. Figures, images and equation/table fidelity were not visually verified.", ""])
@@ -115,6 +118,15 @@ def render_markdown(report: RadarReport) -> str:
             lines.append("")
             for page in resolved.source_pages:
                 lines.append(f"- [PDF page {page}](<{resolved.source_pdf.source_url}#page={page}>)")
+        if resolved.source_passages:
+            lines.extend(["", "**Consulted source passages (provenance, not semantic verification):**", ""])
+            for passage in resolved.source_passages:
+                lines.extend([f"Passage `{passage.passage_id}` — PDF page {passage.page}, "
+                              f"characters {passage.start}–{passage.end} (zero-based, end exclusive).", ""])
+                # Source text is literal, even when it contains Markdown fences.
+                fence = "`" * max(3, 1 + max((len(match.group()) for match in
+                                              re.finditer(r"`+", passage.text)), default=0))
+                lines.extend([fence + "text", passage.text, fence, ""])
         lines.append("")
     lines.extend(_opportunity_lines(report))
     lines.append("## Next move")

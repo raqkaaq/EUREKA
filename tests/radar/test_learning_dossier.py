@@ -238,7 +238,8 @@ class TestResearchSynthesis(unittest.TestCase):
         result = research_candidates([_work()], model=FunctionModel(respond))
         self.assertEqual(len(calls), 4)
         report = attach_evidence(result.draft, list(result.included))
-        self.assertEqual(report.learning_dossiers[0].dossier.model_dump(exclude={"supporting_pages"}), dossier)
+        self.assertEqual(report.learning_dossiers[0].dossier.model_dump(
+            exclude={"supporting_pages", "source_passage_ids"}), dossier)
         for field in ("wow", "investigate", "reproduce"):
             self.assertEqual(getattr(report.opportunities[0].draft, field), opportunity_text)
         self.assertEqual(report.next_move, opportunity_text)

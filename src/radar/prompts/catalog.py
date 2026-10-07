@@ -39,6 +39,10 @@ def pdf_reduction_prompt() -> AgentPrompt:
     return load_yaml("radar.prompts", "pdf_reduction.yaml", AgentPrompt)
 
 
+def pdf_investigation_prompt() -> AgentPrompt:
+    return load_yaml("radar.prompts", "pdf_investigation.yaml", AgentPrompt)
+
+
 def search_planning_prompt() -> AgentPrompt:
     return load_yaml("radar.prompts", "search_planning.yaml", AgentPrompt)
 

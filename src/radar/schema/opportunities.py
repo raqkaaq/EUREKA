@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 
 from radar.config.runtime import MAX_EVIDENCE_PER_OPP, MAX_OPPORTUNITIES
 from radar.schema.learning import LearningDossierDraft
-from radar.schema.documents import PDFSource, PDFReading, DocumentFailure
+from radar.schema.documents import PDFSource, PDFReading, DocumentFailure, PDFPassage
 
 
 class OpportunityDraft(BaseModel):
@@ -83,17 +83,26 @@ class ResolvedLearningDossier(BaseModel):
     evidence_level: Literal["abstract", "pdf_text"] = "abstract"
     source_pdf: PDFSource | None = None
     source_pages: list[StrictInt] = Field(default_factory=list, max_length=8)
+    source_passages: list[PDFPassage] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _matching_source(self) -> ResolvedLearningDossier:
         if self.source.index != self.dossier.paper_index or not self.source.openalex_id:
             raise ValueError("Learning dossier must reference its primary candidate.")
+        if [p.passage_id for p in self.source_passages] != self.dossier.source_passage_ids:
+            raise ValueError("Consulted passages must match the dossier's source references.")
         if self.evidence_level == "pdf_text":
             if self.source_pdf is None or self.source_pdf.work_id != self.source.openalex_id or not self.source_pages:
                 raise ValueError("PDF evidence requires its own source and page references.")
             if self.source_pages != self.dossier.supporting_pages:
                 raise ValueError("Resolved PDF pages must match the model's validated references.")
-        elif self.source_pdf is not None or self.source_pages or self.dossier.supporting_pages:
+            if self.source_passages:
+                if any(p.work_id != self.source_pdf.work_id or p.sha256 != self.source_pdf.sha256
+                       for p in self.source_passages):
+                    raise ValueError("Consulted passages must belong to the primary PDF source.")
+                if set(self.source_pages) != {p.page for p in self.source_passages}:
+                    raise ValueError("Supporting pages must match consulted source passages.")
+        elif self.source_pdf is not None or self.source_pages or self.dossier.supporting_pages or self.source_passages:
             raise ValueError("Abstract evidence cannot claim PDF page coverage.")
         return self
 
@@ -137,6 +146,7 @@ class RadarReport(BaseModel):
     opportunities: list[Opportunity] = Field(default_factory=list)
     ignore: list[str] = Field(default_factory=list)
     next_move: str = Field(default="")
+    learning_question: str = ""
     learning_dossiers: list[ResolvedLearningDossier] = Field(
         default_factory=list, max_length=1
     )
@@ -161,7 +171,8 @@ class RadarReport(BaseModel):
                 raise ValueError("PDF dossier requires its matching completed reading.")
             if any(p < 1 or p > reading.page_count for p in item.source_pages):
                 raise ValueError("PDF reference names an unavailable page.")
-            verified_pages = {e.page for e in reading.notes.evidence}
+            verified_pages = ({p.page for p in item.source_passages} if item.source_passages
+                              else {e.page for e in reading.notes.evidence})
             if not set(item.source_pages) <= verified_pages:
                 raise ValueError("PDF dossier must cite supplied verified evidence pages.")
         return self

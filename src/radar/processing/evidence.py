@@ -22,7 +22,7 @@ from radar.schema.opportunities import (
     ResolvedLearningDossier,
 )
 from radar.schema.papers import CollectedWork
-from radar.schema.documents import PDFReading, PDFSource, DocumentFailure
+from radar.schema.documents import PDFReading, PDFSource, DocumentFailure, PDFPassage
 
 
 def _link_for(index: int, candidates: list[CollectedWork]) -> EvidenceLink | None:
@@ -49,6 +49,8 @@ def attach_evidence(
     draft: RadarDraft, candidates: list[CollectedWork], *,
     document_readings: list[PDFReading] | None = None,
     document_failures: list[DocumentFailure] | None = None,
+    source_passages: list[PDFPassage] | None = None,
+    learning_question: str = "",
 ) -> RadarReport:
     """Attach deterministic evidence links to a model draft."""
     opportunities: list[Opportunity] = []
@@ -85,10 +87,16 @@ def attach_evidence(
             if reading is None:
                 dossiers.append(ResolvedLearningDossier(dossier=dossier, source=link))
             else:
+                by_id = {p.passage_id: p for p in source_passages or []}
+                try:
+                    consulted = [by_id[pid] for pid in dossier.source_passage_ids]
+                except KeyError:
+                    raise ValueError("Dossier cites an unconsulted source passage.") from None
                 dossiers.append(ResolvedLearningDossier(
                     dossier=dossier, source=link, evidence_level="pdf_text",
                     source_pdf=PDFSource.model_validate(reading.model_dump(include=set(PDFSource.model_fields))),
                     source_pages=dossier.supporting_pages,
+                    source_passages=consulted,
                 ))
     elif getattr(draft, "learning_dossiers", None):
         raise ValueError("Unexpected learning dossiers on a non-learning draft.")
@@ -97,6 +105,7 @@ def attach_evidence(
         opportunities=opportunities,
         ignore=ignore,
         next_move=draft.next_move.strip(),
+        learning_question=learning_question,
         document_readings=document_readings or [],
         document_failures=document_failures or [],
         learning_dossiers=dossiers,
